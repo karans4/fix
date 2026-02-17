@@ -603,15 +603,17 @@ def display_contract(contract, status_fn):
     status_fn(f"{C_BLUE}={C_RESET}", f"{C_BOLD}Contract{C_RESET}")
     status_fn(f"{C_DIM}|{C_RESET}", f"  task:       fix '{contract['task']['command']}'")
     status_fn(f"{C_DIM}|{C_RESET}", f"  verify:     {v['method']} -- {v['criterion']}")
-    status_fn(f"{C_DIM}|{C_RESET}", f"  sandbox:    {t['sandbox']}  network: {t['network']}")
-    status_fn(f"{C_DIM}|{C_RESET}", f"  rollback:   {t['rollback_on_failure']}  attempt: {t['current_attempt']}/{t['max_attempts']}")
-    status_fn(f"{C_DIM}|{C_RESET}", f"  agent:      {contract['agent']['backend']}")
+    if t['sandbox']:
+        status_fn(f"{C_DIM}|{C_RESET}", f"  sandbox:    {t['sandbox']}  network: {t['network']}  rollback: {t['rollback_on_failure']}")
+    status_fn(f"{C_DIM}|{C_RESET}", f"  attempt:    {t['current_attempt']}/{t['max_attempts']}")
     if contract.get("prior_failures"):
         status_fn(f"{C_DIM}|{C_RESET}", f"  prior fails: {len(contract['prior_failures'])}")
 
 
 def build_prompt(command, stderr_text, env_info, contract, prior_failures=None):
-    contract_json = json.dumps(contract, indent=2)
+    # Strip internal fields the agent doesn't need to see
+    prompt_contract = {k: v for k, v in contract.items() if k != "agent"}
+    contract_json = json.dumps(prompt_contract, indent=2)
     v = contract["verification"]
     t = contract["terms"]
 
@@ -1185,9 +1187,6 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         status(f"{C_GREEN}${C_RESET}", f"Fix{attempt_label}: {C_BOLD}{fix_cmd[:80]}{C_RESET}")
         if explanation:
             status(f"{C_DIM}i{C_RESET}", explanation)
-
-        cost_str = f"~${COST_PER_CALL_CENTS/100:.4f}" if is_paid else "free (local)"
-        status(f"{C_DIM}~{C_RESET}", f"Cost: {cost_str} [{backend_name}]")
 
         # --dry-run: show fix and contract, stop
         if dry_run:
