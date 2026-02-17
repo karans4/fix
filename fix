@@ -22,7 +22,8 @@ Config:
     .fix.py                             Project config (overrides global)
 
     Config vars: model, ollama_model, ollama_url, safe_mode, verify, root,
-                 openai_api_url, openai_model, backend, hidden_paths
+                 openai_api_url, openai_model, backend, hidden_paths,
+                 bounty, judge
 
 Shell:
     eval "$(fix shell)"                 Add to .bashrc/.zshrc/config.fish (enables fix !!)
@@ -194,6 +195,8 @@ DEFAULTS = {
     "root": None,       # restrict agent investigation to this directory
     "verify": None,     # default verification command for this project
     "agent": None,      # custom agent function: f(contract) -> response dict
+    "bounty": None,     # optional escrow bounty: "0.01 USDC", "100 sats", etc.
+    "judge": None,      # optional dispute judge: f(contract, outcome) -> verdict dict
 }
 
 
@@ -721,7 +724,8 @@ def resolve_backend(cfg, force_local=False):
 
 def build_contract(command, stderr_text, env_info,
                    verify_spec=None, safe_mode=False, backend_name="",
-                   attempt=0, prior_failures=None, root=None):
+                   attempt=0, prior_failures=None, root=None,
+                   bounty=None, judge=None):
     """Build a contract object that both parties see and agree to."""
     # Verification terms
     if verify_spec is None:
@@ -784,6 +788,16 @@ def build_contract(command, stderr_text, env_info,
         },
     }
 
+    if bounty:
+        contract["escrow"] = {
+            "bounty": bounty,
+            "judge": "provided" if judge else "none",
+            "terms": "Agent receives bounty on fulfilled contract. "
+                     "On breach, bounty is retained by principal. "
+                     + ("Disputes are resolved by a third-party judge." if judge else
+                        "No dispute resolution — verification is final."),
+        }
+
     if prior_failures:
         contract["prior_failures"] = [
             {"fix": fix, "result": err[:300]}
@@ -824,6 +838,12 @@ def display_contract(contract, status_fn):
         lines.append(("Sandbox", " \u00b7 ".join(sandbox_parts)))
     if t.get("root"):
         lines.append(("Root", t["root"]))
+    if contract.get("escrow"):
+        e = contract["escrow"]
+        escrow_str = f"{C_GREEN}{e['bounty']}{C_RESET}"
+        if e["judge"] != "none":
+            escrow_str += f" {C_DIM}\u00b7{C_RESET} judge: {e['judge']}"
+        lines.append(("Escrow", escrow_str))
     lines.append(("Attempt", f"{t['current_attempt']} of {t['max_attempts']}"))
     if contract.get("prior_failures"):
         n = len(contract["prior_failures"])
@@ -1368,6 +1388,8 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             backend_name=backend_name, attempt=attempt,
             prior_failures=prior_failures or None,
             root=cfg.get("root"),
+            bounty=cfg.get("bounty"),
+            judge=cfg.get("judge"),
         )
         display_contract(contract, status)
 
@@ -1432,7 +1454,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                 return proc.returncode
 
         # Apply fix
-        rc = apply_fix(fix_cmd, command, verify_spec, safe_mode, cfg)
+        rc = apply_fix(fix_cmd, command, verify_spec, safe_mode, cfg, contract)
 
         if rc == 0:
             return 0
@@ -1447,7 +1469,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
     return 1
 
 
-def apply_fix(fix_cmd, original_cmd, verify_spec, safe_mode, cfg):
+def apply_fix(fix_cmd, original_cmd, verify_spec, safe_mode, cfg, contract=None):
     """Apply a fix and verify it. Returns exit code."""
 
     if safe_mode:
@@ -1455,12 +1477,7 @@ def apply_fix(fix_cmd, original_cmd, verify_spec, safe_mode, cfg):
         success, fix_out, verify_out = run_sandboxed_fix(
             fix_cmd, original_cmd, verify_spec, cfg, status)
         print(file=sys.stderr)
-        if success:
-            status(f"{C_GREEN}\u2714{C_RESET}", f"{C_GREEN}Contract fulfilled.{C_RESET} Changes committed.")
-            return 0
-        else:
-            status(f"{C_RED}\u2718{C_RESET}", f"{C_RED}Contract breached.{C_RESET} System unchanged.")
-            return 1
+        explanation = verify_out or ("Changes committed" if success else "System unchanged")
     else:
         # Direct execution
         status(f"{C_BLUE}\u25b8{C_RESET}", "Applying fix...")
@@ -1474,12 +1491,48 @@ def apply_fix(fix_cmd, original_cmd, verify_spec, safe_mode, cfg):
         verifier = Verifier(verify_spec, original_cmd)
         success, explanation = verifier.verify(fix_proc)
         print(file=sys.stderr)
-        if success:
-            status(f"{C_GREEN}\u2714{C_RESET}", f"{C_GREEN}Contract fulfilled.{C_RESET} {explanation}")
-        else:
-            status(f"{C_RED}\u2718{C_RESET}", f"{C_RED}Contract breached.{C_RESET} {explanation}")
 
-        return 0 if success else 1
+    # Dispute resolution: if verification failed and a judge is configured, appeal
+    if not success and contract and contract.get("escrow"):
+        judge_fn = cfg.get("judge")
+        if callable(judge_fn):
+            outcome = {
+                "fix": fix_cmd,
+                "success": False,
+                "explanation": explanation,
+            }
+            status(f"{C_YELLOW}\u2696{C_RESET}", "Verification failed. Appealing to judge...")
+            try:
+                verdict = judge_fn(contract, outcome)
+                if isinstance(verdict, dict):
+                    ruling = verdict.get("ruling", "breach")
+                    reason = verdict.get("reason", "no reason given")
+                    if ruling == "fulfilled":
+                        status(f"{C_GREEN}\u2696{C_RESET}",
+                               f"Judge {C_GREEN}overruled{C_RESET}: {C_ITALIC}{reason}{C_RESET}")
+                        success = True
+                        explanation = f"Judge: {reason}"
+                    else:
+                        status(f"{C_RED}\u2696{C_RESET}",
+                               f"Judge {C_RED}upheld breach{C_RESET}: {C_ITALIC}{reason}{C_RESET}")
+            except Exception as e:
+                status(f"{C_RED}!{C_RESET}", f"Judge error: {e}")
+
+    if success:
+        status(f"{C_GREEN}\u2714{C_RESET}", f"{C_GREEN}Contract fulfilled.{C_RESET} {explanation}")
+        if contract and contract.get("escrow"):
+            status(f"{C_GREEN}${C_RESET}",
+                   f"Escrow: {contract['escrow']['bounty']} released to agent")
+    else:
+        msg = f"{C_RED}Contract breached.{C_RESET} {explanation}"
+        if safe_mode:
+            msg += " System unchanged."
+        status(f"{C_RED}\u2718{C_RESET}", msg)
+        if contract and contract.get("escrow"):
+            status(f"{C_DIM}${C_RESET}",
+                   f"Escrow: {contract['escrow']['bounty']} retained by principal")
+
+    return 0 if success else 1
 
 
 # --- CLI ---
