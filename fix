@@ -132,6 +132,7 @@ def init_db():
             env_hash TEXT,
             fix_script TEXT,
             raw_error TEXT DEFAULT '',
+            contract TEXT DEFAULT '',
             success_count INTEGER DEFAULT 0,
             fail_count INTEGER DEFAULT 0,
             created_at REAL,
@@ -148,12 +149,13 @@ def init_db():
         conn.execute("INSERT OR IGNORE INTO stats VALUES (?, 0)", (k,))
     conn.commit()
 
-    # Migrate: add raw_error column if missing
-    try:
-        conn.execute("SELECT raw_error FROM fixes LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE fixes ADD COLUMN raw_error TEXT DEFAULT ''")
-        conn.commit()
+    # Migrate: add columns if missing
+    for col in ("raw_error", "contract"):
+        try:
+            conn.execute(f"SELECT {col} FROM fixes LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute(f"ALTER TABLE fixes ADD COLUMN {col} TEXT DEFAULT ''")
+            conn.commit()
 
     return conn
 
@@ -185,11 +187,12 @@ def lookup_fix(conn, ehash, envhash):
     return None, False
 
 
-def store_fix(conn, ehash, envhash, fix_script, raw_error=""):
+def store_fix(conn, ehash, envhash, fix_script, raw_error="", contract=None):
     conn.execute(
-        "INSERT OR REPLACE INTO fixes (error_hash, env_hash, fix_script, raw_error, success_count, fail_count, created_at) "
-        "VALUES (?, ?, ?, ?, 1, 0, ?)",
-        (ehash, envhash, fix_script, raw_error, time.time())
+        "INSERT OR REPLACE INTO fixes (error_hash, env_hash, fix_script, raw_error, contract, success_count, fail_count, created_at) "
+        "VALUES (?, ?, ?, ?, ?, 1, 0, ?)",
+        (ehash, envhash, fix_script, raw_error,
+         json.dumps(contract) if contract else "", time.time())
     )
     conn.commit()
 
@@ -205,15 +208,21 @@ def record_outcome(conn, ehash, envhash, success):
 
 def export_fixes(conn):
     rows = conn.execute(
-        "SELECT error_hash, env_hash, fix_script, raw_error, success_count, fail_count, created_at FROM fixes"
+        "SELECT error_hash, env_hash, fix_script, raw_error, contract, success_count, fail_count, created_at FROM fixes"
     ).fetchall()
     fixes = []
     for r in rows:
-        fixes.append({
+        entry = {
             "error_hash": r[0], "env_hash": r[1], "fix_script": r[2],
-            "raw_error": r[3] or "", "success_count": r[4],
-            "fail_count": r[5], "created_at": r[6]
-        })
+            "raw_error": r[3] or "", "success_count": r[5],
+            "fail_count": r[6], "created_at": r[7]
+        }
+        if r[4]:
+            try:
+                entry["contract"] = json.loads(r[4])
+            except json.JSONDecodeError:
+                entry["contract"] = None
+        fixes.append(entry)
     print(json.dumps(fixes, indent=2))
 
 
@@ -510,30 +519,119 @@ def resolve_backend(cfg, force_local=False):
     raise RuntimeError("No LLM backend available. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or start Ollama.")
 
 
-def build_prompt(command, stderr_text, env_info, prior_failures=None):
-    prompt = f"""You are a DevOps agent. A command failed. Generate a fix.
+# --- Contract ---
 
-FAILED COMMAND: {command}
+def build_contract(command, stderr_text, env_info, ehash, envhash,
+                   verify_spec=None, safe_mode=False, backend_name="",
+                   attempt=0, prior_failures=None):
+    """Build a contract object that both parties see and agree to."""
+    # Verification terms
+    if verify_spec is None:
+        verification = {
+            "method": "exit_code",
+            "target": command,
+            "criterion": "exit 0"
+        }
+    elif verify_spec == "human":
+        verification = {
+            "method": "human_judgment",
+            "target": command,
+            "criterion": "human approves the output"
+        }
+    elif verify_spec.startswith("contains "):
+        match = re.match(r"contains\s+['\"](.+?)['\"]", verify_spec)
+        verification = {
+            "method": "output_match",
+            "target": command,
+            "criterion": f"stdout contains '{match.group(1)}'" if match else verify_spec
+        }
+    elif verify_spec.startswith("not contains "):
+        match = re.match(r"not contains\s+['\"](.+?)['\"]", verify_spec)
+        verification = {
+            "method": "output_exclusion",
+            "target": command,
+            "criterion": f"output must not contain '{match.group(1)}'" if match else verify_spec
+        }
+    else:
+        verification = {
+            "method": "custom_command",
+            "target": verify_spec,
+            "criterion": "verification command exits 0"
+        }
 
-ERROR OUTPUT:
-{stderr_text[-2000:]}
+    contract = {
+        "version": 1,
+        "task": {
+            "type": "fix_command",
+            "command": command,
+            "error_hash": ehash,
+            "error": stderr_text[-1000:],
+        },
+        "environment": {
+            "hash": envhash,
+            "os": f"{env_info.get('distro', '')} ({env_info['os']} {env_info['release']})",
+            "arch": env_info["machine"],
+            "shell": env_info["shell"],
+            "package_managers": env_info.get("package_managers", []),
+        },
+        "verification": verification,
+        "terms": {
+            "sandbox": safe_mode,
+            "network": "package_installs_only" if safe_mode else "unrestricted",
+            "max_attempts": MAX_FIX_ATTEMPTS,
+            "current_attempt": attempt + 1,
+            "rollback_on_failure": safe_mode,
+        },
+        "agent": {
+            "backend": backend_name,
+        },
+    }
 
-SYSTEM INFO:
-- OS: {env_info.get('distro', '')} ({env_info['os']} {env_info['release']})
-- Arch: {env_info['machine']}
-- Shell: {env_info['shell']}
-- Python: {env_info['python']}
-- Package managers: {', '.join(env_info.get('package_managers', []))}
+    if prior_failures:
+        contract["prior_failures"] = [
+            {"fix": fix, "result": err[:300]}
+            for fix, err in prior_failures
+        ]
 
-Respond with ONLY a JSON object, no markdown, no explanation:
-{{"fix": "the shell command(s) to run", "explanation": "one line why", "retry": true}}
+    return contract
 
-The "fix" field should contain shell commands that fix the underlying issue.
-Set "retry" to true if the original command should be re-run after the fix.
-Keep it minimal. Prefer the system package manager.
-Use sudo for apt/dnf/pacman commands (they require root).
-Use pip install --break-system-packages if apt doesn't have the package.
-Combine commands with && for atomicity."""
+
+def display_contract(contract, status_fn):
+    """Print the contract to the user's terminal."""
+    v = contract["verification"]
+    t = contract["terms"]
+    status_fn(f"{C_BLUE}={C_RESET}", f"{C_BOLD}Contract{C_RESET}")
+    status_fn(f"{C_DIM}|{C_RESET}", f"  task:       fix '{contract['task']['command']}'")
+    status_fn(f"{C_DIM}|{C_RESET}", f"  verify:     {v['method']} -- {v['criterion']}")
+    status_fn(f"{C_DIM}|{C_RESET}", f"  sandbox:    {t['sandbox']}  network: {t['network']}")
+    status_fn(f"{C_DIM}|{C_RESET}", f"  rollback:   {t['rollback_on_failure']}  attempt: {t['current_attempt']}/{t['max_attempts']}")
+    status_fn(f"{C_DIM}|{C_RESET}", f"  agent:      {contract['agent']['backend']}")
+    if contract.get("prior_failures"):
+        status_fn(f"{C_DIM}|{C_RESET}", f"  prior fails: {len(contract['prior_failures'])}")
+
+
+def build_prompt(command, stderr_text, env_info, contract, prior_failures=None):
+    contract_json = json.dumps(contract, indent=2)
+    prompt = f"""You are a DevOps agent entering a fix contract. Both you and the user
+have agreed to the following terms:
+
+CONTRACT:
+{contract_json}
+
+You must provide a fix for the failed command. The fix will be verified according
+to the contract's verification terms. If verification fails, the fix is rejected.
+
+Respond with ONLY a JSON object, no markdown:
+{{"accepted": true, "fix": "shell command(s)", "explanation": "one line why", "retry": true}}
+
+Rules:
+- "accepted" must be true (you agree to the contract terms)
+- "fix" contains shell commands that fix the underlying issue
+- "retry" is true if the original command should be re-run after the fix
+- Keep it minimal. Prefer the system package manager.
+- Use sudo for apt/dnf/pacman commands.
+- Use pip install --break-system-packages if apt doesn't have the package.
+- Combine commands with && for atomicity."""
 
     if prior_failures:
         prompt += "\n\nPREVIOUS FAILED ATTEMPTS (do NOT repeat these):\n"
@@ -993,7 +1091,17 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
     prior_failures = []
 
     for attempt in range(MAX_FIX_ATTEMPTS):
-        prompt = build_prompt(command, proc.stderr, env_info, prior_failures or None)
+        # Build contract -- the shared agreement between user and agent
+        contract = build_contract(
+            command, proc.stderr, env_info, ehash, envhash,
+            verify_spec=verify_spec, safe_mode=safe_mode,
+            backend_name=backend_name, attempt=attempt,
+            prior_failures=prior_failures or None
+        )
+        display_contract(contract, status)
+
+        prompt = build_prompt(command, proc.stderr, env_info, contract,
+                              prior_failures or None)
 
         # Parse LLM response (retry on bad JSON)
         result = None
@@ -1012,6 +1120,11 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                 status(f"{C_RED}!{C_RESET}", str(e))
                 return proc.returncode
 
+        # Check if agent explicitly declined
+        if result.get("accepted") is False:
+            status(f"{C_RED}!{C_RESET}", "Agent declined the contract.")
+            return proc.returncode
+
         if is_paid:
             inc_stat(conn, "session_spend_cents", COST_PER_CALL_CENTS)
             inc_stat(conn, "total_spend_cents", COST_PER_CALL_CENTS)
@@ -1022,6 +1135,11 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             fix_cmd = " && ".join(fix_cmd)
         explanation = result.get("explanation", "")
 
+        # Record agent's response in the contract
+        contract["agent"]["accepted"] = True
+        contract["agent"]["fix"] = fix_cmd
+        contract["agent"]["explanation"] = explanation
+
         attempt_label = f" (attempt {attempt + 1}/{MAX_FIX_ATTEMPTS})" if attempt > 0 else ""
         status(f"{C_GREEN}${C_RESET}", f"Fix{attempt_label}: {C_BOLD}{fix_cmd[:80]}{C_RESET}")
         if explanation:
@@ -1030,7 +1148,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         cost_str = f"~${COST_PER_CALL_CENTS/100:.4f}" if is_paid else "free (local)"
         status(f"{C_DIM}~{C_RESET}", f"Cost: {cost_str} [{backend_name}]")
 
-        # --dry-run: show fix and stop
+        # --dry-run: show fix and contract, stop
         if dry_run:
             print(f"\n{fix_cmd}\n")
             return proc.returncode
@@ -1042,7 +1160,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
 
         # Apply fix
         rc = apply_fix(conn, ehash, envhash, fix_cmd, command, verify_spec,
-                        safe_mode, cfg, raw_error=proc.stderr)
+                        safe_mode, cfg, raw_error=proc.stderr, contract=contract)
 
         if rc == 0:
             return 0
@@ -1050,7 +1168,6 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         # Fix didn't work -- if we have more attempts, feed failure context back
         if attempt < MAX_FIX_ATTEMPTS - 1:
             status(f"{C_YELLOW}~{C_RESET}", f"Attempt {attempt + 1} failed. Trying again with context...")
-            # Capture what went wrong
             verify_proc = subprocess.run(command, shell=True, capture_output=True, text=True)
             prior_failures.append((fix_cmd, verify_proc.stderr[:500] if verify_proc.stderr else "exit non-zero"))
             continue
@@ -1059,7 +1176,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
 
 
 def apply_fix(conn, ehash, envhash, fix_cmd, original_cmd, verify_spec,
-              safe_mode, cfg, raw_error=""):
+              safe_mode, cfg, raw_error="", contract=None):
     """Apply a fix and verify it. Returns exit code."""
 
     if safe_mode:
@@ -1067,11 +1184,15 @@ def apply_fix(conn, ehash, envhash, fix_cmd, original_cmd, verify_spec,
         success, fix_out, verify_out = run_sandboxed_fix(
             fix_cmd, original_cmd, verify_spec, cfg, status)
         if success:
-            status(f"{C_GREEN}+{C_RESET}", "Contract satisfied. Changes committed.")
-            store_fix(conn, ehash, envhash, fix_cmd, raw_error)
+            if contract:
+                contract["outcome"] = "fulfilled"
+            status(f"{C_GREEN}+{C_RESET}", "Contract fulfilled. Changes committed.")
+            store_fix(conn, ehash, envhash, fix_cmd, raw_error, contract)
             return 0
         else:
-            status(f"{C_RED}!{C_RESET}", "Contract not satisfied. System unchanged.")
+            if contract:
+                contract["outcome"] = "breached"
+            status(f"{C_RED}!{C_RESET}", "Contract breached. System unchanged.")
             return 1
     else:
         # Direct execution
@@ -1088,9 +1209,13 @@ def apply_fix(conn, ehash, envhash, fix_cmd, original_cmd, verify_spec,
         status(f"{C_GREEN if success else C_RED}{'+'  if success else '!'}{C_RESET}", explanation)
 
         if success:
-            store_fix(conn, ehash, envhash, fix_cmd, raw_error)
+            if contract:
+                contract["outcome"] = "fulfilled"
+            store_fix(conn, ehash, envhash, fix_cmd, raw_error, contract)
             record_outcome(conn, ehash, envhash, True)
         else:
+            if contract:
+                contract["outcome"] = "breached"
             record_outcome(conn, ehash, envhash, False)
 
         return 0 if success else 1
