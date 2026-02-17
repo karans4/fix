@@ -1,0 +1,1197 @@
+#!/usr/bin/env python3
+"""fix -- AI-powered command fixer.
+
+Usage:
+    fix <command>                       Run command; if it fails, diagnose and fix
+    fix !!                              Re-run last failed command from shell history
+    fix --safe <command>                Sandboxed: overlay snapshot + rollback on failure
+    fix --explain <command>             Explain the error without fixing
+    fix --dry-run <command>             Show fix without executing
+    fix --verify=human <command>        Human judges the result
+    fix --verify="contains 'X'" <cmd>   Stdout must contain X
+    fix --verify="not contains 'X'" <cmd>  Stderr must not contain X
+    fix --verify="CMD" <command>        Run CMD as verification
+    fix --local <command>               Force Ollama backend
+    fix --hide PATH                     Hide PATH from sandbox agent (repeatable)
+    fix --visible PATH                  Whitelist mode: only PATH visible (repeatable)
+    fix --budget <cents>                Set max spend (default: 50)
+    fix -y <command>                    Auto-apply without confirmation
+    fix --cache                         Show cached fixes
+    fix --stats                         Show spending stats
+    fix --clear                         Clear the fix cache
+    fix export                          Dump fixes as JSON
+    fix import <file>                   Import fixes from JSON
+"""
+
+import subprocess, hashlib, sqlite3, sys, os, json, time, platform, shutil, re
+
+# --- Config ---
+CONFIG_DIR = os.path.expanduser("~/.fix")
+DB_PATH = os.path.join(CONFIG_DIR, "fixes.db")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.toml")
+MAX_FIX_ATTEMPTS = 3
+DEFAULT_BUDGET_CENTS = 50
+
+# Claude API defaults
+CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+COST_PER_CALL_CENTS = 0.1
+
+# Ollama defaults
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "qwen2.5-coder:1.5b"
+
+
+# --- Colors ---
+C_RESET = "\033[0m"
+C_RED = "\033[31m"
+C_GREEN = "\033[32m"
+C_YELLOW = "\033[33m"
+C_BLUE = "\033[34m"
+C_DIM = "\033[2m"
+C_BOLD = "\033[1m"
+
+if not sys.stderr.isatty():
+    C_RESET = C_RED = C_GREEN = C_YELLOW = C_BLUE = C_DIM = C_BOLD = ""
+
+
+def status(icon, msg):
+    print(f"  {icon}  {msg}", file=sys.stderr)
+
+
+# --- Config File ---
+
+def load_config():
+    """Load ~/.fix/config.toml. Returns dict with defaults."""
+    cfg = {
+        "backend": "auto",
+        "model": CLAUDE_MODEL,
+        "budget_cents": DEFAULT_BUDGET_CENTS,
+        "safe_mode": False,
+        "ollama_model": OLLAMA_MODEL,
+        "ollama_url": OLLAMA_URL,
+        "hidden_paths": ["~/.ssh", "~/.gnupg", "~/.aws", "~/.fix",
+                         "~/.config/gh", "~/.netrc", "~/.azure", "~/.kube",
+                         "~/.docker", "~/.gitconfig", "~/.bash_history",
+                         "~/.python_history"],
+        # OpenAI-compatible
+        "openai_api_url": "",
+        "openai_model": "",
+    }
+    if not os.path.exists(CONFIG_PATH):
+        return cfg
+
+    try:
+        # Minimal TOML parser -- handles flat key=value and [section] tables
+        section = None
+        with open(CONFIG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("["):
+                    section = line.strip("[] ")
+                    if section == "hidden_paths":
+                        cfg["hidden_paths"] = []
+                    continue
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if val.lower() == "true":
+                    val = True
+                elif val.lower() == "false":
+                    val = False
+                elif val.isdigit():
+                    val = int(val)
+                elif re.match(r'^\d+\.\d+$', val):
+                    val = float(val)
+
+                if section == "hidden_paths" and key == "paths":
+                    # Parse TOML array: ["a", "b", "c"]
+                    arr = re.findall(r'"([^"]*)"', val if isinstance(val, str) else "")
+                    cfg["hidden_paths"] = arr
+                elif section:
+                    cfg[f"{section}_{key}"] = val
+                else:
+                    cfg[key] = val
+    except Exception:
+        pass  # bad config = defaults
+    return cfg
+
+
+# --- Database ---
+
+def init_db():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fixes (
+            error_hash TEXT,
+            env_hash TEXT,
+            fix_script TEXT,
+            raw_error TEXT DEFAULT '',
+            success_count INTEGER DEFAULT 0,
+            fail_count INTEGER DEFAULT 0,
+            created_at REAL,
+            PRIMARY KEY (error_hash, env_hash)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stats (
+            key TEXT PRIMARY KEY,
+            value REAL
+        )
+    """)
+    for k in ("total_spend_cents", "session_spend_cents", "fixes_served", "fixes_generated"):
+        conn.execute("INSERT OR IGNORE INTO stats VALUES (?, 0)", (k,))
+    conn.commit()
+
+    # Migrate: add raw_error column if missing
+    try:
+        conn.execute("SELECT raw_error FROM fixes LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE fixes ADD COLUMN raw_error TEXT DEFAULT ''")
+        conn.commit()
+
+    return conn
+
+
+def get_stat(conn, key):
+    row = conn.execute("SELECT value FROM stats WHERE key=?", (key,)).fetchone()
+    return row[0] if row else 0
+
+
+def inc_stat(conn, key, amount=1):
+    conn.execute("UPDATE stats SET value = value + ? WHERE key=?", (amount, key))
+    conn.commit()
+
+
+def lookup_fix(conn, ehash, envhash):
+    row = conn.execute(
+        "SELECT fix_script FROM fixes WHERE error_hash=? AND env_hash=? AND success_count > fail_count",
+        (ehash, envhash)
+    ).fetchone()
+    if row:
+        return row[0], True
+
+    row = conn.execute(
+        "SELECT fix_script FROM fixes WHERE error_hash=? AND success_count > fail_count ORDER BY success_count DESC LIMIT 1",
+        (ehash,)
+    ).fetchone()
+    if row:
+        return row[0], False
+    return None, False
+
+
+def store_fix(conn, ehash, envhash, fix_script, raw_error=""):
+    conn.execute(
+        "INSERT OR REPLACE INTO fixes (error_hash, env_hash, fix_script, raw_error, success_count, fail_count, created_at) "
+        "VALUES (?, ?, ?, ?, 1, 0, ?)",
+        (ehash, envhash, fix_script, raw_error, time.time())
+    )
+    conn.commit()
+
+
+def record_outcome(conn, ehash, envhash, success):
+    col = "success_count" if success else "fail_count"
+    conn.execute(f"UPDATE fixes SET {col} = {col} + 1 WHERE error_hash=? AND env_hash=?",
+                 (ehash, envhash))
+    conn.commit()
+
+
+# --- Export/Import ---
+
+def export_fixes(conn):
+    rows = conn.execute(
+        "SELECT error_hash, env_hash, fix_script, raw_error, success_count, fail_count, created_at FROM fixes"
+    ).fetchall()
+    fixes = []
+    for r in rows:
+        fixes.append({
+            "error_hash": r[0], "env_hash": r[1], "fix_script": r[2],
+            "raw_error": r[3] or "", "success_count": r[4],
+            "fail_count": r[5], "created_at": r[6]
+        })
+    print(json.dumps(fixes, indent=2))
+
+
+def import_fixes(conn, path):
+    with open(path) as f:
+        fixes = json.load(f)
+    imported = 0
+    for fix in fixes:
+        conn.execute(
+            "INSERT OR IGNORE INTO fixes (error_hash, env_hash, fix_script, raw_error, success_count, fail_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (fix["error_hash"], fix["env_hash"], fix["fix_script"],
+             fix.get("raw_error", ""), fix["success_count"], fix["fail_count"], fix["created_at"])
+        )
+        imported += 1
+    conn.commit()
+    status(f"{C_GREEN}+{C_RESET}", f"Imported {imported} fix(es).")
+
+
+# --- Environment Fingerprinting ---
+
+def get_env_fingerprint():
+    info = {
+        "os": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+        "distro": "",
+        "shell": os.environ.get("SHELL", ""),
+        "python": platform.python_version(),
+    }
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    info["distro"] = line.split("=", 1)[1].strip().strip('"')
+                    break
+    except FileNotFoundError:
+        pass
+
+    pms = [pm for pm in ("apt", "dnf", "pacman", "brew", "pip", "npm", "cargo")
+           if shutil.which(pm)]
+    info["package_managers"] = pms
+    return info
+
+
+def make_env_hash(fingerprint):
+    return hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:16]
+
+
+# --- Better Error Hashing ---
+
+def normalize_error(stderr_text):
+    """Normalize stderr for hashing: strip noise that varies between runs."""
+    text = stderr_text.strip()
+    # Strip ANSI escape codes
+    text = re.sub(r'\033\[[0-9;]*m', '', text)
+    # Strip absolute paths (keep basename)
+    text = re.sub(r'/[^\s:]+/([^\s/:]+)', r'\1', text)
+    # Strip line numbers (e.g., "line 42", ":42:", "at line 42")
+    text = re.sub(r'(?:line |:)\d+', '', text)
+    # Strip timestamps (ISO, syslog, etc.)
+    text = re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[^\s]*', '', text)
+    text = re.sub(r'\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}', '', text)
+    # Strip PIDs
+    text = re.sub(r'\bPID\s*[:=]\s*\d+', '', text)
+    text = re.sub(r'\[\d+\]', '', text)
+    # Collapse whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Take last 5 lines of the original (before normalization was lossy)
+    lines = stderr_text.strip().splitlines()
+    significant = "\n".join(lines[-5:]) if len(lines) > 5 else stderr_text.strip()
+    # Hash the normalized version
+    normalized = re.sub(r'\033\[[0-9;]*m', '', significant)
+    normalized = re.sub(r'/[^\s:]+/([^\s/:]+)', r'\1', normalized)
+    normalized = re.sub(r'(?:line |:)\d+', '', normalized)
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    return normalized
+
+
+def make_error_hash(stderr_text):
+    normalized = normalize_error(stderr_text)
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
+# --- Verification ---
+
+class Verifier:
+    """Verification predicate: did the fix work?"""
+
+    def __init__(self, spec, original_cmd):
+        self.spec = spec
+        self.original_cmd = original_cmd
+
+    def verify(self, fix_result):
+        """Returns (success: bool, explanation: str)"""
+        if self.spec is None:
+            # Default: re-run original, exit 0 = success
+            return self._verify_rerun()
+        if self.spec == "human":
+            return self._verify_human(fix_result)
+        if self.spec.startswith("contains "):
+            return self._verify_contains(fix_result)
+        if self.spec.startswith("not contains "):
+            return self._verify_not_contains(fix_result)
+        # Treat as custom verification command
+        return self._verify_command(self.spec)
+
+    def _verify_rerun(self):
+        proc = subprocess.run(self.original_cmd, shell=True, capture_output=True, text=True)
+        if proc.returncode == 0:
+            return True, "Command succeeded (exit 0)"
+        return False, f"Command failed (exit {proc.returncode}): {proc.stderr[:200]}"
+
+    def _verify_human(self, fix_result):
+        print(f"\n{C_BLUE}--- Fix Result ---{C_RESET}", file=sys.stderr)
+        # Re-run original to show current output
+        proc = subprocess.run(self.original_cmd, shell=True, capture_output=True, text=True)
+        if proc.stdout:
+            sys.stdout.write(proc.stdout)
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+        print(f"{C_BLUE}--- End Result ---{C_RESET}\n", file=sys.stderr)
+        try:
+            answer = input(f"  ?  Did this fix your problem? [Y/n] ")
+            if answer.strip().lower() == "n":
+                return False, "Human rejected the result"
+            return True, "Human approved the result"
+        except (EOFError, KeyboardInterrupt):
+            return False, "No human input"
+
+    def _verify_contains(self, fix_result):
+        # Extract expected string from spec: contains 'X' or contains "X"
+        match = re.match(r"contains\s+['\"](.+?)['\"]", self.spec)
+        if not match:
+            return False, f"Bad verify spec: {self.spec}"
+        expected = match.group(1)
+        proc = subprocess.run(self.original_cmd, shell=True, capture_output=True, text=True)
+        if expected in proc.stdout:
+            return True, f"stdout contains '{expected}'"
+        return False, f"stdout does not contain '{expected}'"
+
+    def _verify_not_contains(self, fix_result):
+        match = re.match(r"not contains\s+['\"](.+?)['\"]", self.spec)
+        if not match:
+            return False, f"Bad verify spec: {self.spec}"
+        forbidden = match.group(1)
+        proc = subprocess.run(self.original_cmd, shell=True, capture_output=True, text=True)
+        if forbidden in proc.stderr or forbidden in proc.stdout:
+            return False, f"Output contains '{forbidden}'"
+        return True, f"Output does not contain '{forbidden}'"
+
+    def _verify_command(self, cmd):
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if proc.returncode == 0:
+            return True, f"Verification command passed"
+        return False, f"Verification command failed (exit {proc.returncode})"
+
+
+class SandboxVerifier(Verifier):
+    """Runs verification inside the sandbox."""
+
+    def __init__(self, spec, original_cmd, sandbox):
+        super().__init__(spec, original_cmd)
+        self.sandbox = sandbox
+
+    def _verify_rerun(self):
+        result = self.sandbox.run_in_sandbox(self.original_cmd, network=True)
+        if result.returncode == 0:
+            return True, "Command succeeded in sandbox (exit 0)"
+        return False, f"Command failed in sandbox (exit {result.returncode})"
+
+    def _verify_command(self, cmd):
+        result = self.sandbox.run_in_sandbox(cmd, network=True)
+        if result.returncode == 0:
+            return True, "Verification passed in sandbox"
+        return False, f"Verification failed in sandbox (exit {result.returncode})"
+
+
+# --- LLM Backends ---
+
+def call_claude(prompt, api_key, model=None, api_url=None):
+    import httpx
+    resp = httpx.post(
+        api_url or CLAUDE_API_URL,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": model or CLAUDE_MODEL,
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Claude API error {resp.status_code}: {resp.text[:200]}")
+    return resp.json()["content"][0]["text"]
+
+
+def call_openai(prompt, api_key, model, api_url):
+    """Call any OpenAI-compatible API (OpenAI, Together, Groq, etc.)."""
+    import httpx
+    resp = httpx.post(
+        api_url.rstrip("/") + "/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenAI-compatible API error {resp.status_code}: {resp.text[:200]}")
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def call_ollama(prompt, model=None, url=None):
+    import httpx
+    resp = httpx.post(
+        url or OLLAMA_URL,
+        json={"model": model or OLLAMA_MODEL, "prompt": prompt, "stream": False},
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Ollama error {resp.status_code}: {resp.text[:200]}")
+    return resp.json()["response"]
+
+
+def ollama_available(url=None):
+    try:
+        import httpx
+        resp = httpx.get((url or OLLAMA_URL).rsplit("/", 1)[0] + "/api/tags", timeout=2)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def get_api_key(key_type="anthropic"):
+    """Look up API key: env var > key file > config."""
+    env_vars = {
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "custom": "FIX_API_KEY",
+    }
+    key = os.environ.get(env_vars.get(key_type, ""), "")
+    if not key:
+        keyfile = os.path.join(CONFIG_DIR, f"{key_type}_key" if key_type != "anthropic" else "api_key")
+        if os.path.exists(keyfile):
+            with open(keyfile) as f:
+                key = f.read().strip()
+    return key
+
+
+def resolve_backend(cfg, force_local=False):
+    """Determine which backend to use.
+
+    Priority: explicit flag > env var > config > auto-detect
+    Returns: (backend_name, call_fn_kwargs)
+    """
+    if force_local:
+        if ollama_available(cfg.get("ollama_url")):
+            return "ollama", {"model": cfg.get("ollama_model"), "url": cfg.get("ollama_url")}
+        raise RuntimeError("Ollama not running (--local requested)")
+
+    # Check for custom OpenAI-compatible endpoint
+    custom_url = os.environ.get("FIX_API_URL") or cfg.get("openai_api_url")
+    custom_key = os.environ.get("FIX_API_KEY") or get_api_key("custom")
+    custom_model = os.environ.get("FIX_MODEL") or cfg.get("openai_model")
+    if custom_url and custom_key and custom_model:
+        return "openai-compat", {"api_key": custom_key, "model": custom_model, "api_url": custom_url}
+
+    # OpenAI
+    openai_key = get_api_key("openai")
+    if openai_key:
+        return "openai", {"api_key": openai_key, "model": "gpt-4o-mini",
+                          "api_url": "https://api.openai.com/v1"}
+
+    # Claude (default cloud)
+    claude_key = get_api_key("anthropic")
+    if claude_key:
+        return "claude", {"api_key": claude_key, "model": cfg.get("model", CLAUDE_MODEL),
+                          "api_url": cfg.get("claude_api_url", CLAUDE_API_URL)}
+
+    # Ollama fallback
+    if ollama_available(cfg.get("ollama_url")):
+        return "ollama", {"model": cfg.get("ollama_model"), "url": cfg.get("ollama_url")}
+
+    raise RuntimeError("No LLM backend available. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or start Ollama.")
+
+
+def build_prompt(command, stderr_text, env_info, prior_failures=None):
+    prompt = f"""You are a DevOps agent. A command failed. Generate a fix.
+
+FAILED COMMAND: {command}
+
+ERROR OUTPUT:
+{stderr_text[-2000:]}
+
+SYSTEM INFO:
+- OS: {env_info.get('distro', '')} ({env_info['os']} {env_info['release']})
+- Arch: {env_info['machine']}
+- Shell: {env_info['shell']}
+- Python: {env_info['python']}
+- Package managers: {', '.join(env_info.get('package_managers', []))}
+
+Respond with ONLY a JSON object, no markdown, no explanation:
+{{"fix": "the shell command(s) to run", "explanation": "one line why", "retry": true}}
+
+The "fix" field should contain shell commands that fix the underlying issue.
+Set "retry" to true if the original command should be re-run after the fix.
+Keep it minimal. Prefer the system package manager.
+Use sudo for apt/dnf/pacman commands (they require root).
+Use pip install --break-system-packages if apt doesn't have the package.
+Combine commands with && for atomicity."""
+
+    if prior_failures:
+        prompt += "\n\nPREVIOUS FAILED ATTEMPTS (do NOT repeat these):\n"
+        for i, (fix, err) in enumerate(prior_failures, 1):
+            prompt += f"\nAttempt {i}: {fix}\nResult: {err[:300]}\n"
+
+    return prompt
+
+
+def build_explain_prompt(command, stderr_text, env_info):
+    return f"""A command failed. Explain what went wrong in 2-3 sentences.
+Be specific and actionable. Don't suggest a fix, just explain the error.
+
+COMMAND: {command}
+
+ERROR:
+{stderr_text[-2000:]}
+
+SYSTEM: {env_info.get('distro', '')} ({env_info['os']}) {env_info['machine']}"""
+
+
+def parse_llm_response(raw):
+    text = raw.strip()
+    if text.startswith("```"):
+        text = "\n".join(text.split("\n")[1:])
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+    if not text.startswith("{"):
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            text = text[start:end]
+    return json.loads(text)
+
+
+def call_llm(prompt, backend_name, backend_kwargs):
+    if backend_name == "claude":
+        return call_claude(prompt, **backend_kwargs)
+    elif backend_name in ("openai", "openai-compat"):
+        return call_openai(prompt, **backend_kwargs)
+    elif backend_name == "ollama":
+        return call_ollama(prompt, **backend_kwargs)
+    raise RuntimeError(f"Unknown backend: {backend_name}")
+
+
+# --- Shell History (fix !!) ---
+
+def get_last_failed_command():
+    """Get the last command from shell history.
+
+    Reads bash/zsh history file. Falls back to HISTFILE env var.
+    """
+    histfile = os.environ.get("HISTFILE")
+    if not histfile:
+        shell = os.environ.get("SHELL", "")
+        if "zsh" in shell:
+            histfile = os.path.expanduser("~/.zsh_history")
+        else:
+            histfile = os.path.expanduser("~/.bash_history")
+
+    if not os.path.exists(histfile):
+        return None
+
+    try:
+        with open(histfile, "rb") as f:
+            # Read last few KB (history can be huge)
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 8192))
+            data = f.read().decode("utf-8", errors="replace")
+
+        lines = data.strip().splitlines()
+        # Filter out 'fix' commands and empty lines
+        for line in reversed(lines):
+            line = line.strip()
+            # zsh history format: ": timestamp:0;command"
+            if line.startswith(":") and ";" in line:
+                line = line.split(";", 1)[1]
+            if line and not line.startswith("fix ") and line != "fix":
+                return line
+    except Exception:
+        pass
+    return None
+
+
+# --- Sandbox ---
+
+ALLOWED_PATHS = {
+    "python-pkg": ["/usr/lib/python*", "/usr/local/lib/python*", "/usr/share/python*",
+                   "/var/lib/dpkg", "/var/cache/apt", "/var/lib/apt", "/etc/apt"],
+    "system-pkg": ["/usr/bin/*", "/usr/lib/*", "/usr/share/*", "/var/lib/dpkg*",
+                   "/var/cache/apt*", "/var/cache/debconf*", "/var/lib/apt*",
+                   "/var/log/dpkg*", "/var/log/apt*", "/var/lib/update-notifier*",
+                   "/etc/apt*", "/etc/ld.so.*"],
+    "compiler": ["/usr/include/*", "/usr/lib/gcc/*", "/usr/bin/gcc*", "/usr/bin/cc*", "/tmp/*"],
+}
+DEFAULT_ALLOWED = [p for paths in ALLOWED_PATHS.values() for p in paths]
+
+
+class Sandbox:
+    DEFAULT_HIDDEN = [".ssh", ".gnupg", ".fix", ".config/gh", ".netrc", ".aws",
+                      ".azure", ".kube", ".docker", ".gitconfig", ".bash_history",
+                      ".python_history"]
+
+    def __init__(self, allowed_paths=None, hidden_paths=None, visible_paths=None, user_home=None):
+        self.workdir = None
+        self.overlay_dirs = []
+        self.allowed_paths = allowed_paths or DEFAULT_ALLOWED
+        self.user_home = user_home or self._detect_home()
+        if hidden_paths:
+            self.hidden_paths = [self._resolve_path(p) for p in hidden_paths]
+        else:
+            self.hidden_paths = [os.path.join(self.user_home, p) for p in self.DEFAULT_HIDDEN]
+        self.visible_paths = [self._resolve_path(p) for p in (visible_paths or [])]
+        self._empty_dir = None
+
+    def _detect_home(self):
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user:
+            import pwd
+            return pwd.getpwnam(sudo_user).pw_dir
+        return os.path.expanduser("~")
+
+    def _resolve_path(self, p):
+        if p.startswith("~/"):
+            return os.path.join(self.user_home, p[2:])
+        return os.path.expanduser(p)
+
+    def _sudo(self, cmd):
+        password = os.environ.get("SUDO_PASSWORD", "")
+        if password:
+            return subprocess.run(f"echo '{password}' | sudo -S {cmd}", shell=True,
+                                  capture_output=True, text=True)
+        return subprocess.run(f"sudo {cmd}", shell=True, capture_output=True, text=True)
+
+    def _resolve_hidden_paths(self):
+        if self.visible_paths:
+            home = self.user_home
+            hide = []
+            for entry in os.listdir(home):
+                full = os.path.join(home, entry)
+                if not any(full == v or full.startswith(v + "/") for v in self.visible_paths):
+                    hide.append(full)
+            return hide
+        return [p for p in self.hidden_paths if os.path.exists(p)]
+
+    def setup(self):
+        r = self._sudo("mktemp -d /run/fix-sandbox-XXXXXXXX")
+        if r.returncode != 0:
+            raise RuntimeError(f"Failed to create sandbox dir: {r.stderr}")
+        self.workdir = r.stdout.strip()
+        self._empty_dir = os.path.join(self.workdir, "_empty")
+        self._sudo(f"mkdir -p {self._empty_dir}")
+
+        targets = ["/usr", "/var", "/etc", "/home", "/tmp"]
+        for target in targets:
+            if not os.path.isdir(target):
+                continue
+            name = target.strip("/").replace("/", "_")
+            upper = os.path.join(self.workdir, f"{name}_upper")
+            work = os.path.join(self.workdir, f"{name}_work")
+            merged = os.path.join(self.workdir, f"{name}_merged")
+            self._sudo(f"mkdir -p {upper} {work} {merged}")
+            self.overlay_dirs.append((target, upper, work, merged))
+
+        for target, upper, work, merged in self.overlay_dirs:
+            r = self._sudo(f"mount -t overlay overlay "
+                           f"-o lowerdir={target},upperdir={upper},workdir={work} {merged}")
+            if r.returncode != 0:
+                raise RuntimeError(f"Failed to mount overlay for {target}: {r.stderr}")
+
+    def run_in_sandbox(self, command, network=False):
+        bind_cmds = []
+        for target, upper, work, merged in self.overlay_dirs:
+            bind_cmds.append(f"mount --bind {merged} {target}")
+
+        if self.visible_paths:
+            home_merged = None
+            for target, upper, work, merged in self.overlay_dirs:
+                if self.user_home.startswith(target):
+                    home_merged = merged
+                    break
+            bind_cmds.append(f"mount -t tmpfs tmpfs {self.user_home}")
+            for vpath in self.visible_paths:
+                if os.path.exists(vpath):
+                    rel = os.path.relpath(vpath, self.user_home)
+                    mountpoint = os.path.join(self.user_home, rel)
+                    if home_merged:
+                        target_for_home = [t for t, u, w, m in self.overlay_dirs if m == home_merged][0]
+                        source = os.path.join(home_merged, os.path.relpath(vpath, target_for_home))
+                    else:
+                        source = vpath
+                    if os.path.isdir(vpath):
+                        bind_cmds.append(f"mkdir -p {mountpoint}")
+                    else:
+                        bind_cmds.append(f"mkdir -p {os.path.dirname(mountpoint)} && touch {mountpoint}")
+                    bind_cmds.append(f"mount --bind {source} {mountpoint}")
+        else:
+            for hidden in self._resolve_hidden_paths():
+                if os.path.isdir(hidden):
+                    bind_cmds.append(f"mount --bind {self._empty_dir} {hidden}")
+                elif os.path.exists(hidden):
+                    bind_cmds.append(f"mount --bind /dev/null {hidden}")
+
+        safe_cmd = command.replace("'", "'\\''")
+        script = " && ".join(bind_cmds + [safe_cmd])
+        ns_flags = "--mount" + ("" if network else " --net")
+        full_cmd = f"unshare {ns_flags} -- bash -c '{script}'"
+
+        password = os.environ.get("SUDO_PASSWORD", "")
+        if password:
+            full_cmd = f"echo '{password}' | sudo -S {full_cmd}"
+        else:
+            full_cmd = f"sudo {full_cmd}"
+
+        return subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=120)
+
+    def get_diff(self):
+        changed = []
+        for target, upper, work, merged in self.overlay_dirs:
+            r = self._sudo(f"find {upper} -type f -printf '%s %p\\n'")
+            if r.returncode != 0 or not r.stdout.strip():
+                continue
+            for line in r.stdout.strip().split("\n"):
+                parts = line.split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                size, overlay_path = int(parts[0]), parts[1]
+                rel = os.path.relpath(overlay_path, upper)
+                real_path = os.path.join(target, rel)
+                changed.append({
+                    "path": real_path, "overlay_path": overlay_path,
+                    "size": size, "is_delete": os.path.basename(overlay_path).startswith(".wh."),
+                })
+        return changed
+
+    def check_allowlist(self, changed_files):
+        import fnmatch
+        allowed, violations = [], []
+        for entry in changed_files:
+            path = entry["path"]
+            is_ok = False
+            for pattern in self.allowed_paths:
+                if fnmatch.fnmatch(path, pattern):
+                    is_ok = True
+                    break
+                if path.startswith(pattern.rstrip("*")):
+                    is_ok = True
+                    break
+            (allowed if is_ok else violations).append(entry)
+        return allowed, violations
+
+    def commit(self):
+        for target, upper, work, merged in self.overlay_dirs:
+            check = self._sudo(f"find {upper} -mindepth 1 -maxdepth 1 | head -1")
+            if check.stdout.strip():
+                r = self._sudo(f"rsync -a {upper}/ {target}/")
+                if r.returncode != 0:
+                    raise RuntimeError(f"Failed to merge {upper} -> {target}: {r.stderr}")
+
+    def rollback(self):
+        pass
+
+    def cleanup(self):
+        if not self.workdir:
+            return
+        for target, upper, work, merged in self.overlay_dirs:
+            self._sudo(f"umount {merged} 2>/dev/null")
+        self._sudo(f"rm -rf {self.workdir}")
+        self.workdir = None
+
+
+def format_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def run_sandboxed_fix(fix_cmd, original_cmd, verify_spec, cfg, status_fn):
+    """Transactional fix: snapshot -> fix -> verify -> commit/rollback."""
+    hidden = None
+    visible = None
+    if os.environ.get("FIX_HIDDEN_PATHS"):
+        hidden = Sandbox.DEFAULT_HIDDEN + json.loads(os.environ["FIX_HIDDEN_PATHS"])
+    if os.environ.get("FIX_VISIBLE_PATHS"):
+        visible = json.loads(os.environ["FIX_VISIBLE_PATHS"])
+
+    sandbox = Sandbox(hidden_paths=hidden, visible_paths=visible)
+    try:
+        status_fn(f"{C_BLUE}#{C_RESET}", "Creating filesystem snapshot...")
+        sandbox.setup()
+
+        hidden_list = sandbox._resolve_hidden_paths()
+        if hidden_list:
+            mode = "whitelist" if sandbox.visible_paths else "blacklist"
+            status_fn(f"{C_DIM}#{C_RESET}", f"Visibility ({mode}): hiding {len(hidden_list)} path(s)")
+
+        needs_net = any(pkg_cmd in fix_cmd for pkg_cmd in
+                        ["apt ", "apt-get ", "pip ", "pip3 ", "npm ", "cargo ",
+                         "dnf ", "pacman ", "wget ", "curl ", "git clone"])
+        status_fn(f"{C_YELLOW}*{C_RESET}",
+                  f"[sandbox] Running fix (net: {'yes' if needs_net else 'no'}): {fix_cmd[:60]}")
+        fix_result = sandbox.run_in_sandbox(fix_cmd, network=needs_net)
+        if fix_result.returncode != 0:
+            status_fn(f"{C_RED}!{C_RESET}", f"[sandbox] Fix failed: {fix_result.stderr[:100]}")
+            sandbox.rollback()
+            return False, fix_result.stderr, ""
+
+        # Diff audit
+        changed = sandbox.get_diff()
+        if changed:
+            status_fn(f"{C_BLUE}#{C_RESET}", f"Diff audit: {len(changed)} file(s) modified")
+            for entry in changed[:20]:
+                icon = "-" if entry["is_delete"] else "+"
+                status_fn(f"{C_DIM} {C_RESET}", f"  {icon} {entry['path']} ({format_size(entry['size'])})")
+
+        # Allowlist check
+        allowed, violations = sandbox.check_allowlist(changed)
+        if violations:
+            status_fn(f"{C_RED}!{C_RESET}", f"SECURITY: {len(violations)} file(s) outside allowlist!")
+            for v in violations[:10]:
+                status_fn(f"{C_RED}!{C_RESET}", f"  BLOCKED: {v['path']}")
+            sandbox.rollback()
+            return False, fix_result.stdout, "ALLOWLIST_VIOLATION"
+
+        # Verification runs inside sandbox
+        verifier = SandboxVerifier(verify_spec, original_cmd, sandbox)
+        success, explanation = verifier.verify(fix_result)
+        status_fn(f"{C_GREEN if success else C_RED}{'+'  if success else '!'}{C_RESET}", explanation)
+
+        if success:
+            status_fn(f"{C_GREEN}+{C_RESET}", "Committing changes...")
+            sandbox.commit()
+            return True, fix_result.stdout, ""
+        else:
+            status_fn(f"{C_RED}!{C_RESET}", "Rolling back (system unchanged).")
+            sandbox.rollback()
+            return False, fix_result.stdout, explanation
+
+    except Exception as e:
+        status_fn(f"{C_RED}!{C_RESET}", f"Sandbox error: {e}")
+        sandbox.rollback()
+        return False, "", str(e)
+    finally:
+        sandbox.cleanup()
+
+
+# --- UI ---
+
+def show_cache(conn):
+    rows = conn.execute(
+        "SELECT error_hash, env_hash, fix_script, success_count, fail_count, created_at FROM fixes ORDER BY created_at DESC"
+    ).fetchall()
+    if not rows:
+        print("Cache is empty.")
+        return
+    print(f"\n{'HASH':<18} {'ENV':<18} {'OK':>4} {'FAIL':>4}  FIX")
+    print("-" * 80)
+    for r in rows:
+        fix_preview = r[2][:40].replace("\n", " ")
+        print(f"{r[0]:<18} {r[1]:<18} {r[3]:>4} {r[4]:>4}  {fix_preview}")
+    print()
+
+
+def show_stats(conn):
+    print(f"\n  Total spend:     ${get_stat(conn, 'total_spend_cents') / 100:.4f}")
+    print(f"  Fixes generated: {int(get_stat(conn, 'fixes_generated'))}")
+    print(f"  Fixes served:    {int(get_stat(conn, 'fixes_served'))}")
+    print()
+
+
+# --- Main Loop ---
+
+def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
+            force_local=False, safe_mode=False, auto_yes=False):
+    conn = init_db()
+
+    budget = cfg.get("budget_cents", DEFAULT_BUDGET_CENTS)
+    session_spend = get_stat(conn, "session_spend_cents")
+
+    # Run the command
+    status(f"{C_BLUE}>{C_RESET}", f"{C_BOLD}{command}{C_RESET}")
+    proc = subprocess.run(command, shell=True, capture_output=True, text=True)
+
+    if proc.stdout:
+        sys.stdout.write(proc.stdout)
+    if proc.returncode == 0:
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+        return 0
+
+    sys.stderr.write(proc.stderr)
+    status(f"{C_RED}!{C_RESET}", f"Exited {proc.returncode}")
+
+    if not proc.stderr.strip():
+        status(f"{C_DIM}?{C_RESET}", "No stderr to analyze.")
+        return proc.returncode
+
+    env_info = get_env_fingerprint()
+    ehash = make_error_hash(proc.stderr)
+    envhash = make_env_hash(env_info)
+    status(f"{C_DIM}#{C_RESET}", f"error={ehash} env={envhash}")
+
+    # Resolve backend
+    try:
+        backend_name, backend_kwargs = resolve_backend(cfg, force_local)
+    except RuntimeError as e:
+        status(f"{C_RED}!{C_RESET}", str(e))
+        return proc.returncode
+
+    # --explain: just explain the error
+    if explain_only:
+        prompt = build_explain_prompt(command, proc.stderr, env_info)
+        try:
+            raw = call_llm(prompt, backend_name, backend_kwargs)
+        except RuntimeError as e:
+            status(f"{C_RED}!{C_RESET}", str(e))
+            return proc.returncode
+        print(f"\n{raw.strip()}\n")
+        return proc.returncode
+
+    # Check cache (skip for --dry-run since we want to see the generated fix)
+    if not dry_run:
+        cached_fix, exact = lookup_fix(conn, ehash, envhash)
+        if cached_fix:
+            match_type = "exact" if exact else "fuzzy"
+            status(f"{C_GREEN}${C_RESET}", f"Cache hit ({match_type}): {C_DIM}{cached_fix[:60]}{C_RESET}")
+            inc_stat(conn, "fixes_served")
+
+            if not auto_yes and sys.stdin.isatty():
+                confirm = input(f"  ?  Apply cached fix? [Y/n] ")
+                if confirm.strip().lower() == "n":
+                    return proc.returncode
+
+            return apply_fix(conn, ehash, envhash, cached_fix, command, verify_spec,
+                             safe_mode, cfg)
+
+    # Budget check for paid backends
+    is_paid = backend_name in ("claude", "openai", "openai-compat")
+    if is_paid and session_spend + COST_PER_CALL_CENTS > budget:
+        # Try falling back to ollama
+        if ollama_available(cfg.get("ollama_url")):
+            backend_name = "ollama"
+            backend_kwargs = {"model": cfg.get("ollama_model"), "url": cfg.get("ollama_url")}
+            status(f"{C_DIM}i{C_RESET}", "Budget exhausted, falling back to Ollama.")
+            is_paid = False
+        else:
+            status(f"{C_RED}!{C_RESET}", f"Budget exhausted (${session_spend/100:.2f}/${budget/100:.2f})")
+            return proc.returncode
+
+    status(f"{C_YELLOW}@{C_RESET}", f"Cache miss. Asking {backend_name}...")
+
+    # Multi-attempt: try up to MAX_FIX_ATTEMPTS, feeding failures back
+    prior_failures = []
+
+    for attempt in range(MAX_FIX_ATTEMPTS):
+        prompt = build_prompt(command, proc.stderr, env_info, prior_failures or None)
+
+        # Parse LLM response (retry on bad JSON)
+        result = None
+        for json_retry in range(3):
+            try:
+                raw = call_llm(prompt, backend_name, backend_kwargs)
+                result = parse_llm_response(raw)
+                break
+            except json.JSONDecodeError:
+                if json_retry < 2:
+                    status(f"{C_DIM}~{C_RESET}", "Bad response, retrying...")
+                    continue
+                status(f"{C_RED}!{C_RESET}", f"Could not parse fix from {backend_name}.")
+                return proc.returncode
+            except RuntimeError as e:
+                status(f"{C_RED}!{C_RESET}", str(e))
+                return proc.returncode
+
+        if is_paid:
+            inc_stat(conn, "session_spend_cents", COST_PER_CALL_CENTS)
+            inc_stat(conn, "total_spend_cents", COST_PER_CALL_CENTS)
+        inc_stat(conn, "fixes_generated")
+
+        fix_cmd = result["fix"]
+        if isinstance(fix_cmd, list):
+            fix_cmd = " && ".join(fix_cmd)
+        explanation = result.get("explanation", "")
+
+        attempt_label = f" (attempt {attempt + 1}/{MAX_FIX_ATTEMPTS})" if attempt > 0 else ""
+        status(f"{C_GREEN}${C_RESET}", f"Fix{attempt_label}: {C_BOLD}{fix_cmd[:80]}{C_RESET}")
+        if explanation:
+            status(f"{C_DIM}i{C_RESET}", explanation)
+
+        cost_str = f"~${COST_PER_CALL_CENTS/100:.4f}" if is_paid else "free (local)"
+        status(f"{C_DIM}~{C_RESET}", f"Cost: {cost_str} [{backend_name}]")
+
+        # --dry-run: show fix and stop
+        if dry_run:
+            print(f"\n{fix_cmd}\n")
+            return proc.returncode
+
+        if not auto_yes and sys.stdin.isatty():
+            confirm = input(f"  ?  Apply this fix? [Y/n] ")
+            if confirm.strip().lower() == "n":
+                return proc.returncode
+
+        # Apply fix
+        rc = apply_fix(conn, ehash, envhash, fix_cmd, command, verify_spec,
+                        safe_mode, cfg, raw_error=proc.stderr)
+
+        if rc == 0:
+            return 0
+
+        # Fix didn't work -- if we have more attempts, feed failure context back
+        if attempt < MAX_FIX_ATTEMPTS - 1:
+            status(f"{C_YELLOW}~{C_RESET}", f"Attempt {attempt + 1} failed. Trying again with context...")
+            # Capture what went wrong
+            verify_proc = subprocess.run(command, shell=True, capture_output=True, text=True)
+            prior_failures.append((fix_cmd, verify_proc.stderr[:500] if verify_proc.stderr else "exit non-zero"))
+            continue
+
+    return 1
+
+
+def apply_fix(conn, ehash, envhash, fix_cmd, original_cmd, verify_spec,
+              safe_mode, cfg, raw_error=""):
+    """Apply a fix and verify it. Returns exit code."""
+
+    if safe_mode:
+        status(f"{C_BLUE}#{C_RESET}", "Safe mode: fix runs in sandbox with rollback.")
+        success, fix_out, verify_out = run_sandboxed_fix(
+            fix_cmd, original_cmd, verify_spec, cfg, status)
+        if success:
+            status(f"{C_GREEN}+{C_RESET}", "Contract satisfied. Changes committed.")
+            store_fix(conn, ehash, envhash, fix_cmd, raw_error)
+            return 0
+        else:
+            status(f"{C_RED}!{C_RESET}", "Contract not satisfied. System unchanged.")
+            return 1
+    else:
+        # Direct execution
+        status(f"{C_YELLOW}*{C_RESET}", "Applying fix...")
+        fix_proc = subprocess.run(fix_cmd, shell=True, capture_output=True, text=True)
+
+        if fix_proc.returncode != 0:
+            status(f"{C_RED}!{C_RESET}", f"Fix command failed: {fix_proc.stderr[:100]}")
+            return fix_proc.returncode
+
+        # Verify
+        verifier = Verifier(verify_spec, original_cmd)
+        success, explanation = verifier.verify(fix_proc)
+        status(f"{C_GREEN if success else C_RED}{'+'  if success else '!'}{C_RESET}", explanation)
+
+        if success:
+            store_fix(conn, ehash, envhash, fix_cmd, raw_error)
+            record_outcome(conn, ehash, envhash, True)
+        else:
+            record_outcome(conn, ehash, envhash, False)
+
+        return 0 if success else 1
+
+
+# --- CLI ---
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+
+    cfg = load_config()
+
+    # Subcommands
+    if sys.argv[1] == "--cache":
+        show_cache(init_db())
+        return
+    if sys.argv[1] == "--stats":
+        show_stats(init_db())
+        return
+    if sys.argv[1] == "--clear":
+        conn = init_db()
+        conn.execute("DELETE FROM fixes")
+        conn.commit()
+        print("Cache cleared.")
+        return
+    if sys.argv[1] == "export":
+        export_fixes(init_db())
+        return
+    if sys.argv[1] == "import" and len(sys.argv) > 2:
+        conn = init_db()
+        import_fixes(conn, sys.argv[2])
+        return
+
+    # Parse flags
+    args = sys.argv[1:]
+    flags = {
+        "auto_yes": False,
+        "force_local": False,
+        "safe_mode": cfg.get("safe_mode", False),
+        "explain_only": False,
+        "dry_run": False,
+        "verify_spec": None,
+    }
+    hidden_extra = []
+    visible_only = []
+    filtered_args = []
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-y", "--yes"):
+            flags["auto_yes"] = True
+        elif a in ("--local", "--ollama"):
+            flags["force_local"] = True
+        elif a == "--safe":
+            flags["safe_mode"] = True
+        elif a == "--explain":
+            flags["explain_only"] = True
+        elif a == "--dry-run":
+            flags["dry_run"] = True
+        elif a.startswith("--verify="):
+            flags["verify_spec"] = a[len("--verify="):]
+        elif a == "--verify" and i + 1 < len(args):
+            i += 1
+            flags["verify_spec"] = args[i]
+        elif a == "--hide" and i + 1 < len(args):
+            i += 1
+            hidden_extra.append(args[i])
+        elif a == "--visible" and i + 1 < len(args):
+            i += 1
+            visible_only.append(args[i])
+        elif a == "--budget" and i + 1 < len(args):
+            i += 1
+            cfg["budget_cents"] = int(args[i])
+        else:
+            filtered_args.append(a)
+        i += 1
+
+    if hidden_extra:
+        os.environ["FIX_HIDDEN_PATHS"] = json.dumps(hidden_extra)
+    if visible_only:
+        os.environ["FIX_VISIBLE_PATHS"] = json.dumps(visible_only)
+
+    # Handle fix !!
+    if filtered_args == ["!!"]:
+        last_cmd = get_last_failed_command()
+        if not last_cmd:
+            status(f"{C_RED}!{C_RESET}", "Could not find last command in shell history.")
+            sys.exit(1)
+        status(f"{C_DIM}!!{C_RESET}", f"Last command: {last_cmd}")
+        command = last_cmd
+    elif not filtered_args:
+        print(__doc__.strip())
+        return
+    else:
+        command = " ".join(filtered_args)
+
+    sys.exit(run_fix(command, cfg, **flags))
+
+
+if __name__ == "__main__":
+    main()
