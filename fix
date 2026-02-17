@@ -48,11 +48,13 @@ C_RED = "\033[31m"
 C_GREEN = "\033[32m"
 C_YELLOW = "\033[33m"
 C_BLUE = "\033[34m"
+C_CYAN = "\033[36m"
 C_DIM = "\033[2m"
 C_BOLD = "\033[1m"
+C_ITALIC = "\033[3m"
 
 if not sys.stderr.isatty():
-    C_RESET = C_RED = C_GREEN = C_YELLOW = C_BLUE = C_DIM = C_BOLD = ""
+    C_RESET = C_RED = C_GREEN = C_YELLOW = C_BLUE = C_CYAN = C_DIM = C_BOLD = C_ITALIC = ""
 
 
 def status(icon, msg):
@@ -600,14 +602,42 @@ def display_contract(contract, status_fn):
     """Print the contract to the user's terminal."""
     v = contract["verification"]
     t = contract["terms"]
-    status_fn(f"{C_BLUE}={C_RESET}", f"{C_BOLD}Contract{C_RESET}")
-    status_fn(f"{C_DIM}|{C_RESET}", f"  task:       fix '{contract['task']['command']}'")
-    status_fn(f"{C_DIM}|{C_RESET}", f"  verify:     {v['method']} -- {v['criterion']}")
-    if t['sandbox']:
-        status_fn(f"{C_DIM}|{C_RESET}", f"  sandbox:    {t['sandbox']}  network: {t['network']}  rollback: {t['rollback_on_failure']}")
-    status_fn(f"{C_DIM}|{C_RESET}", f"  attempt:    {t['current_attempt']}/{t['max_attempts']}")
+    cmd = contract["task"]["command"]
+
+    # Measure widest line for the box
+    lines = []
+    lines.append(("Task", cmd))
+    # Format verification nicely
+    verify_str = v["criterion"]
+    if v["method"] == "exit_code":
+        verify_str = f"re-run command {C_DIM}\u2192{C_RESET} {verify_str}"
+    elif v["method"] == "human_judgment":
+        verify_str = f"human reviews output"
+    elif v["method"] == "output_match":
+        verify_str = v["criterion"]
+    elif v["method"] == "output_exclusion":
+        verify_str = v["criterion"]
+    elif v["method"] == "custom_command":
+        verify_str = f"run {C_DIM}\u2192{C_RESET} {v['target']}"
+    lines.append(("Verify", verify_str))
+    if t["sandbox"]:
+        sandbox_parts = []
+        sandbox_parts.append(f"isolated overlay")
+        sandbox_parts.append(f"net: {t['network']}")
+        if t["rollback_on_failure"]:
+            sandbox_parts.append(f"rollback on breach")
+        lines.append(("Sandbox", " \u00b7 ".join(sandbox_parts)))
+    lines.append(("Attempt", f"{t['current_attempt']} of {t['max_attempts']}"))
     if contract.get("prior_failures"):
-        status_fn(f"{C_DIM}|{C_RESET}", f"  prior fails: {len(contract['prior_failures'])}")
+        n = len(contract["prior_failures"])
+        lines.append(("History", f"{n} prior breach{'es' if n != 1 else ''}"))
+
+    # Draw box
+    print(file=sys.stderr)
+    print(f"  {C_CYAN}\u250c\u2500 Contract \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{C_RESET}", file=sys.stderr)
+    for label, value in lines:
+        print(f"  {C_CYAN}\u2502{C_RESET}  {C_DIM}{label:>8}{C_RESET}   {value}", file=sys.stderr)
+    print(f"  {C_CYAN}\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{C_RESET}", file=sys.stderr)
 
 
 def build_prompt(command, stderr_text, env_info, contract, prior_failures=None):
@@ -1050,7 +1080,8 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
     session_spend = get_stat(conn, "session_spend_cents")
 
     # Run the command
-    status(f"{C_BLUE}>{C_RESET}", f"{C_BOLD}{command}{C_RESET}")
+    print(file=sys.stderr)
+    status(f"{C_BLUE}\u25b8{C_RESET}", f"{C_BOLD}{command}{C_RESET}")
     proc = subprocess.run(command, shell=True, capture_output=True, text=True)
 
     if proc.stdout:
@@ -1061,7 +1092,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         return 0
 
     sys.stderr.write(proc.stderr)
-    status(f"{C_RED}!{C_RESET}", f"Exited {proc.returncode}")
+    status(f"{C_RED}\u2717{C_RESET}", f"Exited {proc.returncode}")
 
     if not proc.stderr.strip():
         status(f"{C_DIM}?{C_RESET}", "No stderr to analyze.")
@@ -1070,7 +1101,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
     env_info = get_env_fingerprint()
     ehash = make_error_hash(proc.stderr)
     envhash = make_env_hash(env_info)
-    status(f"{C_DIM}#{C_RESET}", f"error={ehash} env={envhash}")
+    status(f"{C_DIM}\u2022{C_RESET}", f"{C_DIM}error={ehash} env={envhash}{C_RESET}")
 
     # Resolve backend
     try:
@@ -1095,7 +1126,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         cached_fix, exact = lookup_fix(conn, ehash, envhash)
         if cached_fix:
             match_type = "exact" if exact else "fuzzy"
-            status(f"{C_GREEN}${C_RESET}", f"Cache hit ({match_type}): {C_DIM}{cached_fix[:60]}{C_RESET}")
+            status(f"{C_GREEN}\u25c6{C_RESET}", f"Cache hit ({match_type}): {C_DIM}{cached_fix[:60]}{C_RESET}")
             inc_stat(conn, "fixes_served")
 
             if not auto_yes and sys.stdin.isatty():
@@ -1119,7 +1150,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             status(f"{C_RED}!{C_RESET}", f"Budget exhausted (${session_spend/100:.2f}/${budget/100:.2f})")
             return proc.returncode
 
-    status(f"{C_YELLOW}@{C_RESET}", f"Cache miss. Asking {backend_name}...")
+    status(f"{C_YELLOW}\u25cb{C_RESET}", f"Cache miss. Dispatching to agent...")
 
     # Multi-attempt: try up to MAX_FIX_ATTEMPTS, feeding failures back
     prior_failures = []
@@ -1159,14 +1190,13 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         decline_reason = result.get("explanation", "no reason given")
 
         if accepted is False:
-            status(f"{C_RED}x{C_RESET}", f"Agent {C_RED}DECLINED{C_RESET} the contract: {decline_reason}")
+            print(file=sys.stderr)
+            status(f"{C_RED}\u2718{C_RESET}", f"Agent {C_RED}DECLINED{C_RESET}: {C_ITALIC}{decline_reason}{C_RESET}")
             return proc.returncode
         elif accepted is True:
-            status(f"{C_GREEN}+{C_RESET}", f"Agent {C_GREEN}ACCEPTED{C_RESET} the contract.")
+            status(f"{C_GREEN}\u2714{C_RESET}", f"Agent {C_GREEN}accepted{C_RESET}")
         else:
-            # No explicit acceptance field -- treat as implicit acceptance
-            # (cheaper models sometimes skip it)
-            status(f"{C_DIM}~{C_RESET}", f"Agent responded (implicit acceptance).")
+            status(f"{C_DIM}\u2714{C_RESET}", f"{C_DIM}Agent accepted (implicit){C_RESET}")
 
         if is_paid:
             inc_stat(conn, "session_spend_cents", COST_PER_CALL_CENTS)
@@ -1184,16 +1214,18 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         contract["agent"]["explanation"] = explanation
 
         attempt_label = f" (attempt {attempt + 1}/{MAX_FIX_ATTEMPTS})" if attempt > 0 else ""
-        status(f"{C_GREEN}${C_RESET}", f"Fix{attempt_label}: {C_BOLD}{fix_cmd[:80]}{C_RESET}")
+        print(file=sys.stderr)
+        status(f"{C_GREEN}\u25c6{C_RESET}", f"Fix{attempt_label}: {C_BOLD}{fix_cmd}{C_RESET}")
         if explanation:
-            status(f"{C_DIM}i{C_RESET}", explanation)
+            status(f" ", f"{C_DIM}{C_ITALIC}{explanation}{C_RESET}")
 
         # --dry-run: show fix and contract, stop
         if dry_run:
-            print(f"\n{fix_cmd}\n")
+            print(file=sys.stderr)
             return proc.returncode
 
         if not auto_yes and sys.stdin.isatty():
+            print(file=sys.stderr)
             confirm = input(f"  ?  Apply this fix? [Y/n] ")
             if confirm.strip().lower() == "n":
                 return proc.returncode
@@ -1207,7 +1239,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
 
         # Fix didn't work -- if we have more attempts, feed failure context back
         if attempt < MAX_FIX_ATTEMPTS - 1:
-            status(f"{C_YELLOW}~{C_RESET}", f"Attempt {attempt + 1} failed. Trying again with context...")
+            status(f"{C_YELLOW}\u21bb{C_RESET}", f"Attempt {attempt + 1} breached. Retrying with context...")
             verify_proc = subprocess.run(command, shell=True, capture_output=True, text=True)
             prior_failures.append((fix_cmd, verify_proc.stderr[:500] if verify_proc.stderr else "exit non-zero"))
             continue
@@ -1220,42 +1252,44 @@ def apply_fix(conn, ehash, envhash, fix_cmd, original_cmd, verify_spec,
     """Apply a fix and verify it. Returns exit code."""
 
     if safe_mode:
-        status(f"{C_BLUE}#{C_RESET}", "Safe mode: fix runs in sandbox with rollback.")
+        status(f"{C_BLUE}\u25b8{C_RESET}", "Executing in sandbox...")
         success, fix_out, verify_out = run_sandboxed_fix(
             fix_cmd, original_cmd, verify_spec, cfg, status)
+        print(file=sys.stderr)
         if success:
             if contract:
                 contract["outcome"] = "fulfilled"
-            status(f"{C_GREEN}+{C_RESET}", "Contract fulfilled. Changes committed.")
+            status(f"{C_GREEN}\u2714{C_RESET}", f"{C_GREEN}Contract fulfilled.{C_RESET} Changes committed.")
             store_fix(conn, ehash, envhash, fix_cmd, raw_error, contract)
             return 0
         else:
             if contract:
                 contract["outcome"] = "breached"
-            status(f"{C_RED}!{C_RESET}", "Contract breached. System unchanged.")
+            status(f"{C_RED}\u2718{C_RESET}", f"{C_RED}Contract breached.{C_RESET} System unchanged.")
             return 1
     else:
         # Direct execution
-        status(f"{C_YELLOW}*{C_RESET}", "Applying fix...")
+        status(f"{C_BLUE}\u25b8{C_RESET}", "Applying fix...")
         fix_proc = subprocess.run(fix_cmd, shell=True, capture_output=True, text=True)
 
         if fix_proc.returncode != 0:
-            status(f"{C_RED}!{C_RESET}", f"Fix command failed: {fix_proc.stderr[:100]}")
+            status(f"{C_RED}\u2717{C_RESET}", f"Fix command failed: {fix_proc.stderr[:100]}")
             return fix_proc.returncode
 
         # Verify
         verifier = Verifier(verify_spec, original_cmd)
         success, explanation = verifier.verify(fix_proc)
-        status(f"{C_GREEN if success else C_RED}{'+'  if success else '!'}{C_RESET}", explanation)
-
+        print(file=sys.stderr)
         if success:
             if contract:
                 contract["outcome"] = "fulfilled"
+            status(f"{C_GREEN}\u2714{C_RESET}", f"{C_GREEN}Contract fulfilled.{C_RESET} {explanation}")
             store_fix(conn, ehash, envhash, fix_cmd, raw_error, contract)
             record_outcome(conn, ehash, envhash, True)
         else:
             if contract:
                 contract["outcome"] = "breached"
+            status(f"{C_RED}\u2718{C_RESET}", f"{C_RED}Contract breached.{C_RESET} {explanation}")
             record_outcome(conn, ehash, envhash, False)
 
         return 0 if success else 1
