@@ -612,31 +612,63 @@ def display_contract(contract, status_fn):
 
 def build_prompt(command, stderr_text, env_info, contract, prior_failures=None):
     contract_json = json.dumps(contract, indent=2)
-    prompt = f"""You are a DevOps agent entering a fix contract. Both you and the user
-have agreed to the following terms:
+    v = contract["verification"]
+    t = contract["terms"]
 
-CONTRACT:
+    prompt = f"""FIX CONTRACT — BINDING AGREEMENT
+
+You are an autonomous repair agent operating under the `fix` system.
+A user's command has failed. You are being offered a contract to diagnose
+and repair the failure. This contract is a binding agreement: if you accept,
+you must deliver a fix that satisfies the verification terms below. Your fix
+will be tested mechanically — there is no negotiation after acceptance.
+
+=== PARTIES ===
+PRINCIPAL (user): Owns the system described below. Wants the command to work.
+AGENT (you):      Diagnose the failure. Propose a repair. Accept the terms.
+
+=== CONTRACT ===
 {contract_json}
 
-You must provide a fix for the failed command. The fix will be verified according
-to the contract's verification terms. If verification fails, the fix is rejected.
+=== OBLIGATIONS ===
 
-Respond with ONLY a JSON object, no markdown:
+1. ACCEPTANCE: By responding, you accept this contract. Set "accepted": true
+   in your response to acknowledge the terms. If you cannot fix this, set
+   "accepted": false and explain why in "explanation".
+
+2. DELIVERABLE: Provide shell command(s) in the "fix" field that resolve the
+   root cause of the failure. Commands must be idempotent and atomic where
+   possible (chain with &&). Do not fix symptoms — fix causes.
+
+3. VERIFICATION: After your fix is applied, the system will verify the result
+   using the method specified in the contract:
+   - Method: {v['method']}
+   - Criterion: {v['criterion']}
+   - Target: {v['target']}
+   If verification fails, the contract is BREACHED. {'All filesystem changes are rolled back.' if t['rollback_on_failure'] else 'Changes persist but the fix is not cached.'}
+
+4. CONSTRAINTS:
+   - {'SANDBOXED: Your fix runs in an isolated overlay filesystem. Changes are only committed if verification passes.' if t['sandbox'] else 'DIRECT: Your fix runs directly on the system. Be careful.'}
+   - Network: {t['network']}
+   - Attempt {t['current_attempt']} of {t['max_attempts']}
+   - Prefer the system package manager (apt/dnf/pacman with sudo)
+   - Use pip install --break-system-packages if apt doesn't have the package
+   - Keep it minimal. One fix, not a tutorial.
+
+=== RESPONSE FORMAT ===
+
+Respond with ONLY a JSON object. No markdown, no prose, no commentary.
+
 {{"accepted": true, "fix": "shell command(s)", "explanation": "one line why", "retry": true}}
 
-Rules:
-- "accepted" must be true (you agree to the contract terms)
-- "fix" contains shell commands that fix the underlying issue
-- "retry" is true if the original command should be re-run after the fix
-- Keep it minimal. Prefer the system package manager.
-- Use sudo for apt/dnf/pacman commands.
-- Use pip install --break-system-packages if apt doesn't have the package.
-- Combine commands with && for atomicity."""
+"retry" indicates whether the original command should be re-run after the fix."""
 
     if prior_failures:
-        prompt += "\n\nPREVIOUS FAILED ATTEMPTS (do NOT repeat these):\n"
+        prompt += "\n\n=== PRIOR BREACHES ===\n"
+        prompt += "The following fixes were attempted and FAILED verification.\n"
+        prompt += "Do NOT repeat them. Analyze why they failed and try a different approach.\n"
         for i, (fix, err) in enumerate(prior_failures, 1):
-            prompt += f"\nAttempt {i}: {fix}\nResult: {err[:300]}\n"
+            prompt += f"\nAttempt {i}:\n  Fix: {fix}\n  Result: {err[:300]}\n"
 
     return prompt
 
