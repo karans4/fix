@@ -13,35 +13,149 @@ Options:
     fix --verify="contains 'X'" <cmd>   Stdout must contain X
     fix --verify="CMD" <command>        Run CMD as verification
     fix --local <command>               Force Ollama backend
+    fix -m MODEL <command>              Use a specific model
+    fix --root DIR <command>            Jail agent investigation to DIR
     fix -y <command>                    Auto-apply without confirmation
+
+Config:
+    ~/.fix/config.py                    Global config (Python)
+    .fix.py                             Project config (overrides global)
+
+    Config vars: model, ollama_model, ollama_url, safe_mode, verify, root,
+                 openai_api_url, openai_model, backend, hidden_paths
+
+Shell:
+    eval "$(fix shell)"                 Add to .bashrc/.zshrc/config.fish (enables fix !!)
 
 Project:
     fix init                            Create a .fix.py config for this project
-
-Data:
-    fix --cache                         Show cached fixes
-    fix --stats                         Show spending stats
-    fix --clear                         Clear the fix cache
-    fix export                          Dump fixes as JSON
-    fix import <file>                   Import fixes from JSON
 """
 
-import subprocess, hashlib, sqlite3, sys, os, json, time, platform, shutil, re
+import subprocess, sys, os, json, time, platform, shutil, re
 
 # --- Config ---
 CONFIG_DIR = os.path.expanduser("~/.fix")
-DB_PATH = os.path.join(CONFIG_DIR, "fixes.db")
 MAX_FIX_ATTEMPTS = 3
-DEFAULT_BUDGET_CENTS = 50
+MAX_INVESTIGATE_ROUNDS = 5
+INVESTIGATE_TIMEOUT = 5
+HUMAN_VERIFY_TIMEOUT = 60
 
 # Claude API defaults
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
-COST_PER_CALL_CENTS = 0.1
 
 # Ollama defaults
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "qwen2.5-coder:1.5b"
+
+# --- Investigation ---
+# Regex to detect investigation requests in LLM output
+INVESTIGATE_RE = re.compile(r'^INVESTIGATE:\s*(.+)$', re.MULTILINE)
+
+# Whitelist of allowed command prefixes for investigation
+INVESTIGATE_WHITELIST = {
+    # File inspection
+    "cat", "head", "tail", "less", "file", "wc", "stat", "md5sum", "sha256sum",
+    # Directory listing
+    "ls", "find", "tree", "du",
+    # Search
+    "grep", "rg", "ag", "awk", "sed",
+    # Versions/info
+    "which", "whereis", "type", "command", "uname", "arch", "lsb_release", "hostnamectl",
+    # Package queries
+    "dpkg", "apt", "apt-cache", "apt-file", "apt-list", "rpm", "pacman",
+    "pip", "pip3", "npm", "gem", "cargo", "rustc",
+    # Runtime versions
+    "python3", "python", "node", "gcc", "g++", "make", "cmake", "java", "go", "ruby",
+    "clang", "clang++", "ld", "as", "nasm",
+    # Environment
+    "env", "printenv", "echo", "id", "whoami", "pwd", "hostname",
+    # System info
+    "lsmod", "lscpu", "free", "df", "mount", "ip", "ss",
+    # Logs (read-only)
+    "journalctl", "dmesg",
+    # Misc
+    "readlink", "realpath", "basename", "dirname", "diff", "cmp",
+    "strings", "nm", "ldd", "objdump", "pkg-config", "test",
+}
+
+# Characters that indicate write operations
+DANGEROUS_PATTERNS = {">", ">>", "tee ", "tee\t", "| tee"}
+
+
+def _extract_paths(cmd):
+    """Extract file/directory path arguments from a shell command."""
+    import shlex
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        parts = cmd.split()
+    paths = []
+    for p in parts[1:]:
+        if p.startswith("-"):
+            continue
+        # Looks like a path if it contains / or starts with .
+        if "/" in p or p.startswith("."):
+            paths.append(p)
+    return paths
+
+
+def validate_investigate_command(cmd, root=None):
+    """Check if a command is safe for investigation (read-only whitelist + root jail)."""
+    cmd = cmd.strip()
+    if not cmd:
+        return False, "empty command"
+
+    # Block write redirections
+    for pat in DANGEROUS_PATTERNS:
+        if pat in cmd:
+            return False, f"blocked: contains '{pat}' (write operation)"
+
+    # Extract the first word (the actual command)
+    first_word = cmd.split()[0]
+    # Strip path prefix: /usr/bin/cat -> cat
+    first_word = os.path.basename(first_word)
+
+    if first_word not in INVESTIGATE_WHITELIST:
+        return False, f"'{first_word}' not in investigation whitelist"
+
+    # Root jail: check that all path arguments resolve inside root
+    if root:
+        root_abs = os.path.realpath(root)
+        for p in _extract_paths(cmd):
+            # Resolve relative to root (since cwd will be root)
+            if os.path.isabs(p):
+                resolved = os.path.realpath(p)
+            else:
+                resolved = os.path.realpath(os.path.join(root_abs, p))
+            if not resolved.startswith(root_abs + "/") and resolved != root_abs:
+                return False, f"path '{p}' is outside root ({root_abs})"
+
+    return True, ""
+
+
+def run_investigate_command(cmd, root=None, safe_mode=False, sandbox=None):
+    """Run a read-only investigation command. Returns output string."""
+    ok, reason = validate_investigate_command(cmd, root=root)
+    if not ok:
+        return f"[BLOCKED] {reason}"
+
+    try:
+        if safe_mode and sandbox:
+            result = sandbox.run_in_sandbox(cmd, network=False)
+            out = (result.stdout + result.stderr)[:2000]
+        else:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                timeout=INVESTIGATE_TIMEOUT,
+                cwd=root,
+            )
+            out = (result.stdout + result.stderr)[:2000]
+        return out if out.strip() else "(no output)"
+    except subprocess.TimeoutExpired:
+        return "[TIMEOUT] command exceeded 5s limit"
+    except Exception as e:
+        return f"[ERROR] {e}"
 
 
 # --- Colors ---
@@ -68,7 +182,6 @@ def status(icon, msg):
 DEFAULTS = {
     "backend": "auto",
     "model": CLAUDE_MODEL,
-    "budget_cents": DEFAULT_BUDGET_CENTS,
     "safe_mode": False,
     "ollama_model": OLLAMA_MODEL,
     "ollama_url": OLLAMA_URL,
@@ -78,6 +191,7 @@ DEFAULTS = {
                      "~/.python_history"],
     "openai_api_url": "",
     "openai_model": "",
+    "root": None,       # restrict agent investigation to this directory
     "verify": None,     # default verification command for this project
     "agent": None,      # custom agent function: f(contract) -> response dict
 }
@@ -195,125 +309,151 @@ def generate_config():
     return
 
 
-# --- Database ---
+# fc -ln -2 works for bash/ksh/dash (POSIX). head -1 grabs the one before "fix it" itself.
+_POSIX_HOOK = """\
+fix() {
+  if [ "$1" = "it" ] || [ "$1" = "!!" ]; then
+    FIX_LAST_COMMAND="$(fc -ln -2 | head -1 | sed 's/^[[:space:]]*//')" command fix "$@"
+  else
+    command fix "$@"
+  fi
+}"""
 
-def init_db():
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS fixes (
-            error_hash TEXT,
-            env_hash TEXT,
-            fix_script TEXT,
-            raw_error TEXT DEFAULT '',
-            contract TEXT DEFAULT '',
-            success_count INTEGER DEFAULT 0,
-            fail_count INTEGER DEFAULT 0,
-            created_at REAL,
-            PRIMARY KEY (error_hash, env_hash)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS stats (
-            key TEXT PRIMARY KEY,
-            value REAL
-        )
-    """)
-    for k in ("total_spend_cents", "session_spend_cents", "fixes_served", "fixes_generated"):
-        conn.execute("INSERT OR IGNORE INTO stats VALUES (?, 0)", (k,))
-    conn.commit()
+SHELL_HOOKS = {
+    "bash": _POSIX_HOOK,
+    "ksh":  _POSIX_HOOK,
+    "dash": _POSIX_HOOK,
+    "sh":   _POSIX_HOOK,
+    "zsh": """\
+fix() {
+  if [[ "$1" == "it" || "$1" == "!!" ]]; then
+    FIX_LAST_COMMAND="${history[$((HISTCMD-1))]}" command fix "$@"
+  else
+    command fix "$@"
+  fi
+}""",
+    "fish": """\
+function fix --wraps=fix --description 'AI command fixer'
+    if test (count $argv) -gt 0; and test "$argv[1]" = "it" -o "$argv[1]" = "!!"
+        set -lx FIX_LAST_COMMAND (builtin history search --max 1 --prefix "")
+        command fix $argv
+    else
+        command fix $argv
+    end
+end""",
+}
 
-    # Migrate: add columns if missing
-    for col in ("raw_error", "contract"):
-        try:
-            conn.execute(f"SELECT {col} FROM fixes LIMIT 1")
-        except sqlite3.OperationalError:
-            conn.execute(f"ALTER TABLE fixes ADD COLUMN {col} TEXT DEFAULT ''")
-            conn.commit()
-
-    return conn
-
-
-def get_stat(conn, key):
-    row = conn.execute("SELECT value FROM stats WHERE key=?", (key,)).fetchone()
-    return row[0] if row else 0
-
-
-def inc_stat(conn, key, amount=1):
-    conn.execute("UPDATE stats SET value = value + ? WHERE key=?", (amount, key))
-    conn.commit()
+# Shell name -> (rc file path, eval line to append)
+_RC_FILES = {
+    "bash": ("~/.bashrc",                      'eval "$(fix shell)"'),
+    "zsh":  ("~/.zshrc",                        'eval "$(fix shell)"'),
+    "ksh":  ("~/.kshrc",                        'eval "$(fix shell)"'),
+    "dash": ("~/.profile",                      'eval "$(fix shell)"'),
+    "sh":   ("~/.profile",                      'eval "$(fix shell)"'),
+    "fish": ("~/.config/fish/config.fish",       'fix shell fish | source'),
+}
 
 
-def lookup_fix(conn, ehash, envhash):
-    row = conn.execute(
-        "SELECT fix_script FROM fixes WHERE error_hash=? AND env_hash=? AND success_count > fail_count",
-        (ehash, envhash)
-    ).fetchone()
-    if row:
-        return row[0], True
+def _detect_shell():
+    """Detect the actual running shell, not just $SHELL (login shell).
 
-    row = conn.execute(
-        "SELECT fix_script FROM fixes WHERE error_hash=? AND success_count > fail_count ORDER BY success_count DESC LIMIT 1",
-        (ehash,)
-    ).fetchone()
-    if row:
-        return row[0], False
-    return None, False
+    1. Check parent process name via /proc/$PPID/comm (Linux)
+    2. Fall back to ps(1)
+    3. Fall back to $SHELL env var
+    Returns the short name: bash, zsh, fish, ksh, dash, etc.
+    """
+    ppid = os.getppid()
 
+    # Try /proc (Linux, fast)
+    try:
+        with open(f"/proc/{ppid}/comm") as f:
+            name = f.read().strip()
+        if name:
+            return name
+    except (OSError, IOError):
+        pass
 
-def store_fix(conn, ehash, envhash, fix_script, raw_error="", contract=None):
-    conn.execute(
-        "INSERT OR REPLACE INTO fixes (error_hash, env_hash, fix_script, raw_error, contract, success_count, fail_count, created_at) "
-        "VALUES (?, ?, ?, ?, ?, 1, 0, ?)",
-        (ehash, envhash, fix_script, raw_error,
-         json.dumps(contract) if contract else "", time.time())
-    )
-    conn.commit()
+    # Try ps (macOS, BSDs)
+    try:
+        result = subprocess.run(["ps", "-p", str(ppid), "-o", "comm="],
+                                capture_output=True, text=True, timeout=2)
+        if result.returncode == 0:
+            name = os.path.basename(result.stdout.strip()).lstrip("-")
+            if name:
+                return name
+    except Exception:
+        pass
 
-
-def record_outcome(conn, ehash, envhash, success):
-    col = "success_count" if success else "fail_count"
-    conn.execute(f"UPDATE fixes SET {col} = {col} + 1 WHERE error_hash=? AND env_hash=?",
-                 (ehash, envhash))
-    conn.commit()
-
-
-# --- Export/Import ---
-
-def export_fixes(conn):
-    rows = conn.execute(
-        "SELECT error_hash, env_hash, fix_script, raw_error, contract, success_count, fail_count, created_at FROM fixes"
-    ).fetchall()
-    fixes = []
-    for r in rows:
-        entry = {
-            "error_hash": r[0], "env_hash": r[1], "fix_script": r[2],
-            "raw_error": r[3] or "", "success_count": r[5],
-            "fail_count": r[6], "created_at": r[7]
-        }
-        if r[4]:
-            try:
-                entry["contract"] = json.loads(r[4])
-            except json.JSONDecodeError:
-                entry["contract"] = None
-        fixes.append(entry)
-    print(json.dumps(fixes, indent=2))
+    # Fall back to $SHELL
+    return os.path.basename(os.environ.get("SHELL", "bash"))
 
 
-def import_fixes(conn, path):
-    with open(path) as f:
-        fixes = json.load(f)
-    imported = 0
-    for fix in fixes:
-        conn.execute(
-            "INSERT OR IGNORE INTO fixes (error_hash, env_hash, fix_script, raw_error, success_count, fail_count, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (fix["error_hash"], fix["env_hash"], fix["fix_script"],
-             fix.get("raw_error", ""), fix["success_count"], fix["fail_count"], fix["created_at"])
-        )
-        imported += 1
-    conn.commit()
-    status(f"{C_GREEN}+{C_RESET}", f"Imported {imported} fix(es).")
+def _rc_path(name):
+    """Return the rc file path for a shell."""
+    path, _ = _RC_FILES.get(name, _RC_FILES["bash"])
+    return os.path.expanduser(path)
+
+
+def _rc_eval_line(name):
+    """Return the eval line to add to the rc file."""
+    _, line = _RC_FILES.get(name, _RC_FILES["bash"])
+    return line
+
+
+def shell_hook():
+    """Print shell integration code for eval."""
+    # Allow explicit: fix shell bash / fix shell zsh / fix shell fish
+    if len(sys.argv) > 2 and sys.argv[2] != "--install":
+        name = sys.argv[2]
+    else:
+        name = _detect_shell()
+
+    if name in SHELL_HOOKS:
+        print(SHELL_HOOKS[name])
+    else:
+        # Unknown shell — explain what's needed
+        print(f"# fix: no built-in hook for '{name}'.", file=sys.stderr)
+        print(f"# Set FIX_LAST_COMMAND to the previous command before calling fix.", file=sys.stderr)
+        print(f"# Example (POSIX-like shells):", file=sys.stderr)
+        print(f"#   FIX_LAST_COMMAND=\"your_cmd\" fix it", file=sys.stderr)
+        print(f"#", file=sys.stderr)
+        print(f"# If '{name}' supports fc(1), the bash hook will likely work:", file=sys.stderr)
+        print(f"#   eval \"$(fix shell bash)\"", file=sys.stderr)
+        sys.exit(1)
+
+
+def shell_install():
+    """Auto-append shell hook to the user's rc file. Returns True if installed."""
+    name = _detect_shell()
+
+    if name not in SHELL_HOOKS:
+        print(f"  {C_DIM}Unknown shell: {name}{C_RESET}", file=sys.stderr)
+        print(f"  {C_DIM}If it supports fc(1), try: eval \"$(fix shell bash)\"{C_RESET}", file=sys.stderr)
+        print(f"  {C_DIM}Otherwise, set FIX_LAST_COMMAND before calling fix it.{C_RESET}", file=sys.stderr)
+        return False
+
+    rc = _rc_path(name)
+    eval_line = _rc_eval_line(name)
+
+    # Check if already installed
+    if os.path.exists(rc):
+        with open(rc) as f:
+            contents = f.read()
+        if 'fix shell' in contents:
+            return True  # already there
+
+    try:
+        response = input(f"  Add shell hook to {rc}? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if response and response != "y":
+        return False
+
+    os.makedirs(os.path.dirname(rc) or ".", exist_ok=True)
+    with open(rc, "a") as f:
+        f.write(f"\n# fix shell integration (https://github.com/karans4/fix)\n{eval_line}\n")
+    print(f"  Added to {rc}. Restart your shell or: source {rc}")
+    return True
 
 
 # --- Environment Fingerprinting ---
@@ -342,46 +482,19 @@ def get_env_fingerprint():
     return info
 
 
-def make_env_hash(fingerprint):
-    return hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:16]
-
-
-# --- Better Error Hashing ---
-
-def normalize_error(stderr_text):
-    """Normalize stderr for hashing: strip noise that varies between runs."""
-    text = stderr_text.strip()
-    # Strip ANSI escape codes
-    text = re.sub(r'\033\[[0-9;]*m', '', text)
-    # Strip absolute paths (keep basename)
-    text = re.sub(r'/[^\s:]+/([^\s/:]+)', r'\1', text)
-    # Strip line numbers (e.g., "line 42", ":42:", "at line 42")
-    text = re.sub(r'(?:line |:)\d+', '', text)
-    # Strip timestamps (ISO, syslog, etc.)
-    text = re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[^\s]*', '', text)
-    text = re.sub(r'\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}', '', text)
-    # Strip PIDs
-    text = re.sub(r'\bPID\s*[:=]\s*\d+', '', text)
-    text = re.sub(r'\[\d+\]', '', text)
-    # Collapse whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
-    # Take last 5 lines of the original (before normalization was lossy)
-    lines = stderr_text.strip().splitlines()
-    significant = "\n".join(lines[-5:]) if len(lines) > 5 else stderr_text.strip()
-    # Hash the normalized version
-    normalized = re.sub(r'\033\[[0-9;]*m', '', significant)
-    normalized = re.sub(r'/[^\s:]+/([^\s/:]+)', r'\1', normalized)
-    normalized = re.sub(r'(?:line |:)\d+', '', normalized)
-    normalized = re.sub(r'\s+', ' ', normalized).strip()
-    return normalized
-
-
-def make_error_hash(stderr_text):
-    normalized = normalize_error(stderr_text)
-    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
-
-
 # --- Verification ---
+
+def _input_with_timeout(prompt, timeout):
+    """Like input() but returns None after timeout seconds."""
+    import select
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    if ready:
+        return sys.stdin.readline().rstrip("\n")
+    print(file=sys.stderr)  # newline after the unanswered prompt
+    return None
+
 
 class Verifier:
     """Verification predicate: did the fix work?"""
@@ -420,7 +533,12 @@ class Verifier:
             sys.stderr.write(proc.stderr)
         print(f"{C_BLUE}--- End Result ---{C_RESET}\n", file=sys.stderr)
         try:
-            answer = input(f"  ?  Did this fix your problem? [Y/n] ")
+            answer = _input_with_timeout(
+                f"  ?  Did this fix your problem? [Y/n] ({HUMAN_VERIFY_TIMEOUT}s) ",
+                HUMAN_VERIFY_TIMEOUT
+            )
+            if answer is None:
+                return False, f"Human did not respond within {HUMAN_VERIFY_TIMEOUT}s (backed out)"
             if answer.strip().lower() == "n":
                 return False, "Human rejected the result"
             return True, "Human approved the result"
@@ -534,7 +652,8 @@ def call_ollama(prompt, model=None, url=None):
 def ollama_available(url=None):
     try:
         import httpx
-        resp = httpx.get((url or OLLAMA_URL).rsplit("/", 1)[0] + "/api/tags", timeout=2)
+        base = (url or OLLAMA_URL).split("/api/")[0]
+        resp = httpx.get(base + "/api/tags", timeout=2)
         return resp.status_code == 200
     except Exception:
         return False
@@ -600,9 +719,9 @@ def resolve_backend(cfg, force_local=False):
 
 # --- Contract ---
 
-def build_contract(command, stderr_text, env_info, ehash, envhash,
+def build_contract(command, stderr_text, env_info,
                    verify_spec=None, safe_mode=False, backend_name="",
-                   attempt=0, prior_failures=None):
+                   attempt=0, prior_failures=None, root=None):
     """Build a contract object that both parties see and agree to."""
     # Verification terms
     if verify_spec is None:
@@ -643,11 +762,9 @@ def build_contract(command, stderr_text, env_info, ehash, envhash,
         "task": {
             "type": "fix_command",
             "command": command,
-            "error_hash": ehash,
             "error": stderr_text[-1000:],
         },
         "environment": {
-            "hash": envhash,
             "os": f"{env_info.get('distro', '')} ({env_info['os']} {env_info['release']})",
             "arch": env_info["machine"],
             "shell": env_info["shell"],
@@ -660,6 +777,7 @@ def build_contract(command, stderr_text, env_info, ehash, envhash,
             "max_attempts": MAX_FIX_ATTEMPTS,
             "current_attempt": attempt + 1,
             "rollback_on_failure": safe_mode,
+            "root": os.path.realpath(root) if root else None,
         },
         "agent": {
             "backend": backend_name,
@@ -704,6 +822,8 @@ def display_contract(contract, status_fn):
         if t["rollback_on_failure"]:
             sandbox_parts.append(f"rollback on breach")
         lines.append(("Sandbox", " \u00b7 ".join(sandbox_parts)))
+    if t.get("root"):
+        lines.append(("Root", t["root"]))
     lines.append(("Attempt", f"{t['current_attempt']} of {t['max_attempts']}"))
     if contract.get("prior_failures"):
         n = len(contract["prior_failures"])
@@ -754,7 +874,7 @@ AGENT (you):      Diagnose the failure. Propose a repair. Accept the terms.
    - Method: {v['method']}
    - Criterion: {v['criterion']}
    - Target: {v['target']}
-   If verification fails, the contract is BREACHED. {'All filesystem changes are rolled back.' if t['rollback_on_failure'] else 'Changes persist but the fix is not cached.'}
+   If verification fails, the contract is BREACHED. {'All filesystem changes are rolled back.' if t['rollback_on_failure'] else 'Changes persist but the fix is marked as failed.'}
 
 4. CONSTRAINTS:
    - {'SANDBOXED: Your fix runs in an isolated overlay filesystem. Changes are only committed if verification passes.' if t['sandbox'] else 'DIRECT: Your fix runs directly on the system. Be careful.'}
@@ -764,9 +884,28 @@ AGENT (you):      Diagnose the failure. Propose a repair. Accept the terms.
    - Use pip install --break-system-packages if apt doesn't have the package
    - Keep it minimal. One fix, not a tutorial.
 
+=== INVESTIGATION ===
+
+Before proposing a fix, you may investigate the system. To run a read-only
+command, output a line starting with INVESTIGATE: followed by the command.
+Example:
+    INVESTIGATE: python3 --version
+    INVESTIGATE: cat foo.c
+    INVESTIGATE: dpkg -l | grep libfoo
+
+Only read-only commands are allowed (cat, ls, grep, pip list, dpkg, etc.).
+{"Commands are jailed to root: " + t['root'] + ". Use relative paths. Absolute paths outside root will be blocked." if t.get('root') else ""}
+The results will be appended and you will be re-prompted. When you have enough
+information, respond with your JSON fix object. You may also skip investigation
+and respond immediately if the error is obvious.
+
+You may decline at any point — including after investigating — if you determine
+the problem is beyond your ability to fix. Just respond with the JSON object
+with "accepted": false and explain why.
+
 === RESPONSE FORMAT ===
 
-Respond with ONLY a JSON object. No markdown, no prose, no commentary.
+When ready, respond with a JSON object (no markdown fences, no commentary outside it):
 
 {{"accepted": true, "fix": "shell command(s)", "explanation": "one line why", "retry": true}}
 
@@ -809,13 +948,11 @@ def parse_llm_response(raw):
     return json.loads(text)
 
 
-def call_llm(prompt, backend_name, backend_kwargs, contract=None):
+def _call_backend(prompt, backend_name, backend_kwargs, contract=None):
+    """Single-shot call to a backend. Returns raw text."""
     if backend_name == "custom":
-        # Custom agent function from config — gets the contract dict directly
         fn = backend_kwargs["fn"]
         result = fn(contract or {})
-        # Custom agents return a dict directly, so we JSON-encode it
-        # for parse_llm_response to handle uniformly
         if isinstance(result, dict):
             return json.dumps(result)
         return result
@@ -826,6 +963,44 @@ def call_llm(prompt, backend_name, backend_kwargs, contract=None):
     elif backend_name == "ollama":
         return call_ollama(prompt, **backend_kwargs)
     raise RuntimeError(f"Unknown backend: {backend_name}")
+
+
+def call_llm(prompt, backend_name, backend_kwargs, contract=None):
+    """Call LLM with investigation loop. Any backend can investigate.
+
+    If the response contains INVESTIGATE: <command> lines, we run each
+    command, append the results to the prompt, and re-call. Up to
+    MAX_INVESTIGATE_ROUNDS total rounds.
+    """
+    current_prompt = prompt
+    root = contract.get("terms", {}).get("root") if contract else None
+
+    for round_n in range(MAX_INVESTIGATE_ROUNDS + 1):
+        raw = _call_backend(current_prompt, backend_name, backend_kwargs, contract)
+
+        # Check for investigation requests
+        commands = INVESTIGATE_RE.findall(raw)
+        if not commands or round_n >= MAX_INVESTIGATE_ROUNDS:
+            return raw
+
+        # Run each investigation command, build results
+        results = []
+        for cmd in commands:
+            cmd = cmd.strip()
+            status(f"\U0001f50d", f"{C_DIM}{cmd}{C_RESET}")
+            output = run_investigate_command(cmd, root=root)
+            results.append(f"$ {cmd}\n{output}")
+
+        # Re-prompt with investigation results appended
+        investigation_block = "\n\n".join(results)
+        current_prompt = (
+            f"{current_prompt}\n\n"
+            f"=== INVESTIGATION RESULTS ===\n"
+            f"{investigation_block}\n\n"
+            f"Continue investigating or respond with your JSON fix object."
+        )
+
+    return raw
 
 
 # --- Shell History (fix !!) ---
@@ -861,7 +1036,7 @@ def get_last_failed_command():
             # zsh history format: ": timestamp:0;command"
             if line.startswith(":") and ";" in line:
                 line = line.split(";", 1)[1]
-            if line and not line.startswith("fix ") and line != "fix":
+            if line and not line.startswith("fix ") and line != "fix" and line != "claude":
                 return line
     except Exception:
         pass
@@ -1132,42 +1307,14 @@ def run_sandboxed_fix(fix_cmd, original_cmd, verify_spec, cfg, status_fn):
         sandbox.cleanup()
 
 
-# --- UI ---
-
-def show_cache(conn):
-    rows = conn.execute(
-        "SELECT error_hash, env_hash, fix_script, success_count, fail_count, created_at FROM fixes ORDER BY created_at DESC"
-    ).fetchall()
-    if not rows:
-        print("Cache is empty.")
-        return
-    print(f"\n{'HASH':<18} {'ENV':<18} {'OK':>4} {'FAIL':>4}  FIX")
-    print("-" * 80)
-    for r in rows:
-        fix_preview = r[2][:40].replace("\n", " ")
-        print(f"{r[0]:<18} {r[1]:<18} {r[3]:>4} {r[4]:>4}  {fix_preview}")
-    print()
-
-
-def show_stats(conn):
-    print(f"\n  Total spend:     ${get_stat(conn, 'total_spend_cents') / 100:.4f}")
-    print(f"  Fixes generated: {int(get_stat(conn, 'fixes_generated'))}")
-    print(f"  Fixes served:    {int(get_stat(conn, 'fixes_served'))}")
-    print()
-
-
 # --- Main Loop ---
 
 def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             force_local=False, safe_mode=False, auto_yes=False):
-    conn = init_db()
 
     # Use project config verify as default if no --verify flag given
     if verify_spec is None and cfg.get("verify"):
         verify_spec = cfg["verify"]
-
-    budget = cfg.get("budget_cents", DEFAULT_BUDGET_CENTS)
-    session_spend = get_stat(conn, "session_spend_cents")
 
     # Run the command
     print(file=sys.stderr)
@@ -1189,9 +1336,6 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         return proc.returncode
 
     env_info = get_env_fingerprint()
-    ehash = make_error_hash(proc.stderr)
-    envhash = make_env_hash(env_info)
-    status(f"{C_DIM}\u2022{C_RESET}", f"{C_DIM}error={ehash} env={envhash}{C_RESET}")
 
     # Resolve backend
     try:
@@ -1211,36 +1355,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         print(f"\n{raw.strip()}\n")
         return proc.returncode
 
-    # Check cache (skip for --dry-run since we want to see the generated fix)
-    if not dry_run:
-        cached_fix, exact = lookup_fix(conn, ehash, envhash)
-        if cached_fix:
-            match_type = "exact" if exact else "fuzzy"
-            status(f"{C_GREEN}\u25c6{C_RESET}", f"Cache hit ({match_type}): {C_DIM}{cached_fix[:60]}{C_RESET}")
-            inc_stat(conn, "fixes_served")
-
-            if not auto_yes and sys.stdin.isatty():
-                confirm = input(f"  ?  Apply cached fix? [Y/n] ")
-                if confirm.strip().lower() == "n":
-                    return proc.returncode
-
-            return apply_fix(conn, ehash, envhash, cached_fix, command, verify_spec,
-                             safe_mode, cfg)
-
-    # Budget check for paid backends
-    is_paid = backend_name in ("claude", "openai", "openai-compat")
-    if is_paid and session_spend + COST_PER_CALL_CENTS > budget:
-        # Try falling back to ollama
-        if ollama_available(cfg.get("ollama_url")):
-            backend_name = "ollama"
-            backend_kwargs = {"model": cfg.get("ollama_model"), "url": cfg.get("ollama_url")}
-            status(f"{C_DIM}i{C_RESET}", "Budget exhausted, falling back to Ollama.")
-            is_paid = False
-        else:
-            status(f"{C_RED}!{C_RESET}", f"Budget exhausted (${session_spend/100:.2f}/${budget/100:.2f})")
-            return proc.returncode
-
-    status(f"{C_YELLOW}\u25cb{C_RESET}", f"Cache miss. Dispatching to agent...")
+    status(f"{C_YELLOW}\u25cb{C_RESET}", f"Dispatching to agent...")
 
     # Multi-attempt: try up to MAX_FIX_ATTEMPTS, feeding failures back
     prior_failures = []
@@ -1248,10 +1363,11 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
     for attempt in range(MAX_FIX_ATTEMPTS):
         # Build contract -- the shared agreement between user and agent
         contract = build_contract(
-            command, proc.stderr, env_info, ehash, envhash,
+            command, proc.stderr, env_info,
             verify_spec=verify_spec, safe_mode=safe_mode,
             backend_name=backend_name, attempt=attempt,
-            prior_failures=prior_failures or None
+            prior_failures=prior_failures or None,
+            root=cfg.get("root"),
         )
         display_contract(contract, status)
 
@@ -1288,11 +1404,6 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         else:
             status(f"{C_DIM}\u2714{C_RESET}", f"{C_DIM}Agent accepted (implicit){C_RESET}")
 
-        if is_paid:
-            inc_stat(conn, "session_spend_cents", COST_PER_CALL_CENTS)
-            inc_stat(conn, "total_spend_cents", COST_PER_CALL_CENTS)
-        inc_stat(conn, "fixes_generated")
-
         fix_cmd = result["fix"]
         if isinstance(fix_cmd, list):
             fix_cmd = " && ".join(fix_cmd)
@@ -1321,8 +1432,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                 return proc.returncode
 
         # Apply fix
-        rc = apply_fix(conn, ehash, envhash, fix_cmd, command, verify_spec,
-                        safe_mode, cfg, raw_error=proc.stderr, contract=contract)
+        rc = apply_fix(fix_cmd, command, verify_spec, safe_mode, cfg)
 
         if rc == 0:
             return 0
@@ -1337,8 +1447,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
     return 1
 
 
-def apply_fix(conn, ehash, envhash, fix_cmd, original_cmd, verify_spec,
-              safe_mode, cfg, raw_error="", contract=None):
+def apply_fix(fix_cmd, original_cmd, verify_spec, safe_mode, cfg):
     """Apply a fix and verify it. Returns exit code."""
 
     if safe_mode:
@@ -1347,14 +1456,9 @@ def apply_fix(conn, ehash, envhash, fix_cmd, original_cmd, verify_spec,
             fix_cmd, original_cmd, verify_spec, cfg, status)
         print(file=sys.stderr)
         if success:
-            if contract:
-                contract["outcome"] = "fulfilled"
             status(f"{C_GREEN}\u2714{C_RESET}", f"{C_GREEN}Contract fulfilled.{C_RESET} Changes committed.")
-            store_fix(conn, ehash, envhash, fix_cmd, raw_error, contract)
             return 0
         else:
-            if contract:
-                contract["outcome"] = "breached"
             status(f"{C_RED}\u2718{C_RESET}", f"{C_RED}Contract breached.{C_RESET} System unchanged.")
             return 1
     else:
@@ -1371,16 +1475,9 @@ def apply_fix(conn, ehash, envhash, fix_cmd, original_cmd, verify_spec,
         success, explanation = verifier.verify(fix_proc)
         print(file=sys.stderr)
         if success:
-            if contract:
-                contract["outcome"] = "fulfilled"
             status(f"{C_GREEN}\u2714{C_RESET}", f"{C_GREEN}Contract fulfilled.{C_RESET} {explanation}")
-            store_fix(conn, ehash, envhash, fix_cmd, raw_error, contract)
-            record_outcome(conn, ehash, envhash, True)
         else:
-            if contract:
-                contract["outcome"] = "breached"
             status(f"{C_RED}\u2718{C_RESET}", f"{C_RED}Contract breached.{C_RESET} {explanation}")
-            record_outcome(conn, ehash, envhash, False)
 
         return 0 if success else 1
 
@@ -1395,27 +1492,14 @@ def main():
     cfg = load_config()
 
     # Subcommands
-    if sys.argv[1] == "--cache":
-        show_cache(init_db())
-        return
-    if sys.argv[1] == "--stats":
-        show_stats(init_db())
-        return
-    if sys.argv[1] == "--clear":
-        conn = init_db()
-        conn.execute("DELETE FROM fixes")
-        conn.commit()
-        print("Cache cleared.")
-        return
-    if sys.argv[1] == "export":
-        export_fixes(init_db())
-        return
-    if sys.argv[1] == "import" and len(sys.argv) > 2:
-        conn = init_db()
-        import_fixes(conn, sys.argv[2])
-        return
     if sys.argv[1] == "init":
         generate_config()
+        return
+    if sys.argv[1] == "shell":
+        if len(sys.argv) > 2 and sys.argv[2] == "--install":
+            shell_install()
+        else:
+            shell_hook()
         return
 
     # Parse flags
@@ -1450,15 +1534,19 @@ def main():
         elif a == "--verify" and i + 1 < len(args):
             i += 1
             flags["verify_spec"] = args[i]
+        elif a in ("-m", "--model") and i + 1 < len(args):
+            i += 1
+            cfg["model"] = args[i]
+            cfg["ollama_model"] = args[i]
+        elif a == "--root" and i + 1 < len(args):
+            i += 1
+            cfg["root"] = args[i]
         elif a == "--hide" and i + 1 < len(args):
             i += 1
             hidden_extra.append(args[i])
         elif a == "--visible" and i + 1 < len(args):
             i += 1
             visible_only.append(args[i])
-        elif a == "--budget" and i + 1 < len(args):
-            i += 1
-            cfg["budget_cents"] = int(args[i])
         else:
             filtered_args.append(a)
         i += 1
@@ -1473,8 +1561,13 @@ def main():
         last_cmd = os.environ.get("FIX_LAST_COMMAND") or get_last_failed_command()
         if not last_cmd:
             status(f"{C_RED}!{C_RESET}", "Could not find last command in shell history.")
-            print(f"\n  {C_DIM}Tip: source the shell integration, or pass the command directly:{C_RESET}", file=sys.stderr)
-            print(f"  {C_DIM}  fix \"your command here\"{C_RESET}\n", file=sys.stderr)
+            print(f"\n  {C_DIM}fix needs a shell hook to capture the last command.{C_RESET}", file=sys.stderr)
+            if sys.stdin.isatty():
+                if shell_install():
+                    print(f"\n  {C_DIM}Run your command again, then try fix it.{C_RESET}", file=sys.stderr)
+            else:
+                name = _detect_shell()
+                print(f"  {C_DIM}Run: fix shell --install{C_RESET}", file=sys.stderr)
             sys.exit(1)
         status(f"{C_DIM}\u25b8{C_RESET}", f"Last command: {C_BOLD}{last_cmd}{C_RESET}")
         command = last_cmd
