@@ -1152,10 +1152,19 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                 status(f"{C_RED}!{C_RESET}", str(e))
                 return proc.returncode
 
-        # Check if agent explicitly declined
-        if result.get("accepted") is False:
-            status(f"{C_RED}!{C_RESET}", "Agent declined the contract.")
+        # Agent's response to the contract
+        accepted = result.get("accepted")
+        decline_reason = result.get("explanation", "no reason given")
+
+        if accepted is False:
+            status(f"{C_RED}x{C_RESET}", f"Agent {C_RED}DECLINED{C_RESET} the contract: {decline_reason}")
             return proc.returncode
+        elif accepted is True:
+            status(f"{C_GREEN}+{C_RESET}", f"Agent {C_GREEN}ACCEPTED{C_RESET} the contract.")
+        else:
+            # No explicit acceptance field -- treat as implicit acceptance
+            # (cheaper models sometimes skip it)
+            status(f"{C_DIM}~{C_RESET}", f"Agent responded (implicit acceptance).")
 
         if is_paid:
             inc_stat(conn, "session_spend_cents", COST_PER_CALL_CENTS)
