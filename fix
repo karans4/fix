@@ -2,20 +2,23 @@
 """fix -- AI-powered command fixer.
 
 Usage:
+    fix it                              Fix the last failed command (99% of the time)
     fix <command>                       Run command; if it fails, diagnose and fix
-    fix !!                              Re-run last failed command from shell history
-    fix --safe <command>                Sandboxed: overlay snapshot + rollback on failure
+
+Options:
+    fix --safe <command>                Sandboxed: overlay + rollback on failure
     fix --explain <command>             Explain the error without fixing
     fix --dry-run <command>             Show fix without executing
     fix --verify=human <command>        Human judges the result
     fix --verify="contains 'X'" <cmd>   Stdout must contain X
-    fix --verify="not contains 'X'" <cmd>  Stderr must not contain X
     fix --verify="CMD" <command>        Run CMD as verification
     fix --local <command>               Force Ollama backend
-    fix --hide PATH                     Hide PATH from sandbox agent (repeatable)
-    fix --visible PATH                  Whitelist mode: only PATH visible (repeatable)
-    fix --budget <cents>                Set max spend (default: 50)
     fix -y <command>                    Auto-apply without confirmation
+
+Project:
+    fix init                            Create a .fix.py config for this project
+
+Data:
     fix --cache                         Show cached fixes
     fix --stats                         Show spending stats
     fix --clear                         Clear the fix cache
@@ -28,7 +31,6 @@ import subprocess, hashlib, sqlite3, sys, os, json, time, platform, shutil, re
 # --- Config ---
 CONFIG_DIR = os.path.expanduser("~/.fix")
 DB_PATH = os.path.join(CONFIG_DIR, "fixes.db")
-CONFIG_PATH = os.path.join(CONFIG_DIR, "config.toml")
 MAX_FIX_ATTEMPTS = 3
 DEFAULT_BUDGET_CENTS = 50
 
@@ -61,66 +63,136 @@ def status(icon, msg):
     print(f"  {icon}  {msg}", file=sys.stderr)
 
 
-# --- Config File ---
+# --- Config (Python) ---
+
+DEFAULTS = {
+    "backend": "auto",
+    "model": CLAUDE_MODEL,
+    "budget_cents": DEFAULT_BUDGET_CENTS,
+    "safe_mode": False,
+    "ollama_model": OLLAMA_MODEL,
+    "ollama_url": OLLAMA_URL,
+    "hidden_paths": ["~/.ssh", "~/.gnupg", "~/.aws", "~/.fix",
+                     "~/.config/gh", "~/.netrc", "~/.azure", "~/.kube",
+                     "~/.docker", "~/.gitconfig", "~/.bash_history",
+                     "~/.python_history"],
+    "openai_api_url": "",
+    "openai_model": "",
+    "verify": None,     # default verification command for this project
+    "agent": None,      # custom agent function: f(contract) -> response dict
+}
+
+
+def _exec_config(path):
+    """Execute a Python config file and return its namespace as a dict."""
+    ns = {"__builtins__": __builtins__}
+    try:
+        with open(path) as f:
+            exec(f.read(), ns)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"  {C_RED}\u2717{C_RESET}  Error in {path}: {e}", file=sys.stderr)
+        return {}
+    # Extract user-defined names (skip dunders and modules)
+    return {k: v for k, v in ns.items() if not k.startswith("_")}
+
+
+def _find_project_config():
+    """Walk up from CWD to find .fix.py (stops at git root or /)."""
+    d = os.getcwd()
+    while True:
+        candidate = os.path.join(d, ".fix.py")
+        if os.path.isfile(candidate):
+            return candidate
+        # Stop at git root or filesystem root
+        if os.path.isdir(os.path.join(d, ".git")):
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
 
 def load_config():
-    """Load ~/.fix/config.toml. Returns dict with defaults."""
-    cfg = {
-        "backend": "auto",
-        "model": CLAUDE_MODEL,
-        "budget_cents": DEFAULT_BUDGET_CENTS,
-        "safe_mode": False,
-        "ollama_model": OLLAMA_MODEL,
-        "ollama_url": OLLAMA_URL,
-        "hidden_paths": ["~/.ssh", "~/.gnupg", "~/.aws", "~/.fix",
-                         "~/.config/gh", "~/.netrc", "~/.azure", "~/.kube",
-                         "~/.docker", "~/.gitconfig", "~/.bash_history",
-                         "~/.python_history"],
-        # OpenAI-compatible
-        "openai_api_url": "",
-        "openai_model": "",
-    }
-    if not os.path.exists(CONFIG_PATH):
-        return cfg
+    """Load config: defaults <- ~/.fix/config.py <- .fix.py (project-local).
 
-    try:
-        # Minimal TOML parser -- handles flat key=value and [section] tables
-        section = None
-        with open(CONFIG_PATH) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("["):
-                    section = line.strip("[] ")
-                    if section == "hidden_paths":
-                        cfg["hidden_paths"] = []
-                    continue
-                if "=" not in line:
-                    continue
-                key, val = line.split("=", 1)
-                key = key.strip()
-                val = val.strip().strip('"').strip("'")
-                if val.lower() == "true":
-                    val = True
-                elif val.lower() == "false":
-                    val = False
-                elif val.isdigit():
-                    val = int(val)
-                elif re.match(r'^\d+\.\d+$', val):
-                    val = float(val)
+    Config files are Python. Set variables, define functions.
+    A `def agent(contract)` becomes the custom backend.
+    A `verify = "pytest"` sets the default verification command.
+    """
+    cfg = dict(DEFAULTS)
 
-                if section == "hidden_paths" and key == "paths":
-                    # Parse TOML array: ["a", "b", "c"]
-                    arr = re.findall(r'"([^"]*)"', val if isinstance(val, str) else "")
-                    cfg["hidden_paths"] = arr
-                elif section:
-                    cfg[f"{section}_{key}"] = val
-                else:
-                    cfg[key] = val
-    except Exception:
-        pass  # bad config = defaults
+    # Global config
+    global_path = os.path.join(CONFIG_DIR, "config.py")
+    global_cfg = _exec_config(global_path)
+    cfg.update(global_cfg)
+
+    # Project-local config (overrides global)
+    project_path = _find_project_config()
+    if project_path:
+        project_cfg = _exec_config(project_path)
+        cfg.update(project_cfg)
+        cfg["_project_config"] = project_path
+
     return cfg
+
+
+def generate_config():
+    """Generate a .fix.py in CWD with sensible defaults for the project type."""
+    lines = ['# .fix.py -- project config for fix (https://github.com/karans4/fix)', '']
+
+    # Detect project type
+    cwd = os.getcwd()
+    if os.path.exists(os.path.join(cwd, "pyproject.toml")) or os.path.exists(os.path.join(cwd, "setup.py")):
+        lines.append('# Python project detected')
+        if os.path.isdir(os.path.join(cwd, "tests")):
+            lines.append('verify = "python3 -m pytest tests/"')
+        else:
+            lines.append('# verify = "python3 -m pytest"')
+    elif os.path.exists(os.path.join(cwd, "package.json")):
+        lines.append('# Node.js project detected')
+        lines.append('verify = "npm test"')
+    elif os.path.exists(os.path.join(cwd, "Cargo.toml")):
+        lines.append('# Rust project detected')
+        lines.append('verify = "cargo test"')
+    elif os.path.exists(os.path.join(cwd, "go.mod")):
+        lines.append('# Go project detected')
+        lines.append('verify = "go test ./..."')
+    elif os.path.exists(os.path.join(cwd, "Makefile")):
+        lines.append('# Makefile detected')
+        lines.append('verify = "make test"')
+    else:
+        lines.append('# verify = "make test"  # default verification command')
+
+    lines += [
+        '',
+        '# safe_mode = True  # always use sandbox',
+        '# backend = "local"  # force ollama',
+        '',
+        '# Custom agent -- receives contract dict, returns fix dict.',
+        '# Uncomment to use your own backend instead of the built-in LLM calls.',
+        '#',
+        '# def agent(contract):',
+        '#     """',
+        '#     contract = {',
+        '#         "task": {"command": "...", "error": "..."},',
+        '#         "environment": {"os": "...", ...},',
+        '#         "verification": {"method": "...", "criterion": "..."},',
+        '#         "terms": {"sandbox": bool, ...}',
+        '#     }',
+        '#     Return: {"accepted": True, "fix": "...", "explanation": "...", "retry": True}',
+        '#     """',
+        '#     import httpx',
+        '#     return httpx.post("https://my-service/fix", json=contract).json()',
+        '',
+    ]
+
+    with open(".fix.py", "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"Created .fix.py ({os.path.basename(os.getcwd())})")
+    return
 
 
 # --- Database ---
@@ -487,9 +559,14 @@ def get_api_key(key_type="anthropic"):
 def resolve_backend(cfg, force_local=False):
     """Determine which backend to use.
 
-    Priority: explicit flag > env var > config > auto-detect
+    Priority: custom agent fn > explicit flag > env var > config > auto-detect
     Returns: (backend_name, call_fn_kwargs)
     """
+    # Custom agent function from config (def agent(contract) in .fix.py)
+    agent_fn = cfg.get("agent")
+    if callable(agent_fn) and not force_local:
+        return "custom", {"fn": agent_fn}
+
     if force_local:
         if ollama_available(cfg.get("ollama_url")):
             return "ollama", {"model": cfg.get("ollama_model"), "url": cfg.get("ollama_url")}
@@ -732,8 +809,17 @@ def parse_llm_response(raw):
     return json.loads(text)
 
 
-def call_llm(prompt, backend_name, backend_kwargs):
-    if backend_name == "claude":
+def call_llm(prompt, backend_name, backend_kwargs, contract=None):
+    if backend_name == "custom":
+        # Custom agent function from config — gets the contract dict directly
+        fn = backend_kwargs["fn"]
+        result = fn(contract or {})
+        # Custom agents return a dict directly, so we JSON-encode it
+        # for parse_llm_response to handle uniformly
+        if isinstance(result, dict):
+            return json.dumps(result)
+        return result
+    elif backend_name == "claude":
         return call_claude(prompt, **backend_kwargs)
     elif backend_name in ("openai", "openai-compat"):
         return call_openai(prompt, **backend_kwargs)
@@ -1076,6 +1162,10 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             force_local=False, safe_mode=False, auto_yes=False):
     conn = init_db()
 
+    # Use project config verify as default if no --verify flag given
+    if verify_spec is None and cfg.get("verify"):
+        verify_spec = cfg["verify"]
+
     budget = cfg.get("budget_cents", DEFAULT_BUDGET_CENTS)
     session_spend = get_stat(conn, "session_spend_cents")
 
@@ -1172,7 +1262,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         result = None
         for json_retry in range(3):
             try:
-                raw = call_llm(prompt, backend_name, backend_kwargs)
+                raw = call_llm(prompt, backend_name, backend_kwargs, contract=contract)
                 result = parse_llm_response(raw)
                 break
             except json.JSONDecodeError:
@@ -1324,6 +1414,9 @@ def main():
         conn = init_db()
         import_fixes(conn, sys.argv[2])
         return
+    if sys.argv[1] == "init":
+        generate_config()
+        return
 
     # Parse flags
     args = sys.argv[1:]
@@ -1375,13 +1468,15 @@ def main():
     if visible_only:
         os.environ["FIX_VISIBLE_PATHS"] = json.dumps(visible_only)
 
-    # Handle fix !!
-    if filtered_args == ["!!"]:
-        last_cmd = get_last_failed_command()
+    # Handle fix it / fix !!
+    if filtered_args in (["it"], ["!!"]):
+        last_cmd = os.environ.get("FIX_LAST_COMMAND") or get_last_failed_command()
         if not last_cmd:
             status(f"{C_RED}!{C_RESET}", "Could not find last command in shell history.")
+            print(f"\n  {C_DIM}Tip: source the shell integration, or pass the command directly:{C_RESET}", file=sys.stderr)
+            print(f"  {C_DIM}  fix \"your command here\"{C_RESET}\n", file=sys.stderr)
             sys.exit(1)
-        status(f"{C_DIM}!!{C_RESET}", f"Last command: {last_cmd}")
+        status(f"{C_DIM}\u25b8{C_RESET}", f"Last command: {C_BOLD}{last_cmd}{C_RESET}")
         command = last_cmd
     elif not filtered_args:
         print(__doc__.strip())
