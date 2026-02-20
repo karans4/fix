@@ -1811,7 +1811,6 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             root=cfg.get("root"),
             bounty=cfg.get("bounty", "0.01"),
             judge=cfg.get("judge"),
-            remote=True,
         )
 
         if is_task:
