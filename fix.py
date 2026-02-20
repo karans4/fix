@@ -51,14 +51,15 @@ except ImportError:
 try:
     from client import FixClient
     from agent import FixAgent
-    from protocol import ContractState, FeedbackType, Ruling
+    from protocol import ContractState, FeedbackType, Ruling, DEFAULT_MAX_ATTEMPTS
     _HAS_REMOTE = True
 except ImportError:
     _HAS_REMOTE = False
+    DEFAULT_MAX_ATTEMPTS = 5
 
 # --- Config ---
 CONFIG_DIR = os.path.expanduser("~/.fix")
-MAX_FIX_ATTEMPTS = 5
+MAX_FIX_ATTEMPTS = DEFAULT_MAX_ATTEMPTS
 MAX_INVESTIGATE_ROUNDS = 5
 INVESTIGATE_TIMEOUT = 5
 HUMAN_VERIFY_TIMEOUT = 60

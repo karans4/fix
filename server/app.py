@@ -126,7 +126,7 @@ def build_briefing(contract_id: str, data: dict) -> str:
     cur = escrow.get("currency", "XNO") if escrow else "XNO"
     judge_info = terms.get("judge", {})
     judge_name = judge_info.get("pubkey", "") or "platform AI judge"
-    judge_fee = judge_info.get("fee", "0.005") if judge_info else "0.005"
+    judge_fee = judge_info.get("fee", "0") if judge_info else "0"
     cancel = terms.get("cancellation", {})
     agent_cancel_fee = cancel.get("agent_fee", "0") if cancel else "0"
     principal_cancel_fee = cancel.get("principal_fee", "0") if cancel else "0"

@@ -118,9 +118,11 @@ if nano is not None:
             return balance_raw >= expected_raw
 
         def send(self, contract_id: str, to_account: str, amount_xno: str) -> str:
+            raw = xno_to_raw(amount_xno)
+            if raw == 0:
+                return "noop_zero_amount"
             wallet = self._get_wallet(contract_id)
-            amount_raw = str(xno_to_raw(amount_xno))
-            result = wallet.send(to_account, amount_raw)
+            result = wallet.send(to_account, str(raw))
             if isinstance(result, dict):
                 return result.get("hash", str(result))
             return str(result)

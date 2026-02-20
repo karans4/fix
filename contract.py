@@ -10,6 +10,8 @@ import re
 import shutil
 import subprocess
 
+from protocol import DEFAULT_MAX_ATTEMPTS
+
 from scrubber import scrub
 
 
@@ -140,7 +142,7 @@ def build_contract(command, stderr, env_info, **kwargs):
         "execution": {
             "sandbox": safe_mode,
             "root": root,
-            "max_attempts": 5,
+            "max_attempts": DEFAULT_MAX_ATTEMPTS,
             "investigation_rounds": 5,
             "timeout": 300,
         },
