@@ -124,8 +124,14 @@ def build_briefing(contract_id: str, data: dict) -> str:
 
     bounty = escrow.get("bounty", "0") if escrow else "0"
     cur = escrow.get("currency", "XNO") if escrow else "XNO"
-    judge_name = terms.get("judge", {}).get("pubkey", "") or "platform AI judge"
-    max_attempts = ex.get("max_attempts", 3)
+    judge_info = terms.get("judge", {})
+    judge_name = judge_info.get("pubkey", "") or "platform AI judge"
+    judge_fee = judge_info.get("fee", "0.005") if judge_info else "0.005"
+    cancel = terms.get("cancellation", {})
+    agent_cancel_fee = cancel.get("agent_fee", "0") if cancel else "0"
+    principal_cancel_fee = cancel.get("principal_fee", "0") if cancel else "0"
+    grace_period = cancel.get("grace_period", 30) if cancel else 30
+    max_attempts = ex.get("max_attempts", 5)
     inv_rounds = ex.get("investigation_rounds", 5)
     inv_rate = ex.get("investigation_rate", 5)
     timeout_s = ex.get("timeout", 300)
@@ -225,17 +231,21 @@ PARTIES
 
 7. REMEDIES
 
-  a. Success: bounty released to Agent.
-  b. Failure (all attempts exhausted): contract canceled,
-     bounty returned to Principal.
-  c. Dispute: either party may escalate to the Judge.
-     Both parties have a dispute bond locked. The losing
-     party's bond pays the Judge. The prevailing party's
-     bond is returned.
-  d. Judge timeout: contract voided, all funds returned
-     to both parties.
-  e. Cancellation: either party may cancel within the grace
-     period at no cost. Late cancellation incurs a fee.
+  a. Success: bounty ({bounty} {cur}) released to Agent.
+  b. Failure (all {max_attempts} attempts exhausted): contract
+     canceled, bounty returned to Principal. Agent's
+     cancellation fee of {agent_cancel_fee} {cur} deducted
+     from Agent's bond.
+  c. Dispute: either party may escalate to the Judge
+     ({judge_name}). Judge fee: {judge_fee} {cur}, paid by
+     the losing party from their dispute bond. The
+     prevailing party's bond is returned in full.
+  d. Judge timeout: contract voided, all funds (bounty,
+     both bonds) returned to both parties.
+  e. Cancellation within {grace_period}s of acceptance:
+     no penalty, bond returned. Late cancellation:
+     Agent fee {agent_cancel_fee} {cur},
+     Principal fee {principal_cancel_fee} {cur}.
 
 8. COMMUNICATION
 

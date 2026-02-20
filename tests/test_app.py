@@ -24,7 +24,7 @@ SAMPLE_CONTRACT = {
     "environment": {"os": "Linux", "arch": "aarch64", "package_managers": ["apt"]},
     "capabilities": {},
     "verification": [{"method": "exit_code", "expected": 0}],
-    "execution": {"sandbox": False, "root": None, "max_attempts": 3, "investigation_rounds": 5, "timeout": 300},
+    "execution": {"sandbox": False, "root": None, "max_attempts": 5, "investigation_rounds": 5, "timeout": 300},
     "escrow": {"bounty": "0.05", "currency": "XNO", "chain": "nano"},
     "terms": {"cancellation": {"agent_fee": "0.002", "principal_fee": "0.002", "grace_period": 30}},
 }

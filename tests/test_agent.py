@@ -22,7 +22,7 @@ SAMPLE_CONTRACT = {
         "make": {"available": True},
     },
     "verification": [{"method": "exit_code", "expected": 0}],
-    "execution": {"sandbox": False, "root": None, "max_attempts": 3, "investigation_rounds": 3, "timeout": 300},
+    "execution": {"sandbox": False, "root": None, "max_attempts": 5, "investigation_rounds": 3, "timeout": 300},
     "escrow": {"bounty": "0.05", "currency": "USDC", "chain": "base", "settle": "x402"},
     "redaction": {"enabled": False, "categories": [], "custom_patterns": []},
 }

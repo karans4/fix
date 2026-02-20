@@ -17,7 +17,7 @@ SAMPLE_CONTRACT = {
     "environment": {"os": "Linux", "arch": "aarch64", "package_managers": ["apt"]},
     "capabilities": {},
     "verification": [{"method": "exit_code", "expected": 0}],
-    "execution": {"sandbox": False, "root": None, "max_attempts": 3, "investigation_rounds": 5, "timeout": 300},
+    "execution": {"sandbox": False, "root": None, "max_attempts": 5, "investigation_rounds": 5, "timeout": 300},
     "escrow": {"bounty": "0.05", "currency": "USDC", "chain": "base"},
     "terms": {"cancellation": {"agent_fee": "0.002", "principal_fee": "0.002", "grace_period": 30}},
 }
@@ -259,8 +259,8 @@ def test_verify_failure_cancels_after_max_attempts(client):
     cid = data["contract_id"]
     _accept_contract(client, cid)
 
-    # Exhaust all 3 attempts
-    for i in range(3):
+    # Exhaust all 5 attempts
+    for i in range(5):
         client.post(f"/contracts/{cid}/fix", json={
             "fix": f"echo nope{i}", "agent_pubkey": "agent_xyz",
         })

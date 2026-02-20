@@ -58,7 +58,7 @@ except ImportError:
 
 # --- Config ---
 CONFIG_DIR = os.path.expanduser("~/.fix")
-MAX_FIX_ATTEMPTS = 3
+MAX_FIX_ATTEMPTS = 5
 MAX_INVESTIGATE_ROUNDS = 5
 INVESTIGATE_TIMEOUT = 5
 HUMAN_VERIFY_TIMEOUT = 60
