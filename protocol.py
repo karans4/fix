@@ -30,6 +30,14 @@ DEFAULT_REVIEW_WINDOW = 7200  # 2 hours
 DEFAULT_JUDGE_FEE = "0.005"  # XNO -- each side stakes this as dispute bond
 DEFAULT_RULING_TIMEOUT = 60  # seconds judge has to rule
 
+# Tiered court system: escalating models and fees
+COURT_TIERS = [
+    {"name": "district",  "model": "claude-haiku-4-5-20251001", "fee": "0.001"},
+    {"name": "appeals",   "model": "claude-sonnet-4-6",         "fee": "0.005"},
+    {"name": "supreme",   "model": "claude-opus-4-6",           "fee": "0.02"},
+]
+MAX_DISPUTE_LEVEL = len(COURT_TIERS) - 1  # supreme is final
+
 # Investigation rate limiting
 DEFAULT_INVESTIGATION_RATE = 5  # seconds between commands
 

@@ -13,7 +13,7 @@ from server.app import create_app, build_briefing
 from server.store import ContractStore
 from server.escrow import EscrowManager
 from server.reputation import ReputationManager
-from server.judge import AIJudge
+from server.judge import AIJudge, TieredCourt
 
 API_KEY = os.environ.get("FIX_API_KEY", "")
 MODEL = os.environ.get("FIX_MODEL", "claude-haiku-4-5-20251001")
@@ -26,8 +26,9 @@ if not API_KEY:
     sys.exit(1)
 
 
-# --- Claude call for judge ---
-async def judge_llm_call(system_prompt, user_prompt):
+# --- Claude call for judge (supports model override for tiered courts) ---
+async def judge_llm_call(system_prompt, user_prompt, model=None):
+    use_model = model or MODEL
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -37,12 +38,12 @@ async def judge_llm_call(system_prompt, user_prompt):
                 "content-type": "application/json",
             },
             json={
-                "model": MODEL,
+                "model": use_model,
                 "max_tokens": 1024,
                 "system": system_prompt,
                 "messages": [{"role": "user", "content": user_prompt}],
             },
-            timeout=30,
+            timeout=60,
         )
         return resp.json()["content"][0]["text"]
 
@@ -309,14 +310,15 @@ store = ContractStore(DB_PATH)
 escrow_mgr = EscrowManager(DB_PATH.replace(".db", "_escrow.db"))
 reputation_mgr = ReputationManager(DB_PATH.replace(".db", "_rep.db"))
 judge = AIJudge(model=MODEL, llm_call=judge_llm_call)
+court = TieredCourt(llm_call=judge_llm_call)
 
-app = create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, judge=judge)
+app = create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, judge=judge, court=court)
 
 # Start free agent in background
 agent_thread = threading.Thread(target=run_free_agent, args=(store, escrow_mgr), daemon=True)
 agent_thread.start()
 print(f"[server] Free agent running (model: {AGENT_MODEL})")
-print(f"[server] Judge active (model: {MODEL})")
+print(f"[server] Tiered court active (district/appeals/supreme)")
 print(f"[server] Listening on :{PORT}")
 
 uvicorn.run(app, host="0.0.0.0", port=PORT)

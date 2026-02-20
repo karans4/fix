@@ -1850,15 +1850,24 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                 elif mtype == "ruling":
                     outcome = msg.get("outcome", "?")
                     reasoning = msg.get("reasoning", "")
+                    court = msg.get("court", "")
+                    final = msg.get("final", False)
+                    court_label = f" ({court} court)" if court else ""
+                    final_label = " [FINAL]" if final else ""
                     icon = C_GREEN + "\u2696" + C_RESET if outcome == "fulfilled" else C_RED + "\u2696" + C_RESET
-                    status(icon, f"Judge ruled: {C_BOLD}{outcome}{C_RESET}")
+                    status(icon, f"Judge ruled{court_label}: {C_BOLD}{outcome}{C_RESET}{final_label}")
                     if reasoning:
                         for line in reasoning.splitlines():
                             print(f"  {C_DIM}    {line}{C_RESET}", file=sys.stderr)
+                    if not final and msg.get("level", 0) < 2:
+                        status(f"{C_DIM}\u25b8{C_RESET}",
+                               f"{C_DIM}Losing party may appeal to the next court.{C_RESET}")
                 elif mtype == "dispute":
                     side = msg.get("side", "?")
+                    court = msg.get("court", "")
+                    court_label = f" -> {court} court" if court else ""
                     status(f"{C_RED}\u2696{C_RESET}",
-                           f"{C_RED}Dispute ({side}):{C_RESET} {msg.get('argument', '')}")
+                           f"{C_RED}Dispute ({side}{court_label}):{C_RESET} {msg.get('argument', '')}")
                 else:
                     label = "Agent" if who == "agent" else "You"
                     status(f"{C_DIM}\u25b8{C_RESET}", f"{label}: {text}")
@@ -2046,7 +2055,26 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                     if choice in ("q", "quit", ""):
                         break
 
-                    elif choice in ("d", "dispute"):
+                    elif choice in ("d", "dispute", "a", "appeal"):
+                        # Check current state for appeal eligibility
+                        d = await fix_client.get_contract(contract_id)
+                        if d:
+                            rulings = [m for m in d.get("transcript", []) if m.get("type") == "ruling"]
+                            level = len(rulings)
+                            if level > 0:
+                                last = rulings[-1]
+                                court = last.get("court", "?")
+                                if last.get("final"):
+                                    status(f"{C_RED}!{C_RESET}",
+                                           f"Supreme court has ruled. No further appeals.")
+                                    continue
+                                next_court = ["district", "appeals", "supreme"][min(level, 2)]
+                                status(f"{C_DIM}\u25b8{C_RESET}",
+                                       f"Appealing {court} court ruling to {next_court} court")
+                            else:
+                                status(f"{C_DIM}\u25b8{C_RESET}",
+                                       "Filing dispute (district court)")
+
                         try:
                             arg = input(f"  {C_CYAN}Reason:{C_RESET} ").strip()
                         except (EOFError, KeyboardInterrupt):
@@ -2055,17 +2083,30 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                             status(f"{C_RED}!{C_RESET}", "Dispute requires a reason")
                             continue
                         try:
-                            await fix_client.dispute(contract_id, arg, side="principal")
-                            status(f"{C_BLUE}\u2696{C_RESET}", "Dispute filed")
+                            result = await fix_client.dispute(contract_id, arg, side="principal")
+                            court = result.get("court", "?")
+                            status(f"{C_BLUE}\u2696{C_RESET}",
+                                   f"Dispute filed ({court} court)")
                             status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for judge...")
-                            for _ in range(60):
+                            for _ in range(120):
                                 await _asyncio.sleep(1)
                                 d = await fix_client.get_contract(contract_id)
-                                if d and d.get("status") in ("resolved", "voided"):
-                                    for msg in d.get("transcript", []):
-                                        if msg.get("type") == "ruling":
-                                            _show_chat(msg)
+                                if not d:
+                                    continue
+                                # Show new rulings
+                                t = d.get("transcript", [])
+                                new_rulings = [m for m in t if m.get("type") == "ruling"]
+                                if len(new_rulings) > len(rulings if 'rulings' in dir() else []):
+                                    for r in new_rulings[len(rulings) if 'rulings' in dir() else 0:]:
+                                        _show_chat(r)
                                     break
+                                if d.get("status") in ("resolved", "voided", "in_progress"):
+                                    break
+                            # Show appeal option if not final
+                            if result.get("can_appeal"):
+                                status(f"{C_YELLOW}\u25b8{C_RESET}",
+                                       f"You may appeal to {result['next_court']} court "
+                                       f"(fee: {result['next_fee']} XNO)")
                         except Exception as e:
                             status(f"{C_RED}!{C_RESET}", f"Dispute failed: {e}")
 

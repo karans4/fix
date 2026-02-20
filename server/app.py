@@ -24,10 +24,10 @@ from typing import Optional
 from server.store import ContractStore
 from server.escrow import EscrowManager
 from server.reputation import ReputationManager
-from server.judge import AIJudge, Evidence, JudgeRuling
+from server.judge import AIJudge, TieredCourt, Evidence, JudgeRuling
 from protocol import (
     DEFAULT_REVIEW_WINDOW, DEFAULT_INVESTIGATION_RATE, DEFAULT_RULING_TIMEOUT,
-    MODE_SUPERVISED, MODE_AUTONOMOUS,
+    MODE_SUPERVISED, MODE_AUTONOMOUS, COURT_TIERS, MAX_DISPUTE_LEVEL,
 )
 
 
@@ -236,10 +236,17 @@ PARTIES
      canceled, bounty returned to Principal. Agent's
      cancellation fee of {agent_cancel_fee} {cur} deducted
      from Agent's bond.
-  c. Dispute: either party may escalate to the Judge
-     ({judge_name}). Judge fee: {judge_fee} {cur}, paid by
-     the losing party from their dispute bond. The
-     prevailing party's bond is returned in full.
+  c. Dispute: three-tier court system. The losing party
+     may appeal to the next court. Each tier uses a more
+     capable (and expensive) judge:
+
+       District court:  {COURT_TIERS[0]['fee']} {cur}  (fast, first pass)
+       Appeals court:   {COURT_TIERS[1]['fee']} {cur}  (thorough review)
+       Supreme court:   {COURT_TIERS[2]['fee']} {cur}  (FINAL, no appeal)
+
+     Fee paid by the losing party from their dispute bond.
+     The prevailing party's bond is returned in full.
+     Only the loser of the previous ruling may appeal.
   d. Judge timeout: contract voided, all funds (bounty,
      both bonds) returned to both parties.
   e. Cancellation within {grace_period}s of acceptance:
@@ -291,7 +298,9 @@ EXHIBIT A: PLATFORM API
 
   POST /contracts/{I}/dispute
     Body: {{"argument": "<your case>", "side": "agent"}}
-    Escalate to Judge."""
+    Escalate to judge. First call -> district court. Subsequent
+    calls by the losing party -> appeals -> supreme (final).
+    Response includes: outcome, court, level, can_appeal, next_court."""
 
 
 # --- App factory ---
@@ -301,6 +310,7 @@ def create_app(
     escrow_mgr: EscrowManager | None = None,
     reputation_mgr: ReputationManager | None = None,
     judge: AIJudge | None = None,
+    court: TieredCourt | None = None,
 ) -> FastAPI:
     """Create FastAPI app with injected dependencies."""
 
@@ -319,13 +329,15 @@ def create_app(
     _store = store or ContractStore()
     _escrow = escrow_mgr or EscrowManager()
     _reputation = reputation_mgr or ReputationManager()
-    _judge = judge  # None is ok -- disputes just won't work without it
+    _judge = judge  # Legacy single-judge (still works for basic disputes)
+    _court = court  # Tiered court system (preferred)
 
     # Expose for testing
     app.state.store = _store
     app.state.escrow = _escrow
     app.state.reputation = _reputation
     app.state.judge = _judge
+    app.state.court = _court
 
     # --- Helpers ---
 
@@ -731,69 +743,132 @@ def create_app(
 
     @app.post("/contracts/{contract_id}/dispute")
     async def dispute_contract(contract_id: str, req: DisputeRequest):
-        """Escalate to judge. Bond loser pays judge fee."""
+        """Escalate to judge. Tiered court system: district -> appeals -> supreme.
+
+        First dispute goes to district court (Haiku). Losing party can appeal
+        to appeals court (Sonnet), then supreme court (Opus). Supreme is final.
+        Each tier costs more. Fee comes from loser's dispute bond.
+        """
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
+
+        # Determine dispute level from prior rulings in transcript
+        prior_rulings = [
+            m for m in data.get("transcript", [])
+            if m.get("type") == "ruling"
+        ]
+        level = len(prior_rulings)
+
+        if level > MAX_DISPUTE_LEVEL:
+            raise HTTPException(409, "Supreme court has already ruled. No further appeals.")
+
+        # For appeals (level > 0): only the loser of the previous ruling can appeal
+        if level > 0:
+            last_ruling = prior_rulings[-1]
+            last_outcome = last_ruling.get("outcome", "")
+            # Determine who lost the last ruling
+            if last_outcome in ("fulfilled", "evil_principal"):
+                loser = "principal"
+            else:
+                loser = "agent"
+            if req.side != loser:
+                raise HTTPException(409, f"Only the losing party ({loser}) can appeal")
+
+        court_name = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]["name"]
+        fee = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]["fee"]
 
         _store.update_status(contract_id, "disputed")
         _store.append_message(contract_id, {
             "type": "dispute",
             "argument": req.argument,
             "side": req.side,
+            "level": level,
+            "court": court_name,
+            "fee": fee,
         })
 
-        if not _judge:
+        if not _court and not _judge:
             raise HTTPException(501, "No judge configured")
 
-        # Build evidence
+        # Build evidence with prior rulings for appeals
         evidence = Evidence(
             contract=data["contract"],
             messages=data["transcript"],
             hash_chain="",
             arguments={req.side: req.argument},
+            prior_rulings=[r for r in prior_rulings],
         )
 
-        ruling = await _judge.rule(evidence)
+        if _court:
+            ruling = await _court.rule(evidence, level=level)
+            can_appeal = level < MAX_DISPUTE_LEVEL
+        else:
+            # Legacy single judge -- no tiered system, ruling is always final
+            ruling = await _judge.rule(evidence)
+            ruling.court = court_name
+            ruling.level = level
+            ruling.final = True
+            can_appeal = False
 
-        _store.update_status(contract_id, "resolved")
+        # If this is the final ruling (supreme or no appeal possible), resolve
+        if ruling.final or not can_appeal:
+            _store.update_status(contract_id, "resolved")
+        else:
+            # Not final -- set back to previous state so loser can appeal
+            _store.update_status(contract_id, "in_progress")
+
         _store.append_message(contract_id, {
             "type": "ruling",
             "outcome": ruling.outcome,
             "reasoning": ruling.reasoning,
+            "court": ruling.court,
+            "level": ruling.level,
+            "final": ruling.final,
             "flags": ruling.flags,
         })
 
-        # Determine dispute loser for bond routing
-        if ruling.outcome in ("fulfilled", "evil_principal"):
-            dispute_loser = "principal"
-            escrow_ruling = "fulfilled" if ruling.outcome == "fulfilled" else "fulfilled"
-        elif ruling.outcome in ("evil_agent", "evil_both"):
-            dispute_loser = "agent"
-            escrow_ruling = "canceled"
-        else:
-            dispute_loser = "agent"
-            escrow_ruling = ruling.outcome if ruling.outcome in ("canceled", "impossible") else "canceled"
+        # Only resolve escrow on final ruling
+        if ruling.final or not can_appeal:
+            if ruling.outcome in ("fulfilled", "evil_principal"):
+                dispute_loser = "principal"
+                escrow_ruling = "fulfilled"
+            elif ruling.outcome in ("evil_agent", "evil_both"):
+                dispute_loser = "agent"
+                escrow_ruling = "canceled"
+            else:
+                dispute_loser = "agent"
+                escrow_ruling = ruling.outcome if ruling.outcome in ("canceled", "impossible") else "canceled"
 
-        escrow = _escrow.get(contract_id)
-        if escrow and not escrow["resolved"]:
-            _escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
-                          dispute_loser=dispute_loser)
+            escrow = _escrow.get(contract_id)
+            if escrow and not escrow["resolved"]:
+                _escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
+                              dispute_loser=dispute_loser)
 
-        # Reputation
-        bounty = Decimal(data["contract"].get("escrow", {}).get("bounty", "0"))
-        if data.get("agent_pubkey"):
-            agent_outcome = "fulfilled" if ruling.outcome == "fulfilled" else "canceled"
-            _reputation.record(data["agent_pubkey"], "agent", agent_outcome, bounty)
-            if "evil_agent" in ruling.flags:
-                _reputation.record(data["agent_pubkey"], "agent", "evil_flag")
-        if data.get("principal_pubkey"):
-            principal_outcome = "fulfilled" if ruling.outcome == "fulfilled" else "canceled"
-            _reputation.record(data["principal_pubkey"], "principal", principal_outcome, bounty)
-            if "evil_principal" in ruling.flags:
-                _reputation.record(data["principal_pubkey"], "principal", "evil_flag")
+            # Reputation (only on final ruling)
+            bounty = Decimal(data["contract"].get("escrow", {}).get("bounty", "0"))
+            if data.get("agent_pubkey"):
+                agent_outcome = "fulfilled" if ruling.outcome == "fulfilled" else "canceled"
+                _reputation.record(data["agent_pubkey"], "agent", agent_outcome, bounty)
+                if "evil_agent" in ruling.flags:
+                    _reputation.record(data["agent_pubkey"], "agent", "evil_flag")
+            if data.get("principal_pubkey"):
+                principal_outcome = "fulfilled" if ruling.outcome == "fulfilled" else "canceled"
+                _reputation.record(data["principal_pubkey"], "principal", principal_outcome, bounty)
+                if "evil_principal" in ruling.flags:
+                    _reputation.record(data["principal_pubkey"], "principal", "evil_flag")
 
-        return {"outcome": ruling.outcome, "reasoning": ruling.reasoning, "flags": ruling.flags}
+        return {
+            "outcome": ruling.outcome,
+            "reasoning": ruling.reasoning,
+            "court": ruling.court,
+            "level": ruling.level,
+            "final": ruling.final,
+            "can_appeal": can_appeal and not ruling.final,
+            "next_court": COURT_TIERS[level + 1]["name"] if can_appeal and not ruling.final else None,
+            "next_fee": COURT_TIERS[level + 1]["fee"] if can_appeal and not ruling.final else None,
+            "flags": ruling.flags,
+        }
 
     @app.post("/contracts/{contract_id}/void")
     async def void_contract(contract_id: str):

@@ -15,7 +15,7 @@ from server.app import create_app
 from server.store import ContractStore
 from server.escrow import EscrowManager
 from server.reputation import ReputationManager
-from server.judge import AIJudge, Evidence, JudgeRuling
+from server.judge import AIJudge, TieredCourt, Evidence, JudgeRuling
 
 
 SAMPLE_CONTRACT = {
@@ -592,3 +592,148 @@ def test_review_dispute_requires_argument(client):
         "argument": "",
     })
     assert resp.status_code == 400
+
+
+# --- Tiered court system ---
+
+class FakeTieredCourt:
+    """Fake tiered court that returns configurable rulings per level."""
+    def __init__(self, rulings=None):
+        # rulings: list of (outcome, reasoning) per level
+        self.rulings = rulings or [("canceled", "district says no"), ("fulfilled", "appeals says yes"), ("canceled", "supreme says no")]
+        self.calls = []
+
+    async def rule(self, evidence, level=0):
+        self.calls.append(level)
+        outcome, reasoning = self.rulings[min(level, len(self.rulings) - 1)]
+        from protocol import COURT_TIERS, MAX_DISPUTE_LEVEL
+        tier = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]
+        return JudgeRuling(
+            outcome=outcome, reasoning=reasoning,
+            court=tier["name"], level=level,
+            final=(level >= MAX_DISPUTE_LEVEL),
+        )
+
+
+def _make_tiered_app(rulings=None):
+    court = FakeTieredCourt(rulings)
+    store = ContractStore(":memory:")
+    escrow_mgr = EscrowManager(":memory:")
+    reputation_mgr = ReputationManager(":memory:")
+    app = create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, court=court)
+    return app, store, escrow_mgr, court
+
+
+def test_tiered_district_court():
+    """First dispute goes to district court."""
+    app, store, escrow_mgr, court = _make_tiered_app()
+    client = TestClient(app)
+
+    data = _create_contract(client, JUDGE_CONTRACT)
+    cid = data["contract_id"]
+    _bond_and_accept(client, cid)
+
+    resp = client.post(f"/contracts/{cid}/dispute", json={
+        "argument": "Agent did nothing", "side": "principal",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["court"] == "district"
+    assert body["level"] == 0
+    assert body["can_appeal"] is True
+    assert body["next_court"] == "appeals"
+    assert court.calls == [0]
+
+    # Contract goes back to in_progress (not resolved) so loser can appeal
+    contract = client.get(f"/contracts/{cid}").json()
+    assert contract["status"] == "in_progress"
+
+
+def test_tiered_appeal_to_appeals_court():
+    """Loser of district ruling can appeal to appeals court."""
+    # District: canceled (agent loses). Agent appeals -> appeals: fulfilled (principal loses)
+    app, store, escrow_mgr, court = _make_tiered_app(
+        rulings=[("canceled", "district: agent failed"), ("fulfilled", "appeals: actually worked")]
+    )
+    client = TestClient(app)
+
+    data = _create_contract(client, JUDGE_CONTRACT)
+    cid = data["contract_id"]
+    _bond_and_accept(client, cid)
+
+    # District court
+    resp = client.post(f"/contracts/{cid}/dispute", json={
+        "argument": "Agent did nothing", "side": "principal",
+    })
+    assert resp.json()["court"] == "district"
+    assert resp.json()["outcome"] == "canceled"
+
+    # Agent appeals (agent was the loser of "canceled")
+    resp = client.post(f"/contracts/{cid}/dispute", json={
+        "argument": "I fixed it, principal is wrong", "side": "agent",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["court"] == "appeals"
+    assert body["level"] == 1
+    assert body["outcome"] == "fulfilled"
+    assert body["can_appeal"] is True
+    assert body["next_court"] == "supreme"
+    assert court.calls == [0, 1]
+
+
+def test_tiered_supreme_is_final():
+    """Supreme court ruling is final, no further appeals."""
+    app, store, escrow_mgr, court = _make_tiered_app(
+        rulings=[("canceled", "district"), ("fulfilled", "appeals"), ("canceled", "supreme final")]
+    )
+    client = TestClient(app)
+
+    data = _create_contract(client, JUDGE_CONTRACT)
+    cid = data["contract_id"]
+    _bond_and_accept(client, cid)
+
+    # District -> canceled (agent loses)
+    client.post(f"/contracts/{cid}/dispute", json={"argument": "bad", "side": "principal"})
+    # Appeals -> fulfilled (principal loses), agent appeals
+    client.post(f"/contracts/{cid}/dispute", json={"argument": "appeal", "side": "agent"})
+    # Supreme -> principal appeals
+    resp = client.post(f"/contracts/{cid}/dispute", json={"argument": "supreme appeal", "side": "principal"})
+    body = resp.json()
+    assert body["court"] == "supreme"
+    assert body["level"] == 2
+    assert body["final"] is True
+    assert body["can_appeal"] is False
+    assert body["next_court"] is None
+
+    # Contract is resolved (final)
+    contract = client.get(f"/contracts/{cid}").json()
+    assert contract["status"] == "resolved"
+
+    # Escrow is resolved
+    escrow = escrow_mgr.get(cid)
+    assert escrow["resolved"] is True
+
+    # No further disputes allowed
+    resp = client.post(f"/contracts/{cid}/dispute", json={"argument": "again", "side": "agent"})
+    assert resp.status_code == 409
+
+
+def test_tiered_only_loser_can_appeal():
+    """Only the losing party of the previous ruling can appeal."""
+    app, store, escrow_mgr, court = _make_tiered_app(
+        rulings=[("canceled", "agent loses")]
+    )
+    client = TestClient(app)
+
+    data = _create_contract(client, JUDGE_CONTRACT)
+    cid = data["contract_id"]
+    _bond_and_accept(client, cid)
+
+    # District -> canceled (agent loses)
+    client.post(f"/contracts/{cid}/dispute", json={"argument": "bad", "side": "principal"})
+
+    # Principal tries to appeal (but principal won!) -> should fail
+    resp = client.post(f"/contracts/{cid}/dispute", json={"argument": "appeal anyway", "side": "principal"})
+    assert resp.status_code == 409
+    assert "losing party" in resp.json()["detail"]
