@@ -1820,6 +1820,8 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         display_contract(contract, status)
 
         async def _run_remote():
+            import select as _select
+
             platform_url = cfg.get("platform_url", "https://fix.notruefireman.org")
             fix_client = FixClient(base_url=platform_url)
 
@@ -1828,8 +1830,10 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for agent...")
 
             tried_fixes = set()
-            seen_msgs = 0  # index into transcript to avoid re-processing
+            seen_msgs = 0
             final_rc = 1
+            is_tty = sys.stdin.isatty()
+            mode = contract.get("execution", {}).get("mode", "supervised")
 
             def _show_chat(msg):
                 """Display a chat/ask/answer message from the transcript."""
@@ -1839,7 +1843,10 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                 if mtype == "ask":
                     status(f"{C_CYAN}?{C_RESET}", f"{C_CYAN}Agent asks:{C_RESET} {text}")
                 elif mtype == "answer":
-                    status(f"{C_GREEN}>{C_RESET}", f"You answered: {text}")
+                    if who == "principal":
+                        status(f"{C_DIM}>{C_RESET}", f"{C_DIM}You: {text}{C_RESET}")
+                    else:
+                        status(f"{C_GREEN}>{C_RESET}", f"Agent answered: {text}")
                 elif mtype == "ruling":
                     outcome = msg.get("outcome", "?")
                     reasoning = msg.get("reasoning", "")
@@ -1848,13 +1855,73 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                     if reasoning:
                         for line in reasoning.splitlines():
                             print(f"  {C_DIM}    {line}{C_RESET}", file=sys.stderr)
+                elif mtype == "dispute":
+                    side = msg.get("side", "?")
+                    status(f"{C_RED}\u2696{C_RESET}",
+                           f"{C_RED}Dispute ({side}):{C_RESET} {msg.get('argument', '')}")
                 else:
                     label = "Agent" if who == "agent" else "You"
                     status(f"{C_DIM}\u25b8{C_RESET}", f"{label}: {text}")
 
+            def _stdin_ready():
+                """Check if stdin has data without blocking."""
+                if not is_tty:
+                    return False
+                try:
+                    return bool(_select.select([sys.stdin], [], [], 0)[0])
+                except (ValueError, OSError):
+                    return False
+
+            async def _check_stdin_message():
+                """Read and send a message if the principal typed something."""
+                if _stdin_ready():
+                    try:
+                        line = sys.stdin.readline().strip()
+                        if line:
+                            await fix_client.chat(contract_id, line,
+                                                  from_side="principal", msg_type="message")
+                    except (EOFError, OSError):
+                        pass
+
+            def _show_transcript(transcript):
+                """Pretty-print the full transcript."""
+                print(file=sys.stderr)
+                for i, msg in enumerate(transcript):
+                    mtype = msg.get("type", "?")
+                    who = msg.get("from", "")
+                    if mtype == "investigate":
+                        print(f"  {C_DIM}{i+1}. [{who}] investigate: {msg.get('command','')}{C_RESET}", file=sys.stderr)
+                    elif mtype == "result":
+                        out = msg.get("output", "")
+                        preview = out[:80].replace("\n", " ")
+                        print(f"  {C_DIM}{i+1}. [result] {msg.get('command','')}: {preview}{C_RESET}", file=sys.stderr)
+                    elif mtype == "fix":
+                        print(f"  {i+1}. [{who}] fix: {C_BOLD}{msg.get('fix','')}{C_RESET}", file=sys.stderr)
+                    elif mtype == "verify":
+                        ok = msg.get("success", False)
+                        icon = C_GREEN + "pass" + C_RESET if ok else C_RED + "fail" + C_RESET
+                        print(f"  {i+1}. [verify] {icon}: {msg.get('explanation','')}", file=sys.stderr)
+                    elif mtype == "ruling":
+                        print(f"  {i+1}. {C_BLUE}[judge]{C_RESET} {msg.get('outcome','')}: {msg.get('reasoning','')[:100]}", file=sys.stderr)
+                    elif mtype in ("ask", "answer", "message"):
+                        print(f"  {i+1}. [{who}] {mtype}: {msg.get('message','')}", file=sys.stderr)
+                    elif mtype == "dispute":
+                        print(f"  {i+1}. {C_RED}[dispute]{C_RESET} {msg.get('side','')}: {msg.get('argument','')}", file=sys.stderr)
+                    else:
+                        print(f"  {C_DIM}{i+1}. [{mtype}] {msg}{C_RESET}", file=sys.stderr)
+                print(file=sys.stderr)
+
             # --- Main poll loop ---
+            if is_tty and mode == "supervised":
+                status(f"{C_DIM}\u25b8{C_RESET}",
+                       f"{C_DIM}Supervised mode. Type a message and press Enter to chat with agent.{C_RESET}")
+
             for _ in range(600):  # 5 min max
                 await _asyncio.sleep(0.5)
+
+                # Check if principal typed a message (supervised: always, autonomous: during review)
+                await _check_stdin_message()
+
                 data = await fix_client.get_contract(contract_id)
                 if not data:
                     continue
@@ -1868,12 +1935,16 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
 
                 for msg in new_msgs:
                     mtype = msg.get("type", "")
+                    who = msg.get("from", "")
 
                     # Chat messages
-                    if mtype in ("ask", "answer", "message", "ruling"):
+                    if mtype in ("ask", "answer", "message", "ruling", "dispute"):
+                        # Skip messages we sent (we already know)
+                        if who == "principal" and mtype in ("message", "answer"):
+                            continue
                         _show_chat(msg)
-                        # If agent asked a question, prompt principal
-                        if mtype == "ask" and sys.stdin.isatty():
+                        # If agent asked a question in supervised mode, prompt for reply
+                        if mtype == "ask" and is_tty and mode == "supervised":
                             try:
                                 answer = input(f"  {C_CYAN}>{C_RESET}  Reply: ")
                                 if answer.strip():
@@ -1883,7 +1954,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                                 pass
 
                     # Investigation requests
-                    elif mtype == "investigate" and msg.get("from") == "agent":
+                    elif mtype == "investigate" and who == "agent":
                         cmd = msg["command"]
                         already_replied = any(
                             m.get("type") == "result" and m.get("command") == cmd
@@ -1898,7 +1969,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                             await fix_client.submit_investigation_result(contract_id, cmd, output)
 
                     # Fix proposals
-                    elif mtype == "fix" and msg.get("from") == "agent":
+                    elif mtype == "fix" and who == "agent":
                         fix_cmd = msg.get("fix", "")
                         if fix_cmd in tried_fixes:
                             continue
@@ -1934,13 +2005,12 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
 
                         if success:
                             final_rc = rc
-                            # Don't return yet -- fall through to post-completion menu
                         else:
                             status(f"{C_RED}\u2717{C_RESET}",
                                    f"Fix failed verification (attempt {attempt_num})")
                             status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for agent to retry...")
 
-                if contract_status in ("fulfilled", "canceled", "resolved", "disputed"):
+                if contract_status in ("fulfilled", "canceled", "resolved", "disputed", "voided"):
                     break
 
             # --- Post-completion ---
@@ -1948,8 +2018,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             contract_status = data.get("status", "?") if data else "?"
 
             if contract_status == "fulfilled":
-                status(f"{C_GREEN}\u2714{C_RESET}",
-                       f"{C_GREEN}Contract fulfilled.{C_RESET}")
+                status(f"{C_GREEN}\u2714{C_RESET}", f"{C_GREEN}Contract fulfilled.{C_RESET}")
             elif contract_status == "canceled":
                 status(f"{C_YELLOW}!{C_RESET}",
                        f"{C_YELLOW}Contract canceled{C_RESET} after {len(tried_fixes)} attempt(s)")
@@ -1957,12 +2026,14 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                 status(f"{C_BLUE}\u2696{C_RESET}", "Contract resolved by judge")
             elif contract_status == "disputed":
                 status(f"{C_RED}\u2696{C_RESET}", "Contract disputed, awaiting ruling...")
+            elif contract_status == "voided":
+                status(f"{C_DIM}\u2696{C_RESET}", "Contract voided. All funds returned.")
             elif contract_status == "open":
                 status(f"{C_RED}!{C_RESET}", "Timeout waiting for agent")
                 return 1
 
-            # Interactive menu (only if terminal)
-            if sys.stdin.isatty():
+            # Interactive post-completion menu
+            if is_tty:
                 while True:
                     print(file=sys.stderr)
                     print(f"  {C_DIM}[d]ispute  [m]essage  [v]iew transcript  [q]uit{C_RESET}",
@@ -1984,15 +2055,13 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                             status(f"{C_RED}!{C_RESET}", "Dispute requires a reason")
                             continue
                         try:
-                            result = await fix_client.dispute(contract_id, arg, side="principal")
-                            status(f"{C_BLUE}\u2696{C_RESET}", f"Dispute filed")
-                            # Poll for ruling
+                            await fix_client.dispute(contract_id, arg, side="principal")
+                            status(f"{C_BLUE}\u2696{C_RESET}", "Dispute filed")
                             status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for judge...")
                             for _ in range(60):
                                 await _asyncio.sleep(1)
                                 d = await fix_client.get_contract(contract_id)
                                 if d and d.get("status") in ("resolved", "voided"):
-                                    # Show ruling from transcript
                                     for msg in d.get("transcript", []):
                                         if msg.get("type") == "ruling":
                                             _show_chat(msg)
@@ -2016,31 +2085,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                     elif choice in ("v", "view"):
                         d = await fix_client.get_contract(contract_id)
                         if d:
-                            print(file=sys.stderr)
-                            for i, msg in enumerate(d.get("transcript", [])):
-                                mtype = msg.get("type", "?")
-                                who = msg.get("from", "")
-                                if mtype == "investigate":
-                                    print(f"  {C_DIM}{i+1}. [{who}] investigate: {msg.get('command','')}{C_RESET}", file=sys.stderr)
-                                elif mtype == "result":
-                                    out = msg.get("output", "")
-                                    preview = out[:80].replace("\n", " ")
-                                    print(f"  {C_DIM}{i+1}. [result] {msg.get('command','')}: {preview}{C_RESET}", file=sys.stderr)
-                                elif mtype == "fix":
-                                    print(f"  {i+1}. [{who}] fix: {C_BOLD}{msg.get('fix','')}{C_RESET}", file=sys.stderr)
-                                elif mtype == "verify":
-                                    ok = msg.get("success", False)
-                                    icon = C_GREEN + "pass" + C_RESET if ok else C_RED + "fail" + C_RESET
-                                    print(f"  {i+1}. [verify] {icon}: {msg.get('explanation','')}", file=sys.stderr)
-                                elif mtype == "ruling":
-                                    print(f"  {i+1}. {C_BLUE}[judge]{C_RESET} {msg.get('outcome','')}: {msg.get('reasoning','')[:100]}", file=sys.stderr)
-                                elif mtype in ("ask", "answer", "message"):
-                                    print(f"  {i+1}. [{who}] {mtype}: {msg.get('message','')}", file=sys.stderr)
-                                elif mtype == "dispute":
-                                    print(f"  {i+1}. {C_RED}[dispute]{C_RESET} {msg.get('side','')}: {msg.get('argument','')}", file=sys.stderr)
-                                else:
-                                    print(f"  {C_DIM}{i+1}. [{mtype}] {msg}{C_RESET}", file=sys.stderr)
-                            print(file=sys.stderr)
+                            _show_transcript(d.get("transcript", []))
 
             return final_rc
 
