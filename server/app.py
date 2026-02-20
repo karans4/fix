@@ -87,6 +87,165 @@ class RulingResponse(BaseModel):
     flags: list[str] = []
 
 
+PLATFORM_URL = "https://fix.notruefireman.org"
+
+
+def build_briefing(contract_id: str, data: dict) -> str:
+    """The contract document. Everything a stranger needs to do the job."""
+    c = data.get("contract", {})
+    task = c.get("task", {})
+    env = c.get("environment", {})
+    caps = c.get("capabilities", {})
+    ex = c.get("execution", {})
+    escrow = c.get("escrow", {})
+    terms = c.get("terms", {})
+    verification = c.get("verification", [])
+
+    available = [k for k, v in caps.items() if v.get("available")]
+    unavailable = [k for k, v in caps.items() if not v.get("available")]
+
+    verify_parts = []
+    for v in verification:
+        m = v.get("method", "?")
+        if m == "exit_code":
+            verify_parts.append(f"re-run the original command, exit 0 = success")
+        elif m == "human_judgment":
+            verify_parts.append("human judges the result")
+        elif m == "output_match":
+            verify_parts.append(f"output must contain \"{v.get('pattern', '')}\"")
+        else:
+            verify_parts.append(m)
+
+    B = PLATFORM_URL
+    I = contract_id
+
+    error_lines = "\n".join("      " + l for l in task.get("error", "").splitlines())
+    verify_str = "; ".join(verify_parts) or "re-run the original command, exit 0 = success"
+
+    bounty = escrow.get("bounty", "0") if escrow else "0"
+    cur = escrow.get("currency", "XNO") if escrow else "XNO"
+    judge_name = terms.get("judge", {}).get("pubkey", "") or "platform AI judge"
+    max_attempts = ex.get("max_attempts", 3)
+    inv_rounds = ex.get("investigation_rounds", 5)
+    inv_rate = ex.get("investigation_rate", 5)
+    timeout_s = ex.get("timeout", 300)
+
+    text = f"""SERVICE CONTRACT
+================
+
+Contract ID:  {I}
+Platform:     {B}
+Status:       {data.get('status', '?')}
+
+PARTIES
+
+  Principal:  The party who posted this contract.
+  Agent:      The party who accepts and performs the work.
+  Judge:      {judge_name}
+
+1. SCOPE OF WORK
+
+  The Principal's command failed:
+
+    $ {task.get('command', '?')}
+{error_lines}
+
+  Environment: {env.get('os', '?')} {env.get('arch', '?')}
+  Package managers: {', '.join(env.get('package_managers', [])) or 'none'}
+  Available tools: {', '.join(available) or 'none'}
+  Unavailable: {', '.join(unavailable) or 'none'}
+
+  The Agent shall cause the above command to succeed on the
+  Principal's machine.
+
+2. CONSIDERATION
+
+  Upon successful completion, the Principal shall pay the Agent
+  {bounty} {cur}.
+
+3. INVESTIGATION
+
+  Before accepting, the Agent may run up to {inv_rounds} read-only
+  commands on the Principal's machine to assess the problem.
+  Commands are rate-limited to one per {inv_rate} seconds.
+  The Agent may decline the contract after investigation with
+  no penalty; the bond is returned in full.
+
+4. PERFORMANCE
+
+  The Agent shall submit a shell command ("the fix") to be
+  executed on the Principal's machine. The Agent is allowed
+  {max_attempts} attempt(s). If an attempt fails verification,
+  the Agent is informed of the reason and may submit another.
+  Total time limit: {timeout_s} seconds from acceptance.
+
+5. VERIFICATION
+
+  {verify_str}
+
+6. REMEDIES
+
+  a. Success: bounty released to Agent.
+  b. Failure (all attempts exhausted): contract canceled,
+     bounty returned to Principal.
+  c. Dispute: either party may escalate to the Judge.
+     Both parties have a dispute bond locked. The losing
+     party's bond pays the Judge. The prevailing party's
+     bond is returned.
+  d. Judge timeout: contract voided, all funds returned
+     to both parties.
+  e. Cancellation: either party may cancel within the grace
+     period at no cost. Late cancellation incurs a fee.
+
+7. COMMUNICATION
+
+  Either party may send messages at any time during the
+  contract via the chat endpoint.
+
+EXHIBIT A: PLATFORM API
+
+  Base URL: {B}
+  All requests and responses are JSON.
+
+  GET  /contracts/{I}
+    Read contract state, transcript, and investigation results.
+
+  POST /contracts/{I}/bond
+    Body: {{"agent_pubkey": "<your_id>"}}
+    Post bond to begin investigation.
+
+  POST /contracts/{I}/investigate
+    Body: {{"command": "<shell command>", "agent_pubkey": "<your_id>"}}
+    Request a command be run on the Principal's machine.
+    Results appear in the transcript (type: "result").
+
+  POST /contracts/{I}/accept
+    Body: {{"agent_pubkey": "<your_id>"}}
+    Accept the contract. Commits you to performing the work.
+
+  POST /contracts/{I}/decline
+    Body: {{}}
+    Decline after investigation. Bond returned, contract reopens.
+
+  POST /contracts/{I}/fix
+    Body: {{"fix": "<shell command>", "explanation": "<why>"}}
+    Submit your fix to be run on the Principal's machine.
+
+  POST /contracts/{I}/chat
+    Body: {{"message": "<text>", "from_side": "agent"}}
+    Send a message to the Principal.
+
+  POST /contracts/{I}/verify
+    Body: {{"success": true/false, "explanation": "<reason>"}}
+    (Principal only) Report verification result.
+
+  POST /contracts/{I}/dispute
+    Body: {{"argument": "<your case>", "side": "agent"}}
+    Escalate to Judge."""
+
+    return text
+
+
 # --- App factory ---
 
 def create_app(
@@ -174,17 +333,21 @@ def create_app(
     async def list_contracts(status: str = "open", limit: int = 50):
         """List contracts by status (agents browse open ones)."""
         contracts = _store.list_by_status(status, limit)
+        for c in contracts:
+            c["briefing"] = build_briefing(c["id"], c)
         return {"contracts": contracts}
 
     @app.get("/contracts/{contract_id}")
     async def get_contract(contract_id: str):
-        """Get contract details + transcript. Auto-fulfills expired review windows."""
+        """Get contract details + transcript + briefing."""
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         # Check review expiry on access
         updated = _check_review_expiry(data)
-        return updated or data
+        result = updated or data
+        result["briefing"] = build_briefing(contract_id, result)
+        return result
 
     @app.post("/contracts/{contract_id}/bond")
     async def post_bond(contract_id: str, req: BondRequest):

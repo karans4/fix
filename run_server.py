@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import httpx
 import uvicorn
-from server.app import create_app
+from server.app import create_app, build_briefing
 from server.store import ContractStore
 from server.escrow import EscrowManager
 from server.reputation import ReputationManager
@@ -103,7 +103,7 @@ def run_free_agent(store, escrow_mgr):
                 cid = c["id"]
                 contract = c["contract"]
                 task = contract.get("task", {})
-                briefing = contract.get("briefing", "")
+                briefing = build_briefing(cid, c)
 
                 print(f"[agent] Picking up {cid}: {task.get('command', task.get('task', '?'))}")
 
@@ -245,7 +245,7 @@ If you cannot fix it, respond:
                     continue
 
                 contract = c.get("contract", {})
-                briefing = contract.get("briefing", "")
+                briefing = build_briefing(cid, c)
                 max_attempts = contract.get("execution", {}).get("max_attempts", 3)
                 if len(failures) >= max_attempts:
                     continue
