@@ -1,1 +1,13 @@
 __pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.eggs/
+*.db
+*.sqlite3
+~/.fix/
+demo_judge.py
+sandbox/cow.c
+sandbox/*.so
+.fix.py

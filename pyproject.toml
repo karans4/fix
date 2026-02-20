@@ -4,11 +4,11 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "fix-cli"
-version = "0.1.0"
-description = "AI-powered command fixer"
+version = "0.4.0"
+description = "AI-powered command fixer with contract-based dispute resolution"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [
     { name = "Karan Sharma", email = "karans4@protonmail.com" },
 ]
@@ -16,8 +16,20 @@ dependencies = [
     "httpx>=0.24",
 ]
 
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    "starlette>=0.27",
+]
+
 [project.scripts]
 fix = "fix:main"
 
 [tool.setuptools]
-py-modules = ["fix"]
+py-modules = ["fix", "protocol", "crypto", "contract", "scrubber", "client", "agent"]
+packages = ["server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

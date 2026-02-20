@@ -1,149 +1,91 @@
 # fix
 
-AI-powered command fixer. Run a command, if it fails, an LLM diagnoses the error and generates a fix.
+AI-powered command fixer. A command fails, an LLM diagnoses it, proposes a fix, and a contract system tracks the whole thing. Disputes go to an AI judge.
 
-## Install
+## Quick start
 
 ```sh
-# From source
-git clone https://github.com/karans4/fix && cd fix
-pip install -e .
-
-# Or just copy the script
-cp fix ~/.local/bin/fix
-chmod +x ~/.local/bin/fix
-pip install httpx
+pip install git+https://github.com/karans4/fix.git
 ```
 
-## Setup
-
-Set an API key (any one of these):
+### Local mode (you need an API key)
 
 ```sh
-# Claude (default, cheapest)
-export ANTHROPIC_API_KEY=sk-ant-...
-# or save it
-mkdir -p ~/.fix && echo "sk-ant-..." > ~/.fix/api_key
+export ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY, or run Ollama
 
-# OpenAI
-export OPENAI_API_KEY=sk-...
-
-# Any OpenAI-compatible endpoint (Together, Groq, etc.)
-export FIX_API_URL=https://api.together.xyz/v1
-export FIX_API_KEY=...
-export FIX_MODEL=meta-llama/Llama-3-70b-chat-hf
-
-# Or use Ollama (free, local, no API key)
-ollama pull qwen2.5-coder:1.5b
-ollama serve
+fix "gcc foo.c"         # run command, fix if it fails
+fix it                  # fix the last failed command
+fix --explain "make"    # just explain the error
+fix --dry-run "make"    # show fix without running
+fix --local "make"      # force Ollama (free, local)
 ```
 
-## Usage
+### Remote mode (free platform agent)
+
+Post a contract to the platform. A free AI agent picks it up and proposes a fix.
 
 ```sh
-# Basic: run command, fix if it fails
-fix "gcc foo.c"
-fix "python3 -c 'import flask'"
-
-# Re-run last failed command
-fix !!
-
-# Just explain the error
-fix --explain "python3 bad.py"
-
-# Show the fix without running it
-fix --dry-run "python3 bad.py"
-
-# Force local Ollama backend
-fix --local "gcc missing.c"
-
-# Auto-apply without confirmation
-fix -y "npm install"
+fix --remote "gcc foo.c"
 ```
 
-## Verification
+Platform: `https://fix.notruefireman.org` (free during testing)
 
-By default, `fix` re-runs the original command after applying the fix. Exit 0 = success. You can customize verification:
+Configure in `~/.fix/config.py`:
+```python
+platform_url = "https://fix.notruefireman.org"
+remote = True  # default to remote mode
+```
+
+## Shell integration
+
+For `fix it` / `fix !!` to work, add to your shell config:
 
 ```sh
-# Default: re-run command, exit 0 = success
-fix "gcc foo.c"
+# bash/zsh
+eval "$(fix shell)"
 
-# Human judges the result
-fix --verify=human "python3 render.py"
+# fish
+fix shell fish | source
 
-# Stdout must contain a string
-fix --verify="contains 'Hello'" "python3 foo.py"
-
-# Output must NOT contain a string
-fix --verify="not contains 'error'" "python3 foo.py"
-
-# Custom verification command
-fix --verify="python3 -m pytest tests/" "pip install flask"
+# or auto-install
+fix shell --install
 ```
 
 ## Safe mode (sandbox)
 
-Runs fixes in an OverlayFS sandbox. Changes are only committed if verification passes.
+Default on Linux. Runs fixes in OverlayFS -- changes only committed if verification passes.
 
 ```sh
-fix --safe "python3 -c 'import flask'"
+fix "make build"          # sandbox on Linux by default
+fix --no-safe "make"      # skip sandbox
+fix --safe "make"         # force sandbox
 ```
 
-Security layers:
-1. **Overlay** -- filesystem snapshot, changes isolated until commit
-2. **Network isolation** -- fix can't phone home (except package installs)
-3. **Visibility control** -- sensitive paths hidden from the agent
-4. **Diff audit** -- every changed file shown before commit
-5. **Allowlist** -- only expected paths may be modified
+## Verification
 
 ```sh
-# Hide additional paths from the agent
-fix --safe --hide ~/.env --hide ~/secrets "python3 app.py"
-
-# Whitelist mode: agent can ONLY see these paths
-fix --safe --visible ~/myproject "python3 build.py"
-```
-
-## Config
-
-Optional config at `~/.fix/config.toml`:
-
-```toml
-backend = "claude"
-model = "claude-haiku-4-5-20251001"
-budget_cents = 50
-safe_mode = false
-ollama_model = "qwen2.5-coder:1.5b"
-
-[hidden_paths]
-paths = ["~/.ssh", "~/.gnupg", "~/.aws"]
-```
-
-## Cache
-
-Fixes are cached in SQLite (`~/.fix/fixes.db`) with environment fingerprinting. Same error on same system = instant cache hit.
-
-```sh
-fix --cache    # show cached fixes
-fix --stats    # show spending stats
-fix --clear    # clear cache
-
-# Export/import fixes
-fix export > fixes.json
-fix import fixes.json
+fix "gcc foo.c"                              # default: re-run, exit 0 = success
+fix --verify=human "python3 render.py"       # human judges
+fix --verify="pytest tests/" "pip install x"  # custom command
 ```
 
 ## How it works
 
-1. Run command, capture stderr
-2. Hash error + environment fingerprint
-3. Check SQLite cache (exact env match, then fuzzy)
-4. On cache miss, ask LLM for a fix
-5. Apply fix, verify, cache if successful
-6. Multi-attempt: if first fix fails, retry with failure context (up to 3 tries)
+1. Command fails, stderr captured
+2. Contract built (task, environment, verification terms, escrow)
+3. Agent investigates (read-only commands), then proposes fix
+4. Fix applied, verified mechanically
+5. Multi-attempt: up to 3 tries, feeding failures back as context
+6. Disputes go to an AI judge who reviews the full transcript
 
-Backend priority: explicit flag > env var > config > auto-detect (Claude > OpenAI > Ollama)
+## Architecture
+
+- `fix` -- CLI entry point
+- `server/` -- FastAPI platform (contracts, escrow, reputation, judge)
+- `protocol.py` -- state machine, constants
+- `scrubber.py` -- redacts secrets from error output before sending to LLM
+- `contract.py` -- builds structured contracts
+- `client.py` / `agent.py` -- remote mode client and agent
 
 ## License
 
