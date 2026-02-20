@@ -129,8 +129,9 @@ def build_briefing(contract_id: str, data: dict) -> str:
     inv_rounds = ex.get("investigation_rounds", 5)
     inv_rate = ex.get("investigation_rate", 5)
     timeout_s = ex.get("timeout", 300)
+    sandbox = "Yes (OverlayFS). Changes only committed if verification passes." if ex.get("sandbox") else "No."
 
-    text = f"""SERVICE CONTRACT
+    return f"""SERVICE CONTRACT
 ================
 
 Contract ID:  {I}
@@ -154,6 +155,7 @@ PARTIES
   Package managers: {', '.join(env.get('package_managers', [])) or 'none'}
   Available tools: {', '.join(available) or 'none'}
   Unavailable: {', '.join(unavailable) or 'none'}
+  Sandbox: {sandbox}
 
   The Agent shall cause the above command to succeed on the
   Principal's machine.
@@ -163,27 +165,65 @@ PARTIES
   Upon successful completion, the Principal shall pay the Agent
   {bounty} {cur}.
 
-3. INVESTIGATION
+3. AGENT OPTIONS
 
-  Before accepting, the Agent may run up to {inv_rounds} read-only
-  commands on the Principal's machine to assess the problem.
-  Commands are rate-limited to one per {inv_rate} seconds.
-  The Agent may decline the contract after investigation with
-  no penalty; the bond is returned in full.
+  Upon receiving this contract, the Agent may:
 
-4. PERFORMANCE
+  a. Decline immediately. No bond required, no penalty.
+  b. Post bond and investigate. The Agent may run up to
+     {inv_rounds} read-only commands on the Principal's machine
+     to assess the problem before committing.
+     Rate limit: one command per {inv_rate} seconds.
+  c. Decline after investigating. Bond returned in full,
+     no penalty. Contract reopens for another agent.
+  d. Accept. The Agent commits to fixing the problem.
+
+  The Agent is not obligated to accept at any point. Bonding
+  is required only to investigate; declining is always free.
+
+4. INVESTIGATION RULES
+
+  Commands run on the Principal's machine via the client. The
+  Principal's client enforces a whitelist. Allowed commands:
+
+    File inspection:  cat, head, tail, less, file, wc, stat,
+                      md5sum, sha256sum
+    Directory:        ls, find, tree, du
+    Search:           grep, rg, ag, awk, sed
+    Versions/info:    which, whereis, type, uname, arch,
+                      lsb_release, hostnamectl
+    Package queries:  dpkg, apt, apt-cache, rpm, pacman, pip,
+                      pip3, npm, gem, cargo, rustc
+    Runtimes:         python3, python, node, gcc, g++, make,
+                      cmake, java, go, ruby, clang, clang++
+    Environment:      env, printenv, echo, id, whoami, pwd
+    System info:      lscpu, free, df, mount, ps
+    Misc:             readlink, realpath, basename, dirname,
+                      diff, cmp, strings, nm, ldd, objdump,
+                      pkg-config, test, timeout
+
+  Blocked: write redirects (>), append (>>), tee, and any
+  command not on the whitelist. If a root directory is set,
+  all paths must resolve inside it.
+
+5. PERFORMANCE
 
   The Agent shall submit a shell command ("the fix") to be
-  executed on the Principal's machine. The Agent is allowed
-  {max_attempts} attempt(s). If an attempt fails verification,
-  the Agent is informed of the reason and may submit another.
+  executed on the Principal's machine. The fix command is NOT
+  restricted to the investigation whitelist; it may run any
+  command needed to solve the problem.
+
+  The Agent is allowed {max_attempts} attempt(s). If an attempt
+  fails verification, the Agent is informed of the reason and
+  may submit a different fix.
+
   Total time limit: {timeout_s} seconds from acceptance.
 
-5. VERIFICATION
+6. VERIFICATION
 
   {verify_str}
 
-6. REMEDIES
+7. REMEDIES
 
   a. Success: bounty released to Agent.
   b. Failure (all attempts exhausted): contract canceled,
@@ -197,7 +237,7 @@ PARTIES
   e. Cancellation: either party may cancel within the grace
      period at no cost. Late cancellation incurs a fee.
 
-7. COMMUNICATION
+8. COMMUNICATION
 
   Either party may send messages at any time during the
   contract via the chat endpoint.
@@ -225,7 +265,7 @@ EXHIBIT A: PLATFORM API
 
   POST /contracts/{I}/decline
     Body: {{}}
-    Decline after investigation. Bond returned, contract reopens.
+    Decline. Bond returned if bonded, contract reopens.
 
   POST /contracts/{I}/fix
     Body: {{"fix": "<shell command>", "explanation": "<why>"}}
@@ -242,8 +282,6 @@ EXHIBIT A: PLATFORM API
   POST /contracts/{I}/dispute
     Body: {{"argument": "<your case>", "side": "agent"}}
     Escalate to Judge."""
-
-    return text
 
 
 # --- App factory ---
