@@ -1870,6 +1870,14 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                         if explanation:
                             status(f" ", f"{C_DIM}{C_ITALIC}{explanation}{C_RESET}")
 
+                        # Agent declined or returned empty fix
+                        if not fix_cmd or fix_cmd.lower() in ("none", "null", "n/a"):
+                            status(f"{C_RED}\u2717{C_RESET}", "Agent could not produce a fix")
+                            await fix_client.verify(contract_id, False,
+                                                    f"agent declined (attempt {attempt_num})")
+                            status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for agent to retry...")
+                            continue
+
                         if dry_run:
                             return proc.returncode
 
