@@ -1827,9 +1827,32 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             status(f"{C_GREEN}\u2714{C_RESET}", f"Contract posted ({contract_id})")
             status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for agent...")
 
-            tried_fixes = set()  # track fix commands we already attempted
+            tried_fixes = set()
+            seen_msgs = 0  # index into transcript to avoid re-processing
+            final_rc = 1
 
-            # Poll for contract updates
+            def _show_chat(msg):
+                """Display a chat/ask/answer message from the transcript."""
+                who = msg.get("from", "?")
+                text = msg.get("message", "")
+                mtype = msg.get("type", "message")
+                if mtype == "ask":
+                    status(f"{C_CYAN}?{C_RESET}", f"{C_CYAN}Agent asks:{C_RESET} {text}")
+                elif mtype == "answer":
+                    status(f"{C_GREEN}>{C_RESET}", f"You answered: {text}")
+                elif mtype == "ruling":
+                    outcome = msg.get("outcome", "?")
+                    reasoning = msg.get("reasoning", "")
+                    icon = C_GREEN + "\u2696" + C_RESET if outcome == "fulfilled" else C_RED + "\u2696" + C_RESET
+                    status(icon, f"Judge ruled: {C_BOLD}{outcome}{C_RESET}")
+                    if reasoning:
+                        for line in reasoning.splitlines():
+                            print(f"  {C_DIM}    {line}{C_RESET}", file=sys.stderr)
+                else:
+                    label = "Agent" if who == "agent" else "You"
+                    status(f"{C_DIM}\u25b8{C_RESET}", f"{label}: {text}")
+
+            # --- Main poll loop ---
             for _ in range(600):  # 5 min max
                 await _asyncio.sleep(0.5)
                 data = await fix_client.get_contract(contract_id)
@@ -1839,9 +1862,28 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                 transcript = data.get("transcript", [])
                 contract_status = data.get("status", "open")
 
-                # Check for investigation requests we need to answer
-                for msg in transcript:
-                    if msg.get("type") == "investigate" and msg.get("from") == "agent":
+                # Process new transcript messages
+                new_msgs = transcript[seen_msgs:]
+                seen_msgs = len(transcript)
+
+                for msg in new_msgs:
+                    mtype = msg.get("type", "")
+
+                    # Chat messages
+                    if mtype in ("ask", "answer", "message", "ruling"):
+                        _show_chat(msg)
+                        # If agent asked a question, prompt principal
+                        if mtype == "ask" and sys.stdin.isatty():
+                            try:
+                                answer = input(f"  {C_CYAN}>{C_RESET}  Reply: ")
+                                if answer.strip():
+                                    await fix_client.chat(contract_id, answer.strip(),
+                                                         from_side="principal", msg_type="answer")
+                            except (EOFError, KeyboardInterrupt):
+                                pass
+
+                    # Investigation requests
+                    elif mtype == "investigate" and msg.get("from") == "agent":
                         cmd = msg["command"]
                         already_replied = any(
                             m.get("type") == "result" and m.get("command") == cmd
@@ -1855,9 +1897,8 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                                     print(f"  {C_DIM}    {line}{C_RESET}", file=sys.stderr)
                             await fix_client.submit_investigation_result(contract_id, cmd, output)
 
-                # Check for fix proposals we haven't tried yet
-                for msg in transcript:
-                    if msg.get("type") == "fix" and msg.get("from") == "agent":
+                    # Fix proposals
+                    elif mtype == "fix" and msg.get("from") == "agent":
                         fix_cmd = msg.get("fix", "")
                         if fix_cmd in tried_fixes:
                             continue
@@ -1871,7 +1912,6 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                         if explanation:
                             status(f" ", f"{C_DIM}{C_ITALIC}{explanation}{C_RESET}")
 
-                        # Agent declined or returned empty fix
                         if not fix_cmd or fix_cmd.lower() in ("none", "null", "n/a"):
                             status(f"{C_RED}\u2717{C_RESET}", "Agent could not produce a fix")
                             await fix_client.verify(contract_id, False,
@@ -1893,22 +1933,116 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                                                 "fulfilled" if success else f"fix failed verification (attempt {attempt_num})")
 
                         if success:
-                            return rc
+                            final_rc = rc
+                            # Don't return yet -- fall through to post-completion menu
+                        else:
+                            status(f"{C_RED}\u2717{C_RESET}",
+                                   f"Fix failed verification (attempt {attempt_num})")
+                            status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for agent to retry...")
 
-                        # Failed -- report and keep polling for next fix from agent
-                        status(f"{C_RED}\u2717{C_RESET}",
-                               f"Fix failed verification (attempt {attempt_num})")
-                        status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for agent to retry...")
-
-                if contract_status in ("fulfilled", "canceled", "resolved"):
+                if contract_status in ("fulfilled", "canceled", "resolved", "disputed"):
                     break
 
-            if tried_fixes and not any(data.get("status") == "fulfilled" for _ in [1]):
-                status(f"{C_RED}!{C_RESET}",
-                       f"Agent exhausted after {len(tried_fixes)} attempt(s)")
-            else:
+            # --- Post-completion ---
+            data = await fix_client.get_contract(contract_id)
+            contract_status = data.get("status", "?") if data else "?"
+
+            if contract_status == "fulfilled":
+                status(f"{C_GREEN}\u2714{C_RESET}",
+                       f"{C_GREEN}Contract fulfilled.{C_RESET}")
+            elif contract_status == "canceled":
+                status(f"{C_YELLOW}!{C_RESET}",
+                       f"{C_YELLOW}Contract canceled{C_RESET} after {len(tried_fixes)} attempt(s)")
+            elif contract_status == "resolved":
+                status(f"{C_BLUE}\u2696{C_RESET}", "Contract resolved by judge")
+            elif contract_status == "disputed":
+                status(f"{C_RED}\u2696{C_RESET}", "Contract disputed, awaiting ruling...")
+            elif contract_status == "open":
                 status(f"{C_RED}!{C_RESET}", "Timeout waiting for agent")
-            return 1
+                return 1
+
+            # Interactive menu (only if terminal)
+            if sys.stdin.isatty():
+                while True:
+                    print(file=sys.stderr)
+                    print(f"  {C_DIM}[d]ispute  [m]essage  [v]iew transcript  [q]uit{C_RESET}",
+                          file=sys.stderr)
+                    try:
+                        choice = input(f"  > ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        break
+
+                    if choice in ("q", "quit", ""):
+                        break
+
+                    elif choice in ("d", "dispute"):
+                        try:
+                            arg = input(f"  {C_CYAN}Reason:{C_RESET} ").strip()
+                        except (EOFError, KeyboardInterrupt):
+                            continue
+                        if not arg:
+                            status(f"{C_RED}!{C_RESET}", "Dispute requires a reason")
+                            continue
+                        try:
+                            result = await fix_client.dispute(contract_id, arg, side="principal")
+                            status(f"{C_BLUE}\u2696{C_RESET}", f"Dispute filed")
+                            # Poll for ruling
+                            status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for judge...")
+                            for _ in range(60):
+                                await _asyncio.sleep(1)
+                                d = await fix_client.get_contract(contract_id)
+                                if d and d.get("status") in ("resolved", "voided"):
+                                    # Show ruling from transcript
+                                    for msg in d.get("transcript", []):
+                                        if msg.get("type") == "ruling":
+                                            _show_chat(msg)
+                                    break
+                        except Exception as e:
+                            status(f"{C_RED}!{C_RESET}", f"Dispute failed: {e}")
+
+                    elif choice in ("m", "message", "msg"):
+                        try:
+                            msg = input(f"  {C_CYAN}Message:{C_RESET} ").strip()
+                        except (EOFError, KeyboardInterrupt):
+                            continue
+                        if msg:
+                            try:
+                                await fix_client.chat(contract_id, msg,
+                                                      from_side="principal", msg_type="message")
+                                status(f"{C_GREEN}\u2714{C_RESET}", "Sent")
+                            except Exception as e:
+                                status(f"{C_RED}!{C_RESET}", f"Send failed: {e}")
+
+                    elif choice in ("v", "view"):
+                        d = await fix_client.get_contract(contract_id)
+                        if d:
+                            print(file=sys.stderr)
+                            for i, msg in enumerate(d.get("transcript", [])):
+                                mtype = msg.get("type", "?")
+                                who = msg.get("from", "")
+                                if mtype == "investigate":
+                                    print(f"  {C_DIM}{i+1}. [{who}] investigate: {msg.get('command','')}{C_RESET}", file=sys.stderr)
+                                elif mtype == "result":
+                                    out = msg.get("output", "")
+                                    preview = out[:80].replace("\n", " ")
+                                    print(f"  {C_DIM}{i+1}. [result] {msg.get('command','')}: {preview}{C_RESET}", file=sys.stderr)
+                                elif mtype == "fix":
+                                    print(f"  {i+1}. [{who}] fix: {C_BOLD}{msg.get('fix','')}{C_RESET}", file=sys.stderr)
+                                elif mtype == "verify":
+                                    ok = msg.get("success", False)
+                                    icon = C_GREEN + "pass" + C_RESET if ok else C_RED + "fail" + C_RESET
+                                    print(f"  {i+1}. [verify] {icon}: {msg.get('explanation','')}", file=sys.stderr)
+                                elif mtype == "ruling":
+                                    print(f"  {i+1}. {C_BLUE}[judge]{C_RESET} {msg.get('outcome','')}: {msg.get('reasoning','')[:100]}", file=sys.stderr)
+                                elif mtype in ("ask", "answer", "message"):
+                                    print(f"  {i+1}. [{who}] {mtype}: {msg.get('message','')}", file=sys.stderr)
+                                elif mtype == "dispute":
+                                    print(f"  {i+1}. {C_RED}[dispute]{C_RESET} {msg.get('side','')}: {msg.get('argument','')}", file=sys.stderr)
+                                else:
+                                    print(f"  {C_DIM}{i+1}. [{mtype}] {msg}{C_RESET}", file=sys.stderr)
+                            print(file=sys.stderr)
+
+            return final_rc
 
         return _asyncio.run(_run_remote())
     elif remote and not _HAS_REMOTE:

@@ -123,6 +123,15 @@ class FixClient:
             "side": side,
         })
 
+    async def chat(self, contract_id: str, message: str, from_side: str = "principal",
+                   msg_type: str = "message") -> dict:
+        """Send a chat message."""
+        return await self.transport.post(f"/contracts/{contract_id}/chat", {
+            "message": message,
+            "from_side": from_side,
+            "msg_type": msg_type,
+        })
+
     async def get_ruling(self, contract_id: str) -> dict | None:
         """Get ruling for a contract."""
         return await self.transport.get(f"/contracts/{contract_id}/ruling")
