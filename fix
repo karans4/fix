@@ -365,7 +365,7 @@ def generate_config():
         '',
         '# bounty = "0.01"        # USDC on Base, paid on fulfilled contract',
         '# remote = False         # enable Nostr relay + escrow',
-        '# platform_url = "http://localhost:8000"',
+        '# platform_url = "https://fix.notruefireman.org"',
         '',
         '# --- Custom agent ---',
         '# Receives contract dict, returns fix dict.',
@@ -1837,7 +1837,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         display_contract(contract, status)
 
         async def _run_remote():
-            platform_url = cfg.get("platform_url", "http://localhost:8000")
+            platform_url = cfg.get("platform_url", "https://fix.notruefireman.org")
             fix_client = FixClient(base_url=platform_url)
 
             contract_id = await fix_client.post_contract(contract)
@@ -2193,7 +2193,7 @@ def main():
             print(f"  {C_RED}!{C_RESET}  Remote mode requires: pip install httpx fastapi", file=sys.stderr)
             sys.exit(1)
         import asyncio as _asyncio
-        platform_url = cfg.get("platform_url", "http://localhost:8000")
+        platform_url = cfg.get("platform_url", "https://fix.notruefireman.org")
         agent_config = {
             "platform_url": platform_url,
             "api_key": cfg.get("api_key", ""),

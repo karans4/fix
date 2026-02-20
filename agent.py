@@ -99,7 +99,7 @@ class FixAgent:
         - llm_call: async callable(prompt) -> str
         - poll_interval: float (seconds between polls, default 5.0)
         """
-        self.platform_url = config.get("platform_url", "http://localhost:8000")
+        self.platform_url = config.get("platform_url", "https://fix.notruefireman.org")
         self.api_key = config.get("api_key", "")
         self.pubkey = config.get("pubkey", "agent-default")
         self.capabilities = config.get("capabilities", {})
