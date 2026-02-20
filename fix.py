@@ -1826,7 +1826,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             status(f"{C_GREEN}\u2714{C_RESET}", f"Contract posted ({contract_id})")
             status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for agent...")
 
-            max_rounds = contract.get("execution", {}).get("investigation_rounds", 5)
+            tried_fixes = set()  # track fix commands we already attempted
 
             # Poll for contract updates
             for _ in range(600):  # 5 min max
@@ -1842,7 +1842,6 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                 for msg in transcript:
                     if msg.get("type") == "investigate" and msg.get("from") == "agent":
                         cmd = msg["command"]
-                        # Check if we already replied to this
                         already_replied = any(
                             m.get("type") == "result" and m.get("command") == cmd
                             for m in transcript
@@ -1855,13 +1854,19 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                                     print(f"  {C_DIM}    {line}{C_RESET}", file=sys.stderr)
                             await fix_client.submit_investigation_result(contract_id, cmd, output)
 
-                # Check for fix proposal
+                # Check for fix proposals we haven't tried yet
                 for msg in transcript:
                     if msg.get("type") == "fix" and msg.get("from") == "agent":
                         fix_cmd = msg.get("fix", "")
-                        explanation = msg.get("explanation", "")
+                        if fix_cmd in tried_fixes:
+                            continue
+                        tried_fixes.add(fix_cmd)
 
-                        status(f"{C_GREEN}\u25c6{C_RESET}", f"Fix: {C_BOLD}{fix_cmd}{C_RESET}")
+                        explanation = msg.get("explanation", "")
+                        attempt_num = len(tried_fixes)
+
+                        status(f"{C_GREEN}\u25c6{C_RESET}",
+                               f"Fix (attempt {attempt_num}): {C_BOLD}{fix_cmd}{C_RESET}")
                         if explanation:
                             status(f" ", f"{C_DIM}{C_ITALIC}{explanation}{C_RESET}")
 
@@ -1876,13 +1881,24 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                         rc = apply_fix(fix_cmd, command, verify_spec, safe_mode, cfg, contract)
                         success = (rc == 0)
                         await fix_client.verify(contract_id, success,
-                                                "fulfilled" if success else "fix failed verification")
-                        return rc
+                                                "fulfilled" if success else f"fix failed verification (attempt {attempt_num})")
+
+                        if success:
+                            return rc
+
+                        # Failed -- report and keep polling for next fix from agent
+                        status(f"{C_RED}\u2717{C_RESET}",
+                               f"Fix failed verification (attempt {attempt_num})")
+                        status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for agent to retry...")
 
                 if contract_status in ("fulfilled", "canceled", "resolved"):
                     break
 
-            status(f"{C_RED}!{C_RESET}", "Timeout waiting for agent")
+            if tried_fixes and not any(data.get("status") == "fulfilled" for _ in [1]):
+                status(f"{C_RED}!{C_RESET}",
+                       f"Agent exhausted after {len(tried_fixes)} attempt(s)")
+            else:
+                status(f"{C_RED}!{C_RESET}", "Timeout waiting for agent")
             return 1
 
         return _asyncio.run(_run_remote())

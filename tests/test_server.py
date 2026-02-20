@@ -234,7 +234,7 @@ def test_verify_success_fulfills(client):
     assert contract["status"] == "fulfilled"
 
 
-def test_verify_failure_cancels(client):
+def test_verify_failure_retries(client):
     data = _create_contract(client)
     cid = data["contract_id"]
     _accept_contract(client, cid)
@@ -247,8 +247,29 @@ def test_verify_failure_cancels(client):
         "explanation": "still broken",
     })
     assert resp.status_code == 200
-    assert resp.json()["status"] == "canceled"
+    assert resp.json()["status"] == "retry"
 
+    # Contract stays in_progress for retry
+    contract = client.get(f"/contracts/{cid}").json()
+    assert contract["status"] == "in_progress"
+
+
+def test_verify_failure_cancels_after_max_attempts(client):
+    data = _create_contract(client)
+    cid = data["contract_id"]
+    _accept_contract(client, cid)
+
+    # Exhaust all 3 attempts
+    for i in range(3):
+        client.post(f"/contracts/{cid}/fix", json={
+            "fix": f"echo nope{i}", "agent_pubkey": "agent_xyz",
+        })
+        resp = client.post(f"/contracts/{cid}/verify", json={
+            "success": False,
+            "explanation": f"still broken attempt {i+1}",
+        })
+
+    assert resp.json()["status"] == "canceled"
     contract = client.get(f"/contracts/{cid}").json()
     assert contract["status"] == "canceled"
 

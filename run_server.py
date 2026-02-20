@@ -66,6 +66,47 @@ def agent_llm_call(prompt):
     return resp.json()["content"][0]["text"]
 
 
+def _parse_llm_json(raw):
+    """Extract JSON from LLM response (strips markdown fences)."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = "\n".join(text.split("\n")[1:])
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start >= 0 and end > start:
+        text = text[start:end]
+    return json.loads(text)
+
+
+def _build_fix_prompt(contract, prior_failures=None):
+    """Build prompt for the agent LLM."""
+    task = contract.get("task", {})
+    error = task.get("error", "")
+    command = task.get("command", "")
+    env = contract.get("environment", {})
+
+    prompt = f"""A command failed. Propose a fix as a JSON object.
+
+COMMAND: {command}
+ERROR: {error}
+OS: {env.get('os', '?')} {env.get('arch', '?')}
+Package managers: {', '.join(env.get('package_managers', []))}"""
+
+    if prior_failures:
+        prompt += "\n\nPREVIOUS FAILED ATTEMPTS (do NOT repeat these):"
+        for i, fail in enumerate(prior_failures, 1):
+            prompt += f"\n  Attempt {i}: {fail['fix']} -> {fail['reason']}"
+
+    prompt += f"""
+
+Respond with JSON only (no markdown):
+{{"accepted": true, "fix": "shell command(s)", "explanation": "why"}}"""
+    return prompt
+
+
 def run_free_agent(store, escrow_mgr):
     """Background thread: poll for open contracts, accept and fix them."""
     AGENT_KEY = "platform_free_agent"
@@ -74,89 +115,112 @@ def run_free_agent(store, escrow_mgr):
     while True:
         time.sleep(POLL_INTERVAL)
         try:
+            # 1. Pick up new open contracts
             contracts = store.list_by_status("open", limit=1)
-            if not contracts:
+            if contracts:
+                c = contracts[0]
+                cid = c["id"]
+                contract = c["contract"]
+                task = contract.get("task", {})
+
+                print(f"[agent] Picking up {cid}: {task.get('command', task.get('task', '?'))}")
+
+                # Bond if escrow exists
+                try:
+                    escrow_mgr.lock_agent_bond(cid)
+                    store.db.execute(
+                        "UPDATE contracts SET agent_pubkey = ?, status = 'investigating', updated_at = ? WHERE id = ? AND status = 'open'",
+                        (AGENT_KEY, time.time(), cid),
+                    )
+                    store.db.commit()
+                    store.append_message(cid, {"type": "bond", "agent_pubkey": AGENT_KEY, "from": "agent"})
+                except Exception:
+                    pass
+
+                # Accept
+                data = store.get(cid)
+                if data and data["status"] == "investigating":
+                    store.update_status(cid, "in_progress")
+                elif data and data["status"] == "open":
+                    store.assign_agent(cid, AGENT_KEY)
+                else:
+                    continue
+                store.append_message(cid, {"type": "accept", "agent_pubkey": AGENT_KEY})
+
+                # Generate first fix
+                prompt = _build_fix_prompt(contract)
+                raw = agent_llm_call(prompt)
+                result = _parse_llm_json(raw)
+                fix_cmd = result.get("fix", "")
+                explanation = result.get("explanation", "")
+
+                store.append_message(cid, {
+                    "type": "fix",
+                    "fix": fix_cmd,
+                    "explanation": explanation,
+                    "from": "agent",
+                })
+
+                mode = data.get("execution_mode", "supervised")
+                if mode == "autonomous":
+                    review_window = contract.get("execution", {}).get("review_window", 7200)
+                    store.update_status(cid, "review")
+                    store.set_review_expires(cid, time.time() + review_window)
+
+                print(f"[agent] Fix for {cid}: {fix_cmd[:80]}")
                 continue
 
-            c = contracts[0]
-            cid = c["id"]
-            contract = c["contract"]
-            task = contract.get("task", {})
+            # 2. Check in_progress contracts that need a retry
+            in_progress = store.list_by_status("in_progress", limit=5)
+            for c in in_progress:
+                cid = c["id"]
+                if c.get("agent_pubkey") != AGENT_KEY:
+                    continue
 
-            print(f"[agent] Picking up {cid}: {task.get('command', task.get('task', '?'))}")
+                transcript = c.get("transcript", [])
+                # Find failed verifications and prior fix attempts
+                fixes = [m for m in transcript if m.get("type") == "fix"]
+                failures = [m for m in transcript if m.get("type") == "verify" and not m.get("success")]
 
-            # Bond if escrow exists
-            try:
-                escrow_mgr.lock_agent_bond(cid)
-                store.db.execute(
-                    "UPDATE contracts SET agent_pubkey = ?, status = 'investigating', updated_at = ? WHERE id = ? AND status = 'open'",
-                    (AGENT_KEY, time.time(), cid),
-                )
-                store.db.commit()
-                store.append_message(cid, {"type": "bond", "agent_pubkey": AGENT_KEY, "from": "agent"})
-            except Exception:
-                # No escrow, direct accept
-                pass
+                if not failures or len(fixes) <= len(failures):
+                    pass  # needs a new fix
+                else:
+                    continue  # already submitted a fix for the latest failure
 
-            # Accept
-            data = store.get(cid)
-            if data and data["status"] == "investigating":
-                store.update_status(cid, "in_progress")
-            elif data and data["status"] == "open":
-                store.assign_agent(cid, AGENT_KEY)
-            else:
-                continue
-            store.append_message(cid, {"type": "accept", "agent_pubkey": AGENT_KEY})
+                if not failures:
+                    continue
 
-            # Build prompt
-            error = task.get("error", "")
-            command = task.get("command", "")
-            env = contract.get("environment", {})
+                # Check max attempts
+                contract = c.get("contract", {})
+                max_attempts = contract.get("execution", {}).get("max_attempts", 3)
+                if len(failures) >= max_attempts:
+                    continue
 
-            prompt = f"""A command failed. Propose a fix as a JSON object.
+                # Build retry prompt with failure context
+                prior = []
+                for f in fixes:
+                    # Find the corresponding failure
+                    reason = "verification failed"
+                    for v in failures:
+                        if v.get("explanation"):
+                            reason = v["explanation"]
+                            break
+                    prior.append({"fix": f.get("fix", ""), "reason": reason})
 
-COMMAND: {command}
-ERROR: {error}
-OS: {env.get('os', '?')} {env.get('arch', '?')}
-Package managers: {', '.join(env.get('package_managers', []))}
+                print(f"[agent] Retrying {cid} (attempt {len(failures) + 1})")
+                prompt = _build_fix_prompt(contract, prior_failures=prior)
+                raw = agent_llm_call(prompt)
+                result = _parse_llm_json(raw)
+                fix_cmd = result.get("fix", "")
+                explanation = result.get("explanation", "")
 
-Respond with JSON only (no markdown):
-{{"accepted": true, "fix": "shell command(s)", "explanation": "why"}}"""
-
-            raw = agent_llm_call(prompt)
-
-            # Parse
-            text = raw.strip()
-            if text.startswith("```"):
-                text = "\n".join(text.split("\n")[1:])
-                if text.endswith("```"):
-                    text = text[:-3]
-                text = text.strip()
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                text = text[start:end]
-
-            result = json.loads(text)
-            fix_cmd = result.get("fix", "")
-            explanation = result.get("explanation", "")
-
-            store.append_message(cid, {
-                "type": "fix",
-                "fix": fix_cmd,
-                "explanation": explanation,
-                "from": "agent",
-            })
-
-            # In autonomous mode, go to review; otherwise stay pending
-            mode = data.get("execution_mode", "supervised")
-            if mode == "autonomous":
-                review_window = contract.get("execution", {}).get("review_window", 7200)
-                store.update_status(cid, "review")
-                store.set_review_expires(cid, time.time() + review_window)
-            # supervised: principal verifies via API
-
-            print(f"[agent] Fix for {cid}: {fix_cmd[:80]}")
+                store.append_message(cid, {
+                    "type": "fix",
+                    "fix": fix_cmd,
+                    "explanation": explanation,
+                    "from": "agent",
+                })
+                print(f"[agent] Retry fix for {cid}: {fix_cmd[:80]}")
 
         except Exception as e:
             print(f"[agent] Error: {e}")

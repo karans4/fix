@@ -367,13 +367,6 @@ def create_app(
         if not data:
             raise HTTPException(404, "Contract not found")
 
-        if req.success:
-            _store.update_status(contract_id, "fulfilled")
-            ruling = "fulfilled"
-        else:
-            _store.update_status(contract_id, "canceled")
-            ruling = "canceled"
-
         _store.append_message(contract_id, {
             "type": "verify",
             "success": req.success,
@@ -381,19 +374,39 @@ def create_app(
             "from": "principal",
         })
 
-        # Resolve escrow
-        escrow = _escrow.get(contract_id)
-        if escrow and not escrow["resolved"]:
-            _escrow.resolve(contract_id, ruling)
+        if req.success:
+            _store.update_status(contract_id, "fulfilled")
+            ruling = "fulfilled"
+        else:
+            # Check if retries remain
+            contract = data.get("contract", {})
+            max_attempts = contract.get("execution", {}).get("max_attempts", 3)
+            transcript = data.get("transcript", [])
+            attempts_so_far = sum(1 for m in transcript if m.get("type") == "verify" and not m.get("success"))
+            # +1 for this verify we just appended
+            attempts_so_far += 1
 
-        # Record reputation
-        updated = _store.get(contract_id)
-        if updated:
-            bounty = Decimal(data["contract"].get("escrow", {}).get("bounty", "0"))
-            if updated.get("agent_pubkey"):
-                _reputation.record(updated["agent_pubkey"], "agent", ruling, bounty)
-            if updated.get("principal_pubkey"):
-                _reputation.record(updated["principal_pubkey"], "principal", ruling, bounty)
+            if attempts_so_far < max_attempts:
+                # Stay in_progress -- agent should retry
+                ruling = "retry"
+            else:
+                _store.update_status(contract_id, "canceled")
+                ruling = "canceled"
+
+        if ruling != "retry":
+            # Resolve escrow
+            escrow = _escrow.get(contract_id)
+            if escrow and not escrow["resolved"]:
+                _escrow.resolve(contract_id, ruling)
+
+            # Record reputation
+            updated = _store.get(contract_id)
+            if updated:
+                bounty = Decimal(data["contract"].get("escrow", {}).get("bounty", "0"))
+                if updated.get("agent_pubkey"):
+                    _reputation.record(updated["agent_pubkey"], "agent", ruling, bounty)
+                if updated.get("principal_pubkey"):
+                    _reputation.record(updated["principal_pubkey"], "principal", ruling, bounty)
 
         return {"status": ruling}
 
