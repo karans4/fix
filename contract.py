@@ -166,8 +166,9 @@ def build_contract(command, stderr, env_info, **kwargs):
 
     # Remote mode: add escrow + terms
     if remote:
+        bounty_str = str(bounty) if bounty else "0.01"
         contract["escrow"] = {
-            "bounty": str(bounty) if bounty else "0.01",
+            "bounty": bounty_str,
             "currency": "XNO",
             "chain": "nano",
             "settle": "nano_direct",
@@ -183,14 +184,150 @@ def build_contract(command, stderr, env_info, **kwargs):
                 "ruling": "escalate",
             },
             "platform": {
-                "url": "http://localhost:8000",
                 "evidence_hash_algo": "sha256",
             },
         }
         if judge:
             contract["terms"]["judge"] = judge
 
+    # Human-readable briefing — the actual contract document
+    contract["briefing"] = _build_briefing(contract)
+
     return contract
+
+
+def _build_briefing(contract):
+    """Build a human-readable contract briefing.
+
+    This is the document a stranger (human or AI) reads to understand
+    the deal: what happened, what they can do, what's at stake.
+    """
+    task = contract.get("task", {})
+    env = contract.get("environment", {})
+    caps = contract.get("capabilities", {})
+    execution = contract.get("execution", {})
+    verification = contract.get("verification", [])
+    escrow = contract.get("escrow", {})
+    terms = contract.get("terms", {})
+
+    command = task.get("command", "?")
+    error = task.get("error", "(no error output)")
+    os_str = env.get("os", "?")
+    arch = env.get("arch", "?")
+    pkg_mgrs = ", ".join(env.get("package_managers", [])) or "none"
+
+    available = [k for k, v in caps.items() if v.get("available")]
+    unavailable = [k for k, v in caps.items() if not v.get("available")]
+
+    max_attempts = execution.get("max_attempts", 3)
+    inv_rounds = execution.get("investigation_rounds", 5)
+    inv_rate = execution.get("investigation_rate", 5)
+    timeout = execution.get("timeout", 300)
+    sandbox = execution.get("sandbox", False)
+
+    # Verification description
+    verify_descs = []
+    for v in verification:
+        m = v.get("method", "?")
+        if m == "exit_code":
+            verify_descs.append(f"re-run the original command, exit code must be {v.get('expected', 0)}")
+        elif m == "human_judgment":
+            verify_descs.append("principal (human) judges the result")
+        elif m == "output_match":
+            verify_descs.append(f"output must contain: {v.get('pattern', '?')}")
+        else:
+            verify_descs.append(m)
+    verify_str = "; ".join(verify_descs) if verify_descs else "exit code 0"
+
+    lines = []
+    lines.append("=" * 60)
+    lines.append("FIX CONTRACT")
+    lines.append("=" * 60)
+    lines.append("")
+    lines.append("SITUATION")
+    lines.append(f"  A command failed on the principal's machine.")
+    lines.append(f"  Command:  {command}")
+    lines.append(f"  Error:    {error}")
+    lines.append(f"  OS:       {os_str} ({arch})")
+    lines.append(f"  Packages: {pkg_mgrs}")
+    if available:
+        lines.append(f"  Available: {', '.join(available)}")
+    if unavailable:
+        lines.append(f"  Unavailable: {', '.join(unavailable)}")
+    lines.append("")
+
+    lines.append("YOUR ROLE")
+    lines.append("  You are the agent. You have been assigned this contract.")
+    lines.append("  Your job: make the command succeed on the principal's machine.")
+    lines.append("")
+
+    lines.append("INVESTIGATION PHASE")
+    lines.append(f"  Before proposing a fix, you may request up to {inv_rounds} commands")
+    lines.append(f"  to run on the principal's machine (read-only investigation).")
+    lines.append(f"  Rate limit: 1 command per {inv_rate} seconds.")
+    lines.append(f"  Use this to understand the problem: list files, read source,")
+    lines.append(f"  check installed packages, examine directory structure, etc.")
+    lines.append(f"  API: POST /contracts/{{id}}/investigate  body: {{\"command\": \"...\"}}")
+    lines.append(f"  Results appear in the transcript as type \"result\".")
+    lines.append(f"  You may decline the contract after investigating (bond returned).")
+    lines.append(f"  API: POST /contracts/{{id}}/decline")
+    lines.append("")
+
+    lines.append("FIX PHASE")
+    lines.append(f"  Once you accept, propose a fix (shell command to run).")
+    lines.append(f"  API: POST /contracts/{{id}}/fix  body: {{\"fix\": \"...\", \"explanation\": \"...\"}}")
+    lines.append(f"  You have {max_attempts} attempt(s). If verification fails, you")
+    lines.append(f"  will see the failure reason and may propose another fix.")
+    lines.append(f"  Timeout: {timeout} seconds total.")
+    if sandbox:
+        lines.append(f"  Fix runs in a sandbox (OverlayFS). Changes only committed if verification passes.")
+    lines.append("")
+
+    lines.append("VERIFICATION")
+    lines.append(f"  How your fix is judged: {verify_str}")
+    lines.append("")
+
+    if escrow:
+        bounty_str = escrow.get("bounty", "0")
+        currency = escrow.get("currency", "XNO")
+        lines.append("PAYMENT")
+        lines.append(f"  Bounty: {bounty_str} {currency}")
+        lines.append(f"  On success: bounty released to you.")
+        lines.append(f"  On failure (all attempts exhausted): contract canceled, no payment.")
+        lines.append("")
+
+        cancel = terms.get("cancellation", {})
+        if cancel:
+            lines.append("CANCELLATION")
+            lines.append(f"  Grace period: {cancel.get('grace_period', 30)}s after accepting.")
+            lines.append(f"  Agent cancellation fee: {cancel.get('agent_fee', '0')} {currency}")
+            lines.append(f"  Principal cancellation fee: {cancel.get('principal_fee', '0')} {currency}")
+            lines.append("")
+
+        judge = terms.get("judge", {})
+        if judge:
+            lines.append("DISPUTES")
+            lines.append(f"  Judge: {judge.get('pubkey', 'platform AI judge')}")
+            lines.append(f"  Judge fee: {judge.get('fee', '0.005')} {currency} (paid by loser)")
+            lines.append(f"  Both sides post a dispute bond equal to the judge fee.")
+            lines.append(f"  Winner's bond returned. Loser's bond pays the judge.")
+            lines.append(f"  Ruling timeout: {judge.get('ruling_timeout', 60)}s.")
+            lines.append(f"  If judge doesn't rule: contract voided, all funds returned.")
+            lines.append("")
+        else:
+            lines.append("DISPUTES")
+            lines.append(f"  Platform AI judge resolves disputes.")
+            lines.append(f"  Either side may escalate if they disagree with verification.")
+            lines.append("")
+
+    lines.append("CHAT")
+    lines.append(f"  You may message the principal at any time during the contract.")
+    lines.append(f"  API: POST /contracts/{{id}}/chat  body: {{\"message\": \"...\", \"from_side\": \"agent\"}}")
+    lines.append(f"  Message types: \"ask\" (question), \"answer\" (reply), \"message\" (general)")
+    lines.append("")
+    lines.append("=" * 60)
+
+    return "\n".join(lines)
 
 
 # --- Validator ---

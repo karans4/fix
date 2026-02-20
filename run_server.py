@@ -81,75 +81,134 @@ def _parse_llm_json(raw):
     return json.loads(text)
 
 
-def _build_fix_prompt(contract, prior_failures=None):
-    """Build prompt for the agent LLM."""
-    task = contract.get("task", {})
-    error = task.get("error", "")
-    command = task.get("command", "")
-    env = contract.get("environment", {})
-
-    prompt = f"""A command failed. Propose a fix as a JSON object.
-
-COMMAND: {command}
-ERROR: {error}
-OS: {env.get('os', '?')} {env.get('arch', '?')}
-Package managers: {', '.join(env.get('package_managers', []))}"""
-
-    if prior_failures:
-        prompt += "\n\nPREVIOUS FAILED ATTEMPTS (do NOT repeat these):"
-        for i, fail in enumerate(prior_failures, 1):
-            prompt += f"\n  Attempt {i}: {fail['fix']} -> {fail['reason']}"
-
-    prompt += f"""
-
-Respond with JSON only (no markdown):
-{{"accepted": true, "fix": "shell command(s)", "explanation": "why"}}"""
-    return prompt
-
-
 def run_free_agent(store, escrow_mgr):
-    """Background thread: poll for open contracts, accept and fix them."""
+    """Background thread: full contract lifecycle.
+
+    1. Pick up open contracts, bond into INVESTIGATING
+    2. Ask LLM what to investigate, post commands, wait for results
+    3. Accept and propose fix with full context
+    4. Handle retries on failure
+    """
     AGENT_KEY = "platform_free_agent"
     POLL_INTERVAL = 3
+    RESULT_WAIT = 30  # max seconds to wait for investigation result
 
     while True:
         time.sleep(POLL_INTERVAL)
         try:
-            # 1. Pick up new open contracts
+            # --- Phase 1: Pick up new contracts, start investigating ---
             contracts = store.list_by_status("open", limit=1)
             if contracts:
                 c = contracts[0]
                 cid = c["id"]
                 contract = c["contract"]
                 task = contract.get("task", {})
+                briefing = contract.get("briefing", "")
 
                 print(f"[agent] Picking up {cid}: {task.get('command', task.get('task', '?'))}")
 
-                # Bond if escrow exists
+                # Bond → INVESTIGATING
                 try:
                     escrow_mgr.lock_agent_bond(cid)
-                    store.db.execute(
-                        "UPDATE contracts SET agent_pubkey = ?, status = 'investigating', updated_at = ? WHERE id = ? AND status = 'open'",
-                        (AGENT_KEY, time.time(), cid),
-                    )
-                    store.db.commit()
-                    store.append_message(cid, {"type": "bond", "agent_pubkey": AGENT_KEY, "from": "agent"})
                 except Exception:
                     pass
+                store.db.execute(
+                    "UPDATE contracts SET agent_pubkey = ?, status = 'investigating', updated_at = ? WHERE id = ? AND status = 'open'",
+                    (AGENT_KEY, time.time(), cid),
+                )
+                store.db.commit()
+                store.append_message(cid, {"type": "bond", "agent_pubkey": AGENT_KEY, "from": "agent"})
 
-                # Accept
+                # Ask LLM what to investigate
+                inv_prompt = f"""You are a contract agent. Read this contract and decide what
+commands to run on the principal's machine to investigate the problem.
+
+{briefing}
+
+You have up to {contract.get('execution', {}).get('investigation_rounds', 5)} investigation commands.
+These run on the PRINCIPAL'S machine (where the error happened).
+Use them to understand the problem: list files, read source code, check versions, etc.
+
+Respond with JSON only (no markdown):
+{{"commands": ["ls -la", "cat file.c", ...], "reasoning": "why these commands"}}
+
+If the error is obvious and you don't need to investigate, respond:
+{{"commands": [], "reasoning": "error is clear, no investigation needed"}}"""
+
+                raw = agent_llm_call(inv_prompt)
+                inv_result = _parse_llm_json(raw)
+                inv_commands = inv_result.get("commands", [])
+                reasoning = inv_result.get("reasoning", "")
+
+                if reasoning:
+                    print(f"[agent] Investigation plan for {cid}: {reasoning[:80]}")
+
+                # Post investigation commands and wait for results
+                inv_results = {}
+                max_rounds = contract.get("execution", {}).get("investigation_rounds", 5)
+                for cmd in inv_commands[:max_rounds]:
+                    store.append_message(cid, {
+                        "type": "investigate",
+                        "command": cmd,
+                        "from": "agent",
+                    })
+                    print(f"[agent] Investigating {cid}: {cmd}")
+
+                    # Wait for principal to run it and post result
+                    result_text = None
+                    for _ in range(RESULT_WAIT):
+                        time.sleep(1)
+                        data = store.get(cid)
+                        if not data:
+                            break
+                        transcript = data.get("transcript", [])
+                        for msg in transcript:
+                            if (msg.get("type") == "result"
+                                    and msg.get("command") == cmd):
+                                result_text = msg.get("output", "")
+                                break
+                        if result_text is not None:
+                            break
+
+                    if result_text is not None:
+                        inv_results[cmd] = result_text
+                        print(f"[agent] Result for '{cmd}': {result_text[:80]}")
+                    else:
+                        inv_results[cmd] = "(no response from principal)"
+                        print(f"[agent] No response for '{cmd}', moving on")
+
+                # Accept → IN_PROGRESS
                 data = store.get(cid)
-                if data and data["status"] == "investigating":
-                    store.update_status(cid, "in_progress")
-                elif data and data["status"] == "open":
-                    store.assign_agent(cid, AGENT_KEY)
-                else:
+                if not data or data["status"] != "investigating":
                     continue
+                store.update_status(cid, "in_progress")
                 store.append_message(cid, {"type": "accept", "agent_pubkey": AGENT_KEY})
 
-                # Generate first fix
-                prompt = _build_fix_prompt(contract)
-                raw = agent_llm_call(prompt)
+                # Build fix prompt with investigation context
+                fix_prompt = f"""You are a contract agent. You investigated the problem and
+now must propose a fix.
+
+{briefing}
+
+INVESTIGATION RESULTS:"""
+                if inv_results:
+                    for cmd, output in inv_results.items():
+                        fix_prompt += f"\n\n$ {cmd}\n{output}"
+                else:
+                    fix_prompt += "\n(no investigation performed)"
+
+                fix_prompt += f"""
+
+Based on the contract and your investigation, propose a shell command
+that will fix the problem. The fix runs on the principal's machine.
+
+Respond with JSON only (no markdown):
+{{"fix": "shell command(s) to fix the problem", "explanation": "why this fixes it"}}
+
+If you cannot fix it, respond:
+{{"fix": null, "explanation": "why it cannot be fixed"}}"""
+
+                raw = agent_llm_call(fix_prompt)
                 result = _parse_llm_json(raw)
                 fix_cmd = result.get("fix", "")
                 explanation = result.get("explanation", "")
@@ -167,10 +226,10 @@ def run_free_agent(store, escrow_mgr):
                     store.update_status(cid, "review")
                     store.set_review_expires(cid, time.time() + review_window)
 
-                print(f"[agent] Fix for {cid}: {fix_cmd[:80]}")
+                print(f"[agent] Fix for {cid}: {str(fix_cmd)[:80]}")
                 continue
 
-            # 2. Check in_progress contracts that need a retry
+            # --- Phase 2: Handle retries for failed fixes ---
             in_progress = store.list_by_status("in_progress", limit=5)
             for c in in_progress:
                 cid = c["id"]
@@ -178,38 +237,55 @@ def run_free_agent(store, escrow_mgr):
                     continue
 
                 transcript = c.get("transcript", [])
-                # Find failed verifications and prior fix attempts
                 fixes = [m for m in transcript if m.get("type") == "fix"]
                 failures = [m for m in transcript if m.get("type") == "verify" and not m.get("success")]
 
-                if not failures or len(fixes) <= len(failures):
-                    pass  # needs a new fix
-                else:
-                    continue  # already submitted a fix for the latest failure
-
-                if not failures:
+                # Need a new fix only if there are more failures than fixes
+                if not failures or len(fixes) > len(failures):
                     continue
 
-                # Check max attempts
                 contract = c.get("contract", {})
+                briefing = contract.get("briefing", "")
                 max_attempts = contract.get("execution", {}).get("max_attempts", 3)
                 if len(failures) >= max_attempts:
                     continue
 
-                # Build retry prompt with failure context
-                prior = []
-                for f in fixes:
-                    # Find the corresponding failure
+                # Collect investigation results from transcript
+                inv_results = {}
+                for msg in transcript:
+                    if msg.get("type") == "result":
+                        inv_results[msg.get("command", "?")] = msg.get("output", "")
+
+                # Build retry prompt
+                retry_prompt = f"""You are a contract agent. Your previous fix(es) failed.
+Read the contract and try again.
+
+{briefing}
+
+INVESTIGATION RESULTS:"""
+                if inv_results:
+                    for cmd, output in inv_results.items():
+                        retry_prompt += f"\n\n$ {cmd}\n{output}"
+                else:
+                    retry_prompt += "\n(no investigation was performed)"
+
+                retry_prompt += "\n\nPREVIOUS ATTEMPTS (do NOT repeat these):"
+                for i, f in enumerate(fixes, 1):
+                    # Find matching failure
                     reason = "verification failed"
-                    for v in failures:
-                        if v.get("explanation"):
-                            reason = v["explanation"]
-                            break
-                    prior.append({"fix": f.get("fix", ""), "reason": reason})
+                    if i <= len(failures) and failures[i-1].get("explanation"):
+                        reason = failures[i-1]["explanation"]
+                    retry_prompt += f"\n  Attempt {i}: {f.get('fix', '?')} -> {reason}"
+
+                retry_prompt += f"""
+
+Propose a DIFFERENT fix. Learn from what failed.
+
+Respond with JSON only (no markdown):
+{{"fix": "shell command(s)", "explanation": "why this is different and better"}}"""
 
                 print(f"[agent] Retrying {cid} (attempt {len(failures) + 1})")
-                prompt = _build_fix_prompt(contract, prior_failures=prior)
-                raw = agent_llm_call(prompt)
+                raw = agent_llm_call(retry_prompt)
                 result = _parse_llm_json(raw)
                 fix_cmd = result.get("fix", "")
                 explanation = result.get("explanation", "")
@@ -220,7 +296,7 @@ def run_free_agent(store, escrow_mgr):
                     "explanation": explanation,
                     "from": "agent",
                 })
-                print(f"[agent] Retry fix for {cid}: {fix_cmd[:80]}")
+                print(f"[agent] Retry fix for {cid}: {str(fix_cmd)[:80]}")
 
         except Exception as e:
             print(f"[agent] Error: {e}")
