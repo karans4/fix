@@ -1798,25 +1798,8 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
 
     env_info = get_env_fingerprint()
 
-    # Resolve backend
-    try:
-        backend_name, backend_kwargs = resolve_backend(cfg, force_local)
-    except RuntimeError as e:
-        status(f"{C_RED}!{C_RESET}", str(e))
-        return proc.returncode
-
-    # --explain: just explain the error
-    if explain_only:
-        prompt = build_explain_prompt(command, proc.stderr, env_info)
-        try:
-            raw = call_llm(prompt, backend_name, backend_kwargs)
-        except RuntimeError as e:
-            status(f"{C_RED}!{C_RESET}", str(e))
-            return proc.returncode
-        print(f"\n{raw.strip()}\n")
-        return proc.returncode
-
     # --- Remote mode: post to platform, wait for agent ---
+    # Check this BEFORE resolve_backend so remote works without a local LLM.
     if remote and _HAS_REMOTE:
         import asyncio as _asyncio
         status(f"{C_YELLOW}\u25cb{C_RESET}", f"Dispatching to platform (remote mode)...")
@@ -1907,6 +1890,24 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
     elif remote and not _HAS_REMOTE:
         status(f"{C_RED}!{C_RESET}", "Remote mode requires: pip install httpx")
         return 1
+
+    # Resolve backend (only needed for local mode)
+    try:
+        backend_name, backend_kwargs = resolve_backend(cfg, force_local)
+    except RuntimeError as e:
+        status(f"{C_RED}!{C_RESET}", str(e))
+        return proc.returncode
+
+    # --explain: just explain the error
+    if explain_only:
+        prompt = build_explain_prompt(command, proc.stderr, env_info)
+        try:
+            raw = call_llm(prompt, backend_name, backend_kwargs)
+        except RuntimeError as e:
+            status(f"{C_RED}!{C_RESET}", str(e))
+            return proc.returncode
+        print(f"\n{raw.strip()}\n")
+        return proc.returncode
 
     status(f"{C_YELLOW}\u25cb{C_RESET}", f"Dispatching to agent...")
 
