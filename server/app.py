@@ -60,6 +60,7 @@ class SubmitFixRequest(BaseModel):
 class VerifyRequest(BaseModel):
     success: bool
     explanation: str = ""
+    principal_pubkey: str = ""
 
 class DisputeRequest(BaseModel):
     argument: str
@@ -71,7 +72,7 @@ class RespondRequest(BaseModel):
 
 class HaltRequest(BaseModel):
     reason: str
-    principal_pubkey: str = ""
+    principal_pubkey: str
 
 class SetAccountsRequest(BaseModel):
     principal_account: str = ""
@@ -93,6 +94,15 @@ class RulingResponse(BaseModel):
 
 
 PLATFORM_URL = "https://fix.notruefireman.org"
+
+
+def _check_party(data: dict, pubkey: str, role: str):
+    """Verify caller is the expected party. Raises 403 if not."""
+    stored = data.get(f"{role}_pubkey", "")
+    if not stored or not pubkey:
+        raise HTTPException(403, f"Missing {role} pubkey")
+    if pubkey != stored:
+        raise HTTPException(403, f"Not the {role} of this contract")
 
 
 def build_briefing(contract_id: str, data: dict) -> str:
@@ -462,6 +472,8 @@ def create_app(
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
+        if req.agent_pubkey == data.get("principal_pubkey"):
+            raise HTTPException(403, "Cannot accept your own contract")
 
         if data["status"] == "investigating":
             # Agent already bonded, transition to in_progress
@@ -576,6 +588,8 @@ def create_app(
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
+        if req.agent_pubkey and data.get("agent_pubkey"):
+            _check_party(data, req.agent_pubkey, "agent")
         if data["status"] != "in_progress":
             raise HTTPException(409, f"Contract is {data['status']}")
 
@@ -605,6 +619,7 @@ def create_app(
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
+        _check_party(data, req.principal_pubkey, "principal")
 
         _store.append_message(contract_id, {
             "type": "verify",
@@ -1034,6 +1049,7 @@ def create_app(
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
+        _check_party(data, req.principal_pubkey, "principal")
         if data["status"] not in ("in_progress", "review"):
             raise HTTPException(409, f"Contract is {data['status']}, not in_progress or review")
 

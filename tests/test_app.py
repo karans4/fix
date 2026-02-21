@@ -476,6 +476,7 @@ def test_halt_during_review(client):
 
     resp = client.post(f"/contracts/{cid}/halt", json={
         "reason": "Malicious fix detected",
+        "principal_pubkey": "principal_abc",
     })
     assert resp.status_code == 200
     assert resp.json()["status"] == "halted"
@@ -484,12 +485,12 @@ def test_halt_during_review(client):
 def test_halt_not_in_progress_or_review(client):
     data = _create_contract(client)
     cid = data["contract_id"]
-    resp = client.post(f"/contracts/{cid}/halt", json={"reason": "suspicious"})
+    resp = client.post(f"/contracts/{cid}/halt", json={"reason": "suspicious", "principal_pubkey": "principal_abc"})
     assert resp.status_code == 409
 
 
 def test_halt_not_found(client):
-    resp = client.post("/contracts/nonexistent/halt", json={"reason": "bad agent"})
+    resp = client.post("/contracts/nonexistent/halt", json={"reason": "bad agent", "principal_pubkey": "principal_abc"})
     assert resp.status_code == 404
 
 

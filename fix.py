@@ -1034,6 +1034,13 @@ def _get_signing_key():
     return key
 
 
+def get_pubkey():
+    """Derive a public identity from the signing key (sha256 hex of the key)."""
+    import hashlib
+    key = _get_signing_key()
+    return "fix_" + hashlib.sha256(key).hexdigest()[:16]
+
+
 def sign_contract(contract):
     """Hash and HMAC-sign a contract. Returns (sha256_hex, signature_hex).
 
@@ -1935,7 +1942,8 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             platform_url = cfg.get("platform_url", "https://fix.notruefireman.org")
             fix_client = FixClient(base_url=platform_url)
 
-            contract_id = await fix_client.post_contract(contract)
+            my_pubkey = get_pubkey()
+            contract_id = await fix_client.post_contract(contract, principal_pubkey=my_pubkey)
             status(f"{C_GREEN}\u2714{C_RESET}", f"Contract posted ({contract_id})")
             status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for agent...")
 
@@ -2122,7 +2130,8 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                         rc = apply_fix(fix_cmd, command, verify_spec, safe_mode, cfg, contract)
                         success = (rc == 0)
                         await fix_client.verify(contract_id, success,
-                                                "fulfilled" if success else f"fix failed verification (attempt {attempt_num})")
+                                                "fulfilled" if success else f"fix failed verification (attempt {attempt_num})",
+                                                principal_pubkey=my_pubkey)
 
                         if success:
                             final_rc = rc

@@ -109,11 +109,13 @@ class FixClient:
             "agent_pubkey": agent_pubkey,
         })
 
-    async def verify(self, contract_id: str, success: bool, explanation: str = "") -> dict:
+    async def verify(self, contract_id: str, success: bool, explanation: str = "",
+                     principal_pubkey: str = "") -> dict:
         """Principal reports verification result."""
         return await self.transport.post(f"/contracts/{contract_id}/verify", {
             "success": success,
             "explanation": explanation,
+            "principal_pubkey": principal_pubkey,
         })
 
     async def dispute(self, contract_id: str, argument: str, side: str = "principal") -> dict:

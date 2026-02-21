@@ -225,6 +225,7 @@ def test_verify_success_fulfills(client):
     resp = client.post(f"/contracts/{cid}/verify", json={
         "success": True,
         "explanation": "build passes now",
+        "principal_pubkey": "principal_abc",
     })
     assert resp.status_code == 200
     assert resp.json()["status"] == "fulfilled"
@@ -245,6 +246,7 @@ def test_verify_failure_retries(client):
     resp = client.post(f"/contracts/{cid}/verify", json={
         "success": False,
         "explanation": "still broken",
+        "principal_pubkey": "principal_abc",
     })
     assert resp.status_code == 200
     assert resp.json()["status"] == "retry"
@@ -267,6 +269,7 @@ def test_verify_failure_cancels_after_max_attempts(client):
         resp = client.post(f"/contracts/{cid}/verify", json={
             "success": False,
             "explanation": f"still broken attempt {i+1}",
+            "principal_pubkey": "principal_abc",
         })
 
     assert resp.json()["status"] == "canceled"
@@ -281,7 +284,7 @@ def test_verify_resolves_escrow(app, client):
     client.post(f"/contracts/{cid}/fix", json={
         "fix": "apt install gcc", "agent_pubkey": "agent_xyz",
     })
-    client.post(f"/contracts/{cid}/verify", json={"success": True})
+    client.post(f"/contracts/{cid}/verify", json={"success": True, "principal_pubkey": "principal_abc"})
 
     escrow = app.state.escrow.get(cid)
     assert escrow["resolved"] is True
@@ -304,7 +307,7 @@ def test_reputation_after_fulfillment(client):
     client.post(f"/contracts/{cid}/fix", json={
         "fix": "apt install gcc", "agent_pubkey": "agent_xyz",
     })
-    client.post(f"/contracts/{cid}/verify", json={"success": True})
+    client.post(f"/contracts/{cid}/verify", json={"success": True, "principal_pubkey": "principal_abc"})
 
     agent_rep = client.get("/reputation/agent_xyz").json()
     assert agent_rep["as_agent"]["fulfilled"] == 1
@@ -331,6 +334,6 @@ def test_fix_nonexistent_404(client):
 
 def test_verify_nonexistent_404(client):
     resp = client.post("/contracts/nope/verify", json={
-        "success": True,
+        "success": True, "principal_pubkey": "principal_abc",
     })
     assert resp.status_code == 404

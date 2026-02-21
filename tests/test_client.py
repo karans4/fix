@@ -125,7 +125,7 @@ async def test_verify(fix_client, mock_transport):
     assert result["status"] == "fulfilled"
     assert mock_transport.calls[-1] == (
         "POST", "/contracts/c1/verify",
-        {"success": True, "explanation": "works"},
+        {"success": True, "explanation": "works", "principal_pubkey": ""},
     )
 
 
