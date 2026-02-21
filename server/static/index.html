@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>fix</title>
+<title>fix-cli</title>
 <style>
   :root {
     --bg: #0d1117; --bg2: #161b22; --bg3: #21262d; --border: #30363d;
@@ -26,11 +26,17 @@
   }
   .hero h1 {
     font-size: 64px; font-weight: 800; letter-spacing: -3px;
-    color: var(--text); margin-bottom: 12px;
+    color: var(--text); margin-bottom: 24px;
   }
   .hero h1 span { color: var(--blue); }
+  .hero .tagline {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'SF Mono', monospace;
+    font-size: 32px; font-weight: 700; color: var(--text);
+    margin-bottom: 12px;
+  }
+  .hero .tagline span { color: var(--green); }
   .hero p {
-    font-size: 18px; color: var(--text2); max-width: 420px; margin: 0 auto 32px;
+    font-size: 17px; color: var(--text2); max-width: 420px; margin: 0 auto 32px;
   }
   .install-box {
     display: inline-flex; align-items: center; gap: 12px;
@@ -68,7 +74,7 @@
   .term-dot.r { background: #f85149; } .term-dot.y { background: #ffa657; } .term-dot.g { background: #7ee787; }
   .term-body {
     padding: 16px 18px; font-size: 13px; line-height: 1.7;
-    min-height: 180px;
+    height: 405px; overflow: hidden;
   }
   .term-body .prompt { color: var(--text3); }
   .term-body .cmd { color: var(--text); }
@@ -182,8 +188,9 @@
 <body>
 
 <section class="hero">
-  <h1><span>fix</span></h1>
-  <p>Your command failed. Fix it with AI. One word, from your terminal.</p>
+  <h1><span>fix-cli</span></h1>
+  <div class="tagline">Command failed? Just <span>`fix it`</span></div>
+  <p>Two words. AI investigates, patches, and verifies -- in a sandbox. Or run agents that earn money fixing real problems.</p>
   <div class="install-box" onclick="copyInstall()">
     <span class="mono"><span class="prompt">$</span> <span class="cmd">pip install fix-cli</span></span>
     <span class="copy" id="copy-btn">copy</span>
@@ -234,7 +241,7 @@
     <div class="mode-card">
       <span class="mode-icon">&#10023;</span>
       <h3>Market</h3>
-      <p>Post a contract to the market. An AI agent picks it up and proposes a fix.</p>
+      <p>Post a bounty. AI agents compete to fix it and earn XNO. Or run your own agent with <code>fix serve</code>.</p>
       <code>fix --market</code>
     </div>
   </div>
@@ -254,7 +261,7 @@
       <div class="step-num">2</div>
       <div class="step-text">
         <h4>Type <code class="mono">fix it</code></h4>
-        <p>fix captures the failed command and error output, scrubs secrets, and dispatches to an AI agent.</p>
+        <p>fix captures the failed command and error output, scrubs secrets, and dispatches to an AI agent. Runs in an overlay sandbox by default -- nothing touches your system until verified.</p>
       </div>
     </div>
     <div class="step">
@@ -262,6 +269,13 @@
       <div class="step-text">
         <h4>Agent investigates and fixes</h4>
         <p>The agent reads your environment, runs diagnostic commands, and applies a fix. Verified automatically.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-text">
+        <h4>Disputes go to court</h4>
+        <p>Bad fix? Dispute it. A tiered AI court -- District (Kimi), Appeals (Claude), Supreme (Opus) -- rules on the outcome. Bonds ensure both sides play fair.</p>
       </div>
     </div>
   </div>
@@ -309,20 +323,32 @@ const lines = [
   { type: 'err', text: '   14 | #include <openssl/ssl.h>' },
   { type: 'err', text: '      |          ^~~~~~~~~~~~~~~' },
   { type: 'err', text: 'compilation terminated.' },
-  { type: 'pause', ms: 600 },
+  { type: 'pause', ms: 1600 },
   { type: 'input', text: '$ fix it' },
-  { type: 'pause', ms: 400 },
+  { type: 'pause', ms: 800 },
   { type: 'dim', text: '  \u25b8 Last command: gcc server.c -o server' },
   { type: 'err', text: '  \u2717 Exited 1' },
-  { type: 'pause', ms: 300 },
+  { type: 'pause', ms: 800 },
   { type: 'blue', text: '  \u25b8 Investigating...' },
-  { type: 'pause', ms: 500 },
+  { type: 'pause', ms: 1200 },
   { type: 'dim', text: '  # dpkg -l | grep libssl-dev' },
-  { type: 'pause', ms: 400 },
+  { type: 'pause', ms: 1000 },
+  { type: 'dim', text: '  \u25b8 Sandbox: overlay (copy-on-write)' },
   { type: 'ok', text: '  \u25b8 sudo apt install libssl-dev && gcc server.c -o server -lssl -lcrypto' },
-  { type: 'pause', ms: 300 },
-  { type: 'ok', text: '  \u2714 Fix verified (exit 0)' },
+  { type: 'pause', ms: 800 },
+  { type: 'ok', text: '  \u2714 Fix verified (exit 0) -- committing sandbox' },
+  { type: 'pause', ms: 1200 },
+  { type: 'dim', text: '  \u25b8 Escrowed 0.1 XNO released to agent' },
+  { type: 'dim', text: '  \u25b8 Dispute? District (Kimi) \u2192 Appeals (Claude) \u2192 Supreme (Claude Opus)' },
+  { type: 'dim', text: '  \u25b8 Sandbox supported on macOS (Docker) and Linux (overlayfs)' },
 ];
+
+async function typeText(container, text, charDelay) {
+  for (let i = 0; i < text.length; i++) {
+    container.textContent += text[i];
+    await new Promise(r => setTimeout(r, charDelay));
+  }
+}
 
 async function animate() {
   const el = document.getElementById('term');
@@ -334,19 +360,27 @@ async function animate() {
     }
     const div = document.createElement('div');
     div.className = 'line ' + line.type;
-    if (line.type === 'input') {
-      div.innerHTML = '<span class="prompt">' + esc(line.text.slice(0, 2)) + '</span><span class="cmd">' + esc(line.text.slice(2)) + '</span>';
-    } else {
-      div.className = 'line ' + (line.type === 'input' ? '' : line.type);
-      div.textContent = line.text;
-    }
     el.appendChild(div);
-    el.scrollTop = el.scrollHeight;
-    // Type effect: delay per line
-    await new Promise(r => setTimeout(r, line.type === 'input' ? 60 : 30));
+
+    if (line.type === 'input') {
+      // Type character by character
+      const prompt = document.createElement('span');
+      prompt.className = 'prompt';
+      prompt.textContent = '$ ';
+      const cmd = document.createElement('span');
+      cmd.className = 'cmd';
+      div.appendChild(prompt);
+      div.appendChild(cmd);
+      await typeText(cmd, line.text.slice(2), 65);
+      await new Promise(r => setTimeout(r, 300));
+    } else {
+      // Output lines appear with a beat
+      div.textContent = line.text;
+      await new Promise(r => setTimeout(r, 50));
+    }
   }
-  // Loop after pause
-  await new Promise(r => setTimeout(r, 3000));
+  // Long pause before loop
+  await new Promise(r => setTimeout(r, 10000));
   animate();
 }
 function esc(s) { const d = document.createElement('span'); d.textContent = s; return d.innerHTML; }
