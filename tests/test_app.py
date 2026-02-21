@@ -569,12 +569,8 @@ def test_dispute_with_judge_agent_loses():
     cid = data["contract_id"]
     _bond_and_accept(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/dispute", json={
-        "argument": "Agent did nothing",
-        "side": "principal",
-    })
-    assert resp.status_code == 200
-    assert resp.json()["outcome"] == "canceled"
+    body = _file_dispute(client, cid, "Agent did nothing", "principal")
+    assert body["outcome"] == "canceled"
 
     escrow = escrow_mgr.get(cid)
     assert escrow["resolution"]["bond_loser"] == "agent"
@@ -591,6 +587,32 @@ def test_review_dispute_requires_argument(client):
         "argument": "",
     })
     assert resp.status_code == 400
+
+
+# --- Helpers for two-phase dispute ---
+
+def _file_dispute(client, cid, argument, side="principal"):
+    """File a dispute and trigger ruling (other side responds to skip window)."""
+    resp = client.post(f"/contracts/{cid}/dispute", json={"argument": argument, "side": side})
+    assert resp.status_code == 200
+    body = resp.json()
+    if body.get("status") == "awaiting_response":
+        # Other side responds (or doesn't -- trigger ruling by re-calling dispute after deadline)
+        other = "agent" if side == "principal" else "principal"
+        resp = client.post(f"/contracts/{cid}/respond", json={
+            "argument": "(no contest)",
+            "side": other,
+        })
+        assert resp.status_code == 200
+        return resp.json()
+    return body  # Legacy judge returns ruling directly
+
+
+def _file_dispute_no_respond(client, cid, argument, side="principal"):
+    """File a dispute without response (for testing the awaiting state)."""
+    resp = client.post(f"/contracts/{cid}/dispute", json={"argument": argument, "side": side})
+    assert resp.status_code == 200
+    return resp.json()
 
 
 # --- Tiered court system ---
@@ -632,11 +654,7 @@ def test_tiered_district_court():
     cid = data["contract_id"]
     _bond_and_accept(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/dispute", json={
-        "argument": "Agent did nothing", "side": "principal",
-    })
-    assert resp.status_code == 200
-    body = resp.json()
+    body = _file_dispute(client, cid, "Agent did nothing", "principal")
     assert body["court"] == "district"
     assert body["level"] == 0
     assert body["can_appeal"] is True
@@ -661,18 +679,12 @@ def test_tiered_appeal_to_appeals_court():
     _bond_and_accept(client, cid)
 
     # District court
-    resp = client.post(f"/contracts/{cid}/dispute", json={
-        "argument": "Agent did nothing", "side": "principal",
-    })
-    assert resp.json()["court"] == "district"
-    assert resp.json()["outcome"] == "canceled"
+    body = _file_dispute(client, cid, "Agent did nothing", "principal")
+    assert body["court"] == "district"
+    assert body["outcome"] == "canceled"
 
     # Agent appeals (agent was the loser of "canceled")
-    resp = client.post(f"/contracts/{cid}/dispute", json={
-        "argument": "I fixed it, principal is wrong", "side": "agent",
-    })
-    assert resp.status_code == 200
-    body = resp.json()
+    body = _file_dispute(client, cid, "I fixed it, principal is wrong", "agent")
     assert body["court"] == "appeals"
     assert body["level"] == 1
     assert body["outcome"] == "fulfilled"
@@ -693,12 +705,11 @@ def test_tiered_supreme_is_final():
     _bond_and_accept(client, cid)
 
     # District -> canceled (agent loses)
-    client.post(f"/contracts/{cid}/dispute", json={"argument": "bad", "side": "principal"})
+    _file_dispute(client, cid, "bad", "principal")
     # Appeals -> fulfilled (principal loses), agent appeals
-    client.post(f"/contracts/{cid}/dispute", json={"argument": "appeal", "side": "agent"})
+    _file_dispute(client, cid, "appeal", "agent")
     # Supreme -> principal appeals
-    resp = client.post(f"/contracts/{cid}/dispute", json={"argument": "supreme appeal", "side": "principal"})
-    body = resp.json()
+    body = _file_dispute(client, cid, "supreme appeal", "principal")
     assert body["court"] == "supreme"
     assert body["level"] == 2
     assert body["final"] is True
@@ -730,9 +741,159 @@ def test_tiered_only_loser_can_appeal():
     _bond_and_accept(client, cid)
 
     # District -> canceled (agent loses)
-    client.post(f"/contracts/{cid}/dispute", json={"argument": "bad", "side": "principal"})
+    _file_dispute(client, cid, "bad", "principal")
 
     # Principal tries to appeal (but principal won!) -> should fail
     resp = client.post(f"/contracts/{cid}/dispute", json={"argument": "appeal anyway", "side": "principal"})
     assert resp.status_code == 409
     assert "losing party" in resp.json()["detail"]
+
+
+# --- Two-phase dispute (response window) ---
+
+def test_dispute_returns_awaiting_response():
+    """Filing a dispute returns awaiting_response, not a ruling."""
+    app, store, escrow_mgr, court = _make_tiered_app()
+    client = TestClient(app)
+
+    data = _create_contract(client, JUDGE_CONTRACT)
+    cid = data["contract_id"]
+    _bond_and_accept(client, cid)
+
+    resp = client.post(f"/contracts/{cid}/dispute", json={
+        "argument": "Agent failed", "side": "principal",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "awaiting_response"
+    assert body["court"] == "district"
+    assert "response_deadline" in body
+    assert body["response_window"] == 30
+
+
+def test_respond_triggers_ruling():
+    """Responding to a dispute triggers the judge with both arguments."""
+    app, store, escrow_mgr, court = _make_tiered_app()
+    client = TestClient(app)
+
+    data = _create_contract(client, JUDGE_CONTRACT)
+    cid = data["contract_id"]
+    _bond_and_accept(client, cid)
+
+    # File dispute
+    client.post(f"/contracts/{cid}/dispute", json={
+        "argument": "Agent was lazy", "side": "principal",
+    })
+
+    # Agent responds
+    resp = client.post(f"/contracts/{cid}/respond", json={
+        "argument": "I tried my best, the task was impossible", "side": "agent",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "outcome" in body
+    assert "court" in body
+    assert body["level"] == 0
+
+
+def test_respond_wrong_side_rejected():
+    """The dispute filer cannot respond to their own dispute."""
+    app, store, escrow_mgr, court = _make_tiered_app()
+    client = TestClient(app)
+
+    data = _create_contract(client, JUDGE_CONTRACT)
+    cid = data["contract_id"]
+    _bond_and_accept(client, cid)
+
+    client.post(f"/contracts/{cid}/dispute", json={
+        "argument": "bad agent", "side": "principal",
+    })
+
+    resp = client.post(f"/contracts/{cid}/respond", json={
+        "argument": "responding to myself", "side": "principal",
+    })
+    assert resp.status_code == 400
+
+
+def test_respond_no_pending_dispute():
+    """Responding when no dispute is pending returns 409."""
+    app, store, escrow_mgr, court = _make_tiered_app()
+    client = TestClient(app)
+
+    data = _create_contract(client, JUDGE_CONTRACT)
+    cid = data["contract_id"]
+    _bond_and_accept(client, cid)
+
+    resp = client.post(f"/contracts/{cid}/respond", json={
+        "argument": "nothing to respond to", "side": "agent",
+    })
+    assert resp.status_code == 409
+
+
+def test_dispute_in_absentia():
+    """If response window expires, dispute re-call triggers in absentia ruling."""
+    app, store, escrow_mgr, court = _make_tiered_app()
+    client = TestClient(app)
+
+    data = _create_contract(client, JUDGE_CONTRACT)
+    cid = data["contract_id"]
+    _bond_and_accept(client, cid)
+
+    # File dispute
+    client.post(f"/contracts/{cid}/dispute", json={
+        "argument": "Agent failed", "side": "principal",
+    })
+
+    # Manually expire the deadline by patching the transcript
+    transcript = store.get(cid)["transcript"]
+    for msg in transcript:
+        if msg.get("type") == "dispute_filed":
+            msg["response_deadline"] = time.time() - 1  # expired
+    store.db.execute(
+        "UPDATE contracts SET transcript = ? WHERE id = ?",
+        (__import__("json").dumps(transcript), cid),
+    )
+    store.db.commit()
+
+    # Re-call dispute -- should trigger in absentia ruling
+    resp = client.post(f"/contracts/{cid}/dispute", json={
+        "argument": "Agent failed", "side": "principal",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "outcome" in body
+
+
+def test_dispute_status_endpoint():
+    """GET /dispute_status shows pending dispute info."""
+    app, store, escrow_mgr, court = _make_tiered_app()
+    client = TestClient(app)
+
+    data = _create_contract(client, JUDGE_CONTRACT)
+    cid = data["contract_id"]
+    _bond_and_accept(client, cid)
+
+    # No dispute yet
+    resp = client.get(f"/contracts/{cid}/dispute_status")
+    assert resp.json()["status"] == "no_pending_dispute"
+
+    # File dispute
+    client.post(f"/contracts/{cid}/dispute", json={
+        "argument": "bad agent", "side": "principal",
+    })
+
+    resp = client.get(f"/contracts/{cid}/dispute_status")
+    body = resp.json()
+    assert body["status"] == "awaiting_response"
+    assert body["filer"] == "principal"
+    assert body["court"] == "district"
+
+
+def test_platform_fee_in_resolution():
+    """Platform fee is included in every escrow resolution."""
+    from server.escrow import Escrow
+    escrow = Escrow("1.0", {"judge_fee": "0.026"})
+    escrow.lock()
+    result = escrow.resolve("fulfilled")
+    assert "platform_fee_per_side" in result
+    assert result["platform_fee_per_side"] == "0.001"

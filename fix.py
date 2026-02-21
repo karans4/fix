@@ -1923,9 +1923,11 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             # --- Main poll loop ---
             if is_tty and mode == "supervised":
                 status(f"{C_DIM}\u25b8{C_RESET}",
-                       f"{C_DIM}Supervised mode. Type a message and press Enter to chat with agent.{C_RESET}")
+                       f"{C_DIM}Supervised mode. Type to chat. Ctrl+C to emergency halt.{C_RESET}")
 
-            for _ in range(600):  # 5 min max
+            halted = False
+            try:
+              for _ in range(600):  # 5 min max
                 await _asyncio.sleep(0.5)
 
                 # Check if principal typed a message (supervised: always, autonomous: during review)
@@ -2021,6 +2023,33 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
 
                 if contract_status in ("fulfilled", "canceled", "resolved", "disputed", "voided"):
                     break
+            except KeyboardInterrupt:
+                print(file=sys.stderr)
+                status(f"{C_RED}\u2717{C_RESET}", f"{C_RED}EMERGENCY HALT{C_RESET}")
+                try:
+                    reason = "Emergency halt by principal (Ctrl+C)"
+                    if is_tty:
+                        try:
+                            r = input(f"  {C_RED}Reason (Enter to skip):{C_RESET} ").strip()
+                            if r:
+                                reason = r
+                        except (EOFError, KeyboardInterrupt):
+                            pass
+                    result = await fix_client.halt(contract_id, reason)
+                    halted = True
+                    ruling = result.get("ruling")
+                    if ruling:
+                        outcome = ruling.get("outcome", "?")
+                        reasoning = ruling.get("reasoning", "")
+                        icon = C_GREEN + "\u2696" + C_RESET if outcome == "fulfilled" else C_RED + "\u2696" + C_RESET
+                        status(icon, f"Judge ruled: {C_BOLD}{outcome}{C_RESET}")
+                        if reasoning:
+                            for line in reasoning.splitlines():
+                                print(f"  {C_DIM}    {line}{C_RESET}", file=sys.stderr)
+                    else:
+                        status(f"{C_YELLOW}\u25b8{C_RESET}", "Contract halted. No judge configured.")
+                except Exception as e:
+                    status(f"{C_RED}!{C_RESET}", f"Halt failed: {e}")
 
             # --- Post-completion ---
             data = await fix_client.get_contract(contract_id)

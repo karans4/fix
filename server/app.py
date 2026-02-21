@@ -28,6 +28,7 @@ from server.judge import AIJudge, TieredCourt, Evidence, JudgeRuling
 from protocol import (
     DEFAULT_REVIEW_WINDOW, DEFAULT_INVESTIGATION_RATE, DEFAULT_RULING_TIMEOUT,
     MODE_SUPERVISED, MODE_AUTONOMOUS, COURT_TIERS, MAX_DISPUTE_LEVEL,
+    DISPUTE_RESPONSE_WINDOW, PLATFORM_FEE,
 )
 
 
@@ -63,6 +64,10 @@ class VerifyRequest(BaseModel):
 class DisputeRequest(BaseModel):
     argument: str
     side: str = "principal"  # "principal" or "agent"
+
+class RespondRequest(BaseModel):
+    argument: str
+    side: str  # must be the OTHER side from the dispute filer
 
 class HaltRequest(BaseModel):
     reason: str
@@ -741,62 +746,19 @@ def create_app(
         remaining = max(0, expires - time.time())
         return {"status": "review", "remaining": remaining, "expires_at": expires}
 
-    @app.post("/contracts/{contract_id}/dispute")
-    async def dispute_contract(contract_id: str, req: DisputeRequest):
-        """Escalate to judge. Tiered court system: district -> appeals -> supreme.
-
-        First dispute goes to district court (Haiku). Losing party can appeal
-        to appeals court (Sonnet), then supreme court (Opus). Supreme is final.
-        Each tier costs more. Fee comes from loser's dispute bond.
-        """
-        data = _store.get(contract_id)
-        if not data:
-            raise HTTPException(404, "Contract not found")
-
-        # Determine dispute level from prior rulings in transcript
-        prior_rulings = [
-            m for m in data.get("transcript", [])
-            if m.get("type") == "ruling"
-        ]
-        level = len(prior_rulings)
-
-        if level > MAX_DISPUTE_LEVEL:
-            raise HTTPException(409, "Supreme court has already ruled. No further appeals.")
-
-        # For appeals (level > 0): only the loser of the previous ruling can appeal
-        if level > 0:
-            last_ruling = prior_rulings[-1]
-            last_outcome = last_ruling.get("outcome", "")
-            # Determine who lost the last ruling
-            if last_outcome in ("fulfilled", "evil_principal"):
-                loser = "principal"
-            else:
-                loser = "agent"
-            if req.side != loser:
-                raise HTTPException(409, f"Only the losing party ({loser}) can appeal")
-
-        court_name = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]["name"]
-        fee = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]["fee"]
-
-        _store.update_status(contract_id, "disputed")
-        _store.append_message(contract_id, {
-            "type": "dispute",
-            "argument": req.argument,
-            "side": req.side,
-            "level": level,
-            "court": court_name,
-            "fee": fee,
-        })
-
+    async def _execute_ruling(contract_id: str, data: dict, arguments: dict,
+                              prior_rulings: list, level: int) -> dict:
+        """Run the judge and apply the ruling. Shared by dispute and respond endpoints."""
         if not _court and not _judge:
             raise HTTPException(501, "No judge configured")
 
-        # Build evidence with prior rulings for appeals
+        court_name = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]["name"]
+
         evidence = Evidence(
             contract=data["contract"],
             messages=data["transcript"],
             hash_chain="",
-            arguments={req.side: req.argument},
+            arguments=arguments,
             prior_rulings=[r for r in prior_rulings],
         )
 
@@ -804,18 +766,15 @@ def create_app(
             ruling = await _court.rule(evidence, level=level)
             can_appeal = level < MAX_DISPUTE_LEVEL
         else:
-            # Legacy single judge -- no tiered system, ruling is always final
             ruling = await _judge.rule(evidence)
             ruling.court = court_name
             ruling.level = level
             ruling.final = True
             can_appeal = False
 
-        # If this is the final ruling (supreme or no appeal possible), resolve
         if ruling.final or not can_appeal:
             _store.update_status(contract_id, "resolved")
         else:
-            # Not final -- set back to previous state so loser can appeal
             _store.update_status(contract_id, "in_progress")
 
         _store.append_message(contract_id, {
@@ -828,7 +787,7 @@ def create_app(
             "flags": ruling.flags,
         })
 
-        # Only resolve escrow on final ruling
+        # Resolve escrow on final ruling
         if ruling.final or not can_appeal:
             if ruling.outcome in ("fulfilled", "evil_principal"):
                 dispute_loser = "principal"
@@ -845,7 +804,7 @@ def create_app(
                 _escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
                               dispute_loser=dispute_loser)
 
-            # Reputation (only on final ruling)
+            # Reputation
             bounty = Decimal(data["contract"].get("escrow", {}).get("bounty", "0"))
             if data.get("agent_pubkey"):
                 agent_outcome = "fulfilled" if ruling.outcome == "fulfilled" else "canceled"
@@ -868,6 +827,166 @@ def create_app(
             "next_court": COURT_TIERS[level + 1]["name"] if can_appeal and not ruling.final else None,
             "next_fee": COURT_TIERS[level + 1]["fee"] if can_appeal and not ruling.final else None,
             "flags": ruling.flags,
+        }
+
+    @app.post("/contracts/{contract_id}/dispute")
+    async def dispute_contract(contract_id: str, req: DisputeRequest):
+        """File a dispute. Two-phase: file -> other side has 30s to respond -> judge rules.
+
+        If the other side responds in time, judge hears both arguments.
+        If not, judge rules in absentia (silence is not guilt, but you don't get to make your case).
+        """
+        data = _store.get(contract_id)
+        if not data:
+            raise HTTPException(404, "Contract not found")
+
+        # Check for pending dispute awaiting response
+        transcript = data.get("transcript", [])
+        pending_filed = None
+        for msg in reversed(transcript):
+            if msg.get("type") == "ruling":
+                break  # a ruling after the last dispute_filed means it's resolved
+            if msg.get("type") == "dispute_filed":
+                pending_filed = msg
+                break
+
+        if pending_filed:
+            deadline = pending_filed.get("response_deadline", 0)
+            if time.time() >= deadline:
+                # Response window expired -- trigger ruling in absentia
+                prior_rulings = [m for m in transcript if m.get("type") == "ruling"]
+                level = pending_filed.get("level", 0)
+                arguments = {pending_filed["side"]: pending_filed["argument"]}
+                return await _execute_ruling(contract_id, _store.get(contract_id),
+                                             arguments, prior_rulings, level)
+            else:
+                remaining = round(deadline - time.time(), 1)
+                raise HTTPException(409, f"Dispute already filed. Awaiting response ({remaining}s remaining). "
+                                    f"POST /contracts/{contract_id}/respond to counter-argue.")
+
+        prior_rulings = [m for m in data.get("transcript", []) if m.get("type") == "ruling"]
+        level = len(prior_rulings)
+
+        if level > MAX_DISPUTE_LEVEL:
+            raise HTTPException(409, "Supreme court has already ruled. No further appeals.")
+
+        # For appeals: only the loser can appeal
+        if level > 0:
+            last_ruling = prior_rulings[-1]
+            last_outcome = last_ruling.get("outcome", "")
+            if last_outcome in ("fulfilled", "evil_principal"):
+                loser = "principal"
+            else:
+                loser = "agent"
+            if req.side != loser:
+                raise HTTPException(409, f"Only the losing party ({loser}) can appeal")
+
+        court_name = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]["name"]
+        fee = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]["fee"]
+        other_side = "agent" if req.side == "principal" else "principal"
+        deadline = time.time() + DISPUTE_RESPONSE_WINDOW
+
+        _store.update_status(contract_id, "disputed")
+        _store.append_message(contract_id, {
+            "type": "dispute_filed",
+            "argument": req.argument,
+            "side": req.side,
+            "level": level,
+            "court": court_name,
+            "fee": fee,
+            "response_deadline": deadline,
+        })
+
+        return {
+            "status": "awaiting_response",
+            "court": court_name,
+            "level": level,
+            "fee": fee,
+            "response_deadline": deadline,
+            "response_window": DISPUTE_RESPONSE_WINDOW,
+            "message": f"Dispute filed at {court_name} court. "
+                       f"The {other_side} has {DISPUTE_RESPONSE_WINDOW}s to respond. "
+                       f"POST /contracts/{contract_id}/respond or ruling proceeds in absentia.",
+        }
+
+    @app.post("/contracts/{contract_id}/respond")
+    async def respond_to_dispute(contract_id: str, req: RespondRequest):
+        """Counter-argue a pending dispute. Must be the other side, within the response window.
+
+        After response is received (or window expires), the judge rules with both arguments.
+        """
+        data = _store.get(contract_id)
+        if not data:
+            raise HTTPException(404, "Contract not found")
+
+        # Find the pending dispute (must not have a ruling after it)
+        transcript = data.get("transcript", [])
+        last_filed = None
+        for msg in reversed(transcript):
+            if msg.get("type") == "ruling":
+                break
+            if msg.get("type") == "dispute_filed":
+                last_filed = msg
+                break
+
+        if not last_filed:
+            raise HTTPException(409, "No pending dispute to respond to")
+        filer_side = last_filed["side"]
+
+        # Must be the other side
+        if req.side == filer_side:
+            raise HTTPException(400, f"You filed the dispute. Only the {('agent' if filer_side == 'principal' else 'principal')} can respond.")
+
+        # Check deadline
+        deadline = last_filed.get("response_deadline", 0)
+        if time.time() > deadline:
+            raise HTTPException(410, "Response window has expired. Ruling will proceed in absentia.")
+
+        # Record response
+        _store.append_message(contract_id, {
+            "type": "dispute_response",
+            "argument": req.argument,
+            "side": req.side,
+        })
+
+        # Both sides heard -- trigger ruling immediately
+        prior_rulings = [m for m in data.get("transcript", []) if m.get("type") == "ruling"]
+        level = last_filed.get("level", 0)
+        arguments = {
+            filer_side: last_filed["argument"],
+            req.side: req.argument,
+        }
+
+        return await _execute_ruling(contract_id, _store.get(contract_id),
+                                     arguments, prior_rulings, level)
+
+    @app.get("/contracts/{contract_id}/dispute_status")
+    async def dispute_status(contract_id: str):
+        """Check status of a pending dispute (response window, etc.)."""
+        data = _store.get(contract_id)
+        if not data:
+            raise HTTPException(404, "Contract not found")
+
+        pending = [m for m in data.get("transcript", []) if m.get("type") == "dispute_filed"]
+        if not pending:
+            return {"status": "no_pending_dispute"}
+
+        last_filed = pending[-1]
+        deadline = last_filed.get("response_deadline", 0)
+        remaining = max(0, deadline - time.time())
+
+        # Check if response was already submitted
+        responses = [m for m in data.get("transcript", []) if m.get("type") == "dispute_response"]
+        responded = len(responses) > len(pending) - 1  # rough check
+
+        return {
+            "status": "awaiting_response" if remaining > 0 and not responded else "ready_for_ruling",
+            "filer": last_filed["side"],
+            "court": last_filed.get("court"),
+            "level": last_filed.get("level"),
+            "response_deadline": deadline,
+            "remaining": round(remaining, 1),
+            "responded": responded,
         }
 
     @app.post("/contracts/{contract_id}/void")
@@ -895,7 +1014,12 @@ def create_app(
 
     @app.post("/contracts/{contract_id}/halt")
     async def halt_contract(contract_id: str, req: HaltRequest):
-        """Emergency halt by principal -- freeze escrow and escalate."""
+        """Emergency halt by principal -- freeze contract and escalate to district court.
+
+        Halts are emergencies so the ruling is immediate (no response window).
+        But the ruling is at district level and non-final -- the losing side
+        can appeal through the normal dispute flow with full response windows.
+        """
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
@@ -911,40 +1035,58 @@ def create_app(
 
         ruling_resp = None
 
-        if _judge:
-            # Immediately escalate to judge
+        if _court or _judge:
+            # Immediate district court ruling (no response window for emergencies)
             evidence = Evidence(
                 contract=data["contract"],
                 messages=data["transcript"],
                 hash_chain="",
                 arguments={"principal": req.reason},
             )
-            ruling = await _judge.rule(evidence)
+            if _court:
+                ruling = await _court.rule(evidence, level=0)
+                can_appeal = True  # halt rulings are non-final, can be appealed
+            else:
+                ruling = await _judge.rule(evidence)
+                can_appeal = False
 
-            _store.update_status(contract_id, "resolved")
+            # Non-final: set to in_progress so loser can appeal via /dispute
+            if can_appeal:
+                _store.update_status(contract_id, "in_progress")
+            else:
+                _store.update_status(contract_id, "resolved")
+
             _store.append_message(contract_id, {
                 "type": "ruling",
                 "outcome": ruling.outcome,
                 "reasoning": ruling.reasoning,
+                "court": ruling.court if hasattr(ruling, 'court') else "district",
+                "level": 0,
+                "final": not can_appeal,
                 "flags": ruling.flags,
             })
 
-            # Resolve escrow based on ruling
-            if ruling.outcome in ("fulfilled", "evil_principal"):
-                dispute_loser = "principal"
-                escrow_ruling = "fulfilled"
-            else:
-                dispute_loser = "agent"
-                escrow_ruling = "canceled"
+            # Only resolve escrow if final (legacy judge)
+            if not can_appeal:
+                if ruling.outcome in ("fulfilled", "evil_principal"):
+                    dispute_loser = "principal"
+                    escrow_ruling = "fulfilled"
+                else:
+                    dispute_loser = "agent"
+                    escrow_ruling = "canceled"
 
-            escrow = _escrow.get(contract_id)
-            if escrow and not escrow["resolved"]:
-                _escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
-                              dispute_loser=dispute_loser)
+                escrow = _escrow.get(contract_id)
+                if escrow and not escrow["resolved"]:
+                    _escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
+                                  dispute_loser=dispute_loser)
 
             ruling_resp = {
                 "outcome": ruling.outcome,
                 "reasoning": ruling.reasoning,
+                "court": ruling.court if hasattr(ruling, 'court') else "district",
+                "level": 0,
+                "final": not can_appeal,
+                "can_appeal": can_appeal,
                 "flags": ruling.flags,
             }
 

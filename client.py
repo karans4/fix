@@ -117,11 +117,23 @@ class FixClient:
         })
 
     async def dispute(self, contract_id: str, argument: str, side: str = "principal") -> dict:
-        """Escalate to judge."""
+        """File a dispute. Returns awaiting_response status with deadline.
+        Other side has 30s to respond before judge rules in absentia."""
         return await self.transport.post(f"/contracts/{contract_id}/dispute", {
             "argument": argument,
             "side": side,
         })
+
+    async def respond(self, contract_id: str, argument: str, side: str) -> dict:
+        """Respond to a pending dispute. Triggers judge ruling with both arguments."""
+        return await self.transport.post(f"/contracts/{contract_id}/respond", {
+            "argument": argument,
+            "side": side,
+        })
+
+    async def dispute_status(self, contract_id: str) -> dict:
+        """Check status of a pending dispute."""
+        return await self.transport.get(f"/contracts/{contract_id}/dispute_status")
 
     async def chat(self, contract_id: str, message: str, from_side: str = "principal",
                    msg_type: str = "message") -> dict:
@@ -130,6 +142,13 @@ class FixClient:
             "message": message,
             "from_side": from_side,
             "msg_type": msg_type,
+        })
+
+    async def halt(self, contract_id: str, reason: str, principal_pubkey: str = "") -> dict:
+        """Emergency halt -- freeze contract and escalate to judge."""
+        return await self.transport.post(f"/contracts/{contract_id}/halt", {
+            "reason": reason,
+            "principal_pubkey": principal_pubkey,
         })
 
     async def get_ruling(self, contract_id: str) -> dict | None:

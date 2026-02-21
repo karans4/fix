@@ -3,6 +3,7 @@
 All modules import from here to avoid circular dependencies.
 """
 
+from decimal import Decimal
 from enum import Enum
 
 # --- Protocol Constants ---
@@ -27,7 +28,7 @@ MODE_AUTONOMOUS = "autonomous"
 DEFAULT_REVIEW_WINDOW = 7200  # 2 hours
 
 # Judge defaults
-DEFAULT_JUDGE_FEE = "0.005"  # XNO -- each side stakes this as dispute bond
+DEFAULT_JUDGE_FEE = "0.026"  # XNO -- each side stakes this as dispute bond
 DEFAULT_RULING_TIMEOUT = 60  # seconds judge has to rule
 
 # Tiered court system: escalating models and fees
@@ -37,6 +38,15 @@ COURT_TIERS = [
     {"name": "supreme",   "model": "claude-opus-4-6",           "fee": "0.02"},
 ]
 MAX_DISPUTE_LEVEL = len(COURT_TIERS) - 1  # supreme is final
+# Bond = sum of all tier fees (covers worst-case full appeal)
+DISPUTE_BOND = str(sum(Decimal(t["fee"]) for t in COURT_TIERS))  # "0.026"
+
+# Platform fee: small deduction from BOTH sides on every resolution
+# Covers platform costs (agent LLM, hosting). Non-refundable.
+PLATFORM_FEE = "0.001"  # XNO per side
+
+# Response window: seconds the other side has to counter-argue in a dispute
+DISPUTE_RESPONSE_WINDOW = 30  # seconds
 
 # Investigation rate limiting
 DEFAULT_INVESTIGATION_RATE = 5  # seconds between commands
