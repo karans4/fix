@@ -936,6 +936,8 @@ def create_app(
         _check_party(data, req.agent_pubkey, "agent")
         if data["status"] != "in_progress":
             raise HTTPException(409, "Contract not in progress")
+        if not req.fix or not req.fix.strip():
+            raise HTTPException(400, "Fix cannot be empty")
 
         _server_sign_and_append(contract_id, "fix", {
             "fix": req.fix,
@@ -966,6 +968,13 @@ def create_app(
         if not data:
             raise HTTPException(404, "Contract not found")
         _check_party(data, req.principal_pubkey, "principal")
+        if data["status"] != "in_progress":
+            raise HTTPException(409, "Contract not in progress")
+        # Must have a fix submitted before verification
+        transcript = data.get("transcript", [])
+        has_fix = any(m.get("type") == "fix" for m in transcript)
+        if not has_fix:
+            raise HTTPException(409, "No fix submitted yet")
 
         _server_sign_and_append(contract_id, "verify", {
             "success": req.success,

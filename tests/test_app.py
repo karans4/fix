@@ -1113,11 +1113,7 @@ def test_accept_already_accepted_409(client):
 
 
 def test_verify_without_fix_409(app, client):
-    """Try to verify on in_progress contract without fix submitted -- should reject.
-
-    The verify endpoint currently lacks a status check, so this documents
-    whether the server enforces fix-before-verify ordering.
-    """
+    """Try to verify on in_progress contract without fix submitted -- should 409."""
     data = _create_contract(client)
     cid = data["contract_id"]
     _accept_contract(client, cid)
@@ -1127,9 +1123,7 @@ def test_verify_without_fix_409(app, client):
         "success": True,
         "principal_pubkey": PRINCIPAL_PUBKEY,
     }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
-    # Ideally 409, but verify endpoint may not check status/fix presence
-    # Accept 200 as documenting current behavior (no fix-before-verify guard)
-    assert resp.status_code in (200, 400, 409)
+    assert resp.status_code == 409
 
 
 def test_dispute_on_open_contract_409(client):
@@ -1174,11 +1168,7 @@ def test_create_contract_empty_command_400(client):
 
 
 def test_fix_empty_string_400(client):
-    """Submit fix with fix='' -- should reject.
-
-    The fix endpoint currently may not validate empty fix strings.
-    This documents whether the server enforces non-empty fixes.
-    """
+    """Submit fix with fix='' -- should 400."""
     data = _create_contract(client)
     cid = data["contract_id"]
     _accept_contract(client, cid)
@@ -1187,9 +1177,7 @@ def test_fix_empty_string_400(client):
         "fix": "",
         "agent_pubkey": AGENT_PUBKEY,
     }, AGENT_PUBKEY, AGENT_PRIV)
-    # Ideally 400, but fix endpoint may not validate empty strings
-    # Accept 200 as documenting current behavior if no validation exists
-    assert resp.status_code in (200, 400)
+    assert resp.status_code == 400
 
 
 def test_create_contract_bounty_below_minimum_400(client):
