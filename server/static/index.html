@@ -3,557 +3,382 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>fix — command repair marketplace</title>
+<title>fix</title>
 <style>
   :root {
     --bg: #0d1117; --bg2: #161b22; --bg3: #21262d; --border: #30363d;
     --text: #c9d1d9; --text2: #8b949e; --text3: #6e7681;
     --blue: #58a6ff; --green: #7ee787; --orange: #ffa657; --red: #f85149;
-    --radius: 6px;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-    background: var(--bg); color: var(--text); line-height: 1.5; min-height: 100vh;
+    background: var(--bg); color: var(--text); line-height: 1.6;
   }
-  code, .mono { font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace; }
+  code, .mono { font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'SF Mono', monospace; }
   a { color: var(--blue); text-decoration: none; }
   a:hover { text-decoration: underline; }
 
-  nav {
-    display: flex; align-items: center; gap: 16px; padding: 12px 24px;
-    background: var(--bg2); border-bottom: 1px solid var(--border);
-    position: sticky; top: 0; z-index: 100;
+  /* --- Hero --- */
+  .hero {
+    max-width: 640px; margin: 0 auto; padding: 80px 24px 48px;
+    text-align: center;
   }
-  .logo { font-weight: 700; font-size: 20px; color: var(--blue); letter-spacing: -1px; }
-  .logo span { color: var(--text2); font-weight: 400; font-size: 13px; margin-left: 6px; }
-  .tabs { display: flex; gap: 2px; margin-left: 24px; }
-  .tabs button {
-    background: none; border: none; color: var(--text2); padding: 8px 14px;
-    cursor: pointer; font-size: 14px; border-radius: var(--radius) var(--radius) 0 0;
-    transition: all 0.15s;
+  .hero h1 {
+    font-size: 64px; font-weight: 800; letter-spacing: -3px;
+    color: var(--text); margin-bottom: 12px;
   }
-  .tabs button:hover { color: var(--text); background: var(--bg3); }
-  .tabs button.active { color: var(--text); background: var(--bg); border: 1px solid var(--border); border-bottom: 1px solid var(--bg); }
-  .nav-right { margin-left: auto; display: flex; align-items: center; gap: 12px; font-size: 13px; }
-  .identity-badge .addr { color: var(--blue); cursor: pointer; }
-  .balance { color: var(--green); font-weight: 600; }
-
-  main { max-width: 960px; margin: 0 auto; padding: 24px; }
-  .view { display: none; }
-  .view.active { display: block; }
-
-  .card {
-    background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 16px; margin-bottom: 12px; transition: border-color 0.15s;
+  .hero h1 span { color: var(--blue); }
+  .hero p {
+    font-size: 18px; color: var(--text2); max-width: 420px; margin: 0 auto 32px;
   }
-  .card:hover { border-color: var(--text3); }
-  .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
-  .card-command { font-size: 14px; padding: 6px 10px; background: var(--bg); border-radius: 4px; display: inline-block; max-width: 100%; overflow-x: auto; white-space: nowrap; }
-  .card-error { font-size: 12px; color: var(--red); padding: 8px 10px; background: rgba(248,81,73,0.1); border-radius: 4px; margin: 8px 0; max-height: 80px; overflow: hidden; white-space: pre-wrap; word-break: break-all; }
-  .card-meta { display: flex; gap: 16px; font-size: 12px; color: var(--text2); flex-wrap: wrap; align-items: center; }
-  .bounty-tag { color: var(--green); font-weight: 600; font-size: 14px; white-space: nowrap; }
-  .status-tag { padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
-  .status-open { background: rgba(88,166,255,0.15); color: var(--blue); }
-  .status-active { background: rgba(255,166,87,0.15); color: var(--orange); }
-  .status-completed { background: rgba(126,231,135,0.15); color: var(--green); }
-  .status-disputed { background: rgba(248,81,73,0.15); color: var(--red); }
-  .card-expand { display: none; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
-  .card-expand.open { display: block; }
-
-  .btn {
-    display: inline-flex; align-items: center; gap: 6px; padding: 6px 16px;
-    border-radius: var(--radius); border: 1px solid var(--border); font-size: 13px;
-    cursor: pointer; font-weight: 500; transition: all 0.15s; background: none; color: var(--text);
-  }
-  .btn-primary { background: var(--blue); color: #fff; border-color: var(--blue); }
-  .btn-primary:hover { opacity: 0.85; }
-  .btn-green { background: rgba(126,231,135,0.15); color: var(--green); border-color: var(--green); }
-  .btn-green:hover { background: rgba(126,231,135,0.25); }
-  .btn-red { background: rgba(248,81,73,0.15); color: var(--red); border-color: var(--red); }
-  .btn-red:hover { background: rgba(248,81,73,0.25); }
-  .btn-ghost { background: none; color: var(--text2); border-color: var(--border); }
-  .btn-ghost:hover { color: var(--text); border-color: var(--text3); }
-
-  .form-group { margin-bottom: 16px; }
-  .form-group label { display: block; font-size: 13px; color: var(--text2); margin-bottom: 4px; font-weight: 500; }
-  input[type="text"], input[type="number"], textarea, select {
-    width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border);
-    border-radius: var(--radius); color: var(--text); font-size: 14px; outline: none;
+  .install-box {
+    display: inline-flex; align-items: center; gap: 12px;
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 20px; font-size: 16px; cursor: pointer;
     transition: border-color 0.15s;
   }
-  input:focus, textarea:focus, select:focus { border-color: var(--blue); }
-  textarea { resize: vertical; min-height: 100px; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
-  .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-
-  .rep-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 16px 0; }
-  .rep-stat { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; text-align: center; }
-  .rep-stat .val { font-size: 28px; font-weight: 700; }
-  .rep-stat .lbl { font-size: 12px; color: var(--text2); margin-top: 4px; }
-
-  .filter-bar { display: flex; gap: 8px; margin-bottom: 16px; align-items: center; flex-wrap: wrap; }
-  .filter-bar select, .filter-bar input { width: auto; }
-  .filter-bar input[type="text"] { min-width: 200px; }
-
-  .modal-overlay {
-    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6);
-    z-index: 200; justify-content: center; align-items: center;
+  .install-box:hover { border-color: var(--text3); }
+  .install-box .prompt { color: var(--text3); user-select: none; }
+  .install-box .cmd { color: var(--green); }
+  .install-box .copy {
+    color: var(--text3); font-size: 13px; padding: 4px 8px;
+    border: 1px solid var(--border); border-radius: 4px;
+    background: var(--bg); cursor: pointer; transition: all 0.15s;
   }
-  .modal-overlay.open { display: flex; }
-  .modal {
+  .install-box .copy:hover { color: var(--text); border-color: var(--text3); }
+  .hero-links {
+    margin-top: 16px; font-size: 14px; color: var(--text3);
+  }
+  .hero-links a { margin: 0 8px; }
+
+  /* --- Terminal demo --- */
+  .demo {
+    max-width: 620px; margin: 0 auto 64px; padding: 0 24px;
+  }
+  .term {
     background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
-    padding: 24px; width: 420px; max-width: 90vw;
+    overflow: hidden;
   }
-  .modal h3 { margin-bottom: 16px; }
+  .term-bar {
+    display: flex; gap: 6px; padding: 10px 14px;
+    background: var(--bg3); border-bottom: 1px solid var(--border);
+  }
+  .term-dot { width: 10px; height: 10px; border-radius: 50%; }
+  .term-dot.r { background: #f85149; } .term-dot.y { background: #ffa657; } .term-dot.g { background: #7ee787; }
+  .term-body {
+    padding: 16px 18px; font-size: 13px; line-height: 1.7;
+    min-height: 180px;
+  }
+  .term-body .prompt { color: var(--text3); }
+  .term-body .cmd { color: var(--text); }
+  .term-body .err { color: var(--red); }
+  .term-body .ok { color: var(--green); }
+  .term-body .dim { color: var(--text3); }
+  .term-body .blue { color: var(--blue); }
+  .term-body .line { min-height: 1.7em; }
 
-  .empty { text-align: center; padding: 48px; color: var(--text3); }
-  .section-title { font-size: 18px; font-weight: 600; margin-bottom: 16px; }
-  .toast {
-    position: fixed; bottom: 24px; right: 24px; padding: 12px 20px; border-radius: var(--radius);
-    background: var(--bg2); border: 1px solid var(--border); font-size: 13px;
-    transform: translateY(100px); opacity: 0; transition: all 0.3s; z-index: 300;
+  /* --- Modes --- */
+  .modes {
+    max-width: 720px; margin: 0 auto 64px; padding: 0 24px;
   }
-  .toast.show { transform: translateY(0); opacity: 1; }
+  .modes h2 {
+    font-size: 14px; text-transform: uppercase; letter-spacing: 2px;
+    color: var(--text3); text-align: center; margin-bottom: 24px;
+  }
+  .mode-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .mode-card {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 20px; transition: border-color 0.15s;
+  }
+  .mode-card:hover { border-color: var(--text3); }
+  .mode-card h3 { font-size: 16px; margin-bottom: 6px; }
+  .mode-card p { font-size: 13px; color: var(--text2); margin-bottom: 10px; }
+  .mode-card code {
+    font-size: 12px; color: var(--green); background: var(--bg);
+    padding: 2px 6px; border-radius: 3px;
+  }
+  .mode-icon { font-size: 24px; margin-bottom: 8px; display: block; }
+
+  /* --- Stats --- */
+  .stats {
+    max-width: 720px; margin: 0 auto 64px; padding: 0 24px;
+    display: flex; justify-content: center; gap: 48px;
+  }
+  .stat { text-align: center; }
+  .stat .num { font-size: 32px; font-weight: 700; color: var(--text); }
+  .stat .lbl { font-size: 13px; color: var(--text3); }
+
+  /* --- How it works --- */
+  .how {
+    max-width: 620px; margin: 0 auto 64px; padding: 0 24px;
+  }
+  .how h2 {
+    font-size: 14px; text-transform: uppercase; letter-spacing: 2px;
+    color: var(--text3); text-align: center; margin-bottom: 24px;
+  }
+  .steps { display: flex; flex-direction: column; gap: 16px; }
+  .step {
+    display: flex; align-items: flex-start; gap: 16px;
+    padding: 16px; background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .step-num {
+    font-size: 20px; font-weight: 700; color: var(--blue);
+    min-width: 28px; text-align: center;
+  }
+  .step-text h4 { font-size: 14px; margin-bottom: 2px; }
+  .step-text p { font-size: 13px; color: var(--text2); }
+
+  /* --- Reputation --- */
+  .reputation {
+    max-width: 620px; margin: 0 auto 64px; padding: 0 24px;
+  }
+  .reputation h2 {
+    font-size: 14px; text-transform: uppercase; letter-spacing: 2px;
+    color: var(--text3); text-align: center; margin-bottom: 24px;
+  }
+  .rep-search {
+    display: flex; gap: 8px; margin-bottom: 20px;
+  }
+  .rep-search input {
+    flex: 1; padding: 10px 14px; background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 14px; outline: none;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  }
+  .rep-search input:focus { border-color: var(--blue); }
+  .rep-search input::placeholder { color: var(--text3); }
+  .rep-search button {
+    padding: 10px 20px; background: var(--bg3); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 14px; cursor: pointer;
+    transition: all 0.15s;
+  }
+  .rep-search button:hover { border-color: var(--text3); color: #fff; }
+  .rep-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+  }
+  .rep-stat {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 16px; text-align: center;
+  }
+  .rep-stat .val { font-size: 24px; font-weight: 700; }
+  .rep-stat .lbl { font-size: 11px; color: var(--text3); margin-top: 2px; }
+  .rep-empty { text-align: center; color: var(--text3); font-size: 14px; padding: 20px; }
+
+  /* --- Footer --- */
+  footer {
+    text-align: center; padding: 32px 24px; font-size: 13px;
+    color: var(--text3); border-top: 1px solid var(--border);
+  }
+  footer a { color: var(--text2); }
+
+  @media (max-width: 600px) {
+    .hero h1 { font-size: 40px; }
+    .mode-grid { grid-template-columns: 1fr; }
+    .stats { gap: 24px; }
+  }
 </style>
 </head>
 <body>
 
-<nav>
-  <div class="logo">fix<span>marketplace</span></div>
-  <div class="tabs">
-    <button class="active" onclick="showView('marketplace')">Marketplace</button>
-    <button onclick="showView('post')">Post Contract</button>
-    <button onclick="showView('my')">My Contracts</button>
-    <button onclick="showView('reputation')">Reputation</button>
+<section class="hero">
+  <h1><span>fix</span></h1>
+  <p>Your command failed. Fix it with AI. One word, from your terminal.</p>
+  <div class="install-box" onclick="copyInstall()">
+    <span class="mono"><span class="prompt">$</span> <span class="cmd">pip install fix-cli</span></span>
+    <span class="copy" id="copy-btn">copy</span>
   </div>
-  <div class="nav-right">
-    <span class="balance" id="nav-balance">&mdash; XNO</span>
-    <span class="identity-badge">
-      <span class="addr mono" id="nav-identity" onclick="openIdentityModal()" title="Click to set identity">set identity</span>
-    </span>
+  <div class="hero-links">
+    <a href="https://github.com/karans4/fix">GitHub</a>
+    <a href="https://pypi.org/project/fix-cli/">PyPI</a>
   </div>
-</nav>
+</section>
 
-<main>
-  <!-- MARKETPLACE -->
-  <div class="view active" id="view-marketplace">
-    <div class="filter-bar">
-      <input type="text" id="filter-search" placeholder="Search commands..." oninput="renderMarketplace()">
-      <select id="filter-status" onchange="renderMarketplace()">
-        <option value="open">Open</option>
-        <option value="active">In Progress</option>
-        <option value="completed">Completed</option>
-        <option value="disputed">Disputed</option>
-        <option value="all">All</option>
-      </select>
-      <select id="filter-sort" onchange="renderMarketplace()">
-        <option value="bounty-desc">Highest Bounty</option>
-        <option value="bounty-asc">Lowest Bounty</option>
-        <option value="newest">Newest</option>
-      </select>
-      <button class="btn btn-ghost" onclick="loadContracts()">Refresh</button>
+<section class="demo">
+  <div class="term">
+    <div class="term-bar">
+      <div class="term-dot r"></div>
+      <div class="term-dot y"></div>
+      <div class="term-dot g"></div>
     </div>
-    <div id="marketplace-list"></div>
+    <div class="term-body mono" id="term"></div>
   </div>
+</section>
 
-  <!-- POST CONTRACT -->
-  <div class="view" id="view-post">
-    <h2 class="section-title">Post a Contract</h2>
-    <form id="post-form" onsubmit="submitContract(event)">
-      <div class="form-group">
-        <label>Command that failed</label>
-        <input type="text" id="post-command" placeholder="npm install @some/package" class="mono" required>
-      </div>
-      <div class="form-group">
-        <label>Error output</label>
-        <textarea id="post-error" placeholder="Paste the error output here..." required></textarea>
-      </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label>Bounty (XNO)</label>
-          <input type="number" id="post-bounty" placeholder="0.1" step="0.001" min="0.001" required>
-        </div>
-        <div class="form-group">
-          <label>Environment</label>
-          <input type="text" id="post-env" placeholder="Ubuntu 22.04, Python 3.11, Node 20...">
-        </div>
-      </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label>Shell</label>
-          <input type="text" id="post-shell" placeholder="bash">
-        </div>
-        <div class="form-group">
-          <label>Working directory context</label>
-          <input type="text" id="post-cwd" placeholder="/home/user/project">
-        </div>
-      </div>
-      <div class="form-group">
-        <label>Additional context (optional)</label>
-        <textarea id="post-context" placeholder="Any extra info that might help..." style="min-height:60px"></textarea>
-      </div>
-      <button type="submit" class="btn btn-primary">Post Contract &amp; Lock Escrow</button>
-    </form>
+<section class="stats">
+  <div class="stat">
+    <div class="num" id="stat-resolved">--</div>
+    <div class="lbl">contracts resolved</div>
   </div>
+  <div class="stat">
+    <div class="num" id="stat-agents">--</div>
+    <div class="lbl">active agents</div>
+  </div>
+</section>
 
-  <!-- MY CONTRACTS -->
-  <div class="view" id="view-my">
-    <h2 class="section-title">My Contracts</h2>
-    <div class="filter-bar">
-      <select id="my-role" onchange="renderMyContracts()">
-        <option value="principal">Posted by me</option>
-        <option value="agent">Accepted by me</option>
-      </select>
-      <button class="btn btn-ghost" onclick="loadContracts()">Refresh</button>
+<section class="modes">
+  <h2>Three ways to run</h2>
+  <div class="mode-grid">
+    <div class="mode-card">
+      <span class="mode-icon">&#9041;</span>
+      <h3>Local</h3>
+      <p>Runs on your machine with Ollama. No network, no keys, fully private.</p>
+      <code>fix --local</code>
     </div>
-    <div id="my-list"></div>
-  </div>
-
-  <!-- REPUTATION -->
-  <div class="view" id="view-reputation">
-    <h2 class="section-title">Reputation Lookup</h2>
-    <div class="filter-bar">
-      <input type="text" id="rep-pubkey" placeholder="nano_1abc...xyz or pubkey" class="mono" style="flex:1">
-      <button class="btn btn-primary" onclick="lookupReputation()">Lookup</button>
+    <div class="mode-card">
+      <span class="mode-icon">&#9670;</span>
+      <h3>API</h3>
+      <p>Use your own Claude or OpenAI key. Fast, private, your choice of model.</p>
+      <code>fix "gcc foo.c"</code>
     </div>
-    <div id="rep-result"></div>
-  </div>
-</main>
-
-<!-- IDENTITY MODAL -->
-<div class="modal-overlay" id="identity-modal" onclick="if(event.target===this)closeIdentityModal()">
-  <div class="modal">
-    <h3>Set Identity</h3>
-    <div class="form-group">
-      <label>Your nano address or pubkey</label>
-      <input type="text" id="identity-input" placeholder="nano_1abc..." class="mono">
-    </div>
-    <div style="display:flex;gap:8px;justify-content:flex-end">
-      <button class="btn btn-ghost" onclick="closeIdentityModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="saveIdentity()">Save</button>
+    <div class="mode-card">
+      <span class="mode-icon">&#10023;</span>
+      <h3>Market</h3>
+      <p>Post a contract to the market. An AI agent picks it up and proposes a fix.</p>
+      <code>fix --market</code>
     </div>
   </div>
-</div>
+</section>
 
-<div class="toast" id="toast"></div>
+<section class="how">
+  <h2>How it works</h2>
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-text">
+        <h4>Something breaks</h4>
+        <p>A command fails. You see an error you don't want to debug.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-text">
+        <h4>Type <code class="mono">fix it</code></h4>
+        <p>fix captures the failed command and error output, scrubs secrets, and dispatches to an AI agent.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-text">
+        <h4>Agent investigates and fixes</h4>
+        <p>The agent reads your environment, runs diagnostic commands, and applies a fix. Verified automatically.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="reputation">
+  <h2>Reputation</h2>
+  <div class="rep-search">
+    <input type="text" id="rep-input" placeholder="nano_1abc... or agent pubkey" spellcheck="false"
+           onkeydown="if(event.key==='Enter')lookupRep()">
+    <button onclick="lookupRep()">Lookup</button>
+  </div>
+  <div id="rep-result"></div>
+</section>
+
+<footer>
+  <a href="https://github.com/karans4/fix">karans4/fix</a>
+</footer>
 
 <script>
-const API = window.location.origin;
-let contracts = [];
-let identity = localStorage.getItem('fix-identity') || '';
-
-function init() {
-  updateNavIdentity();
-  loadContracts();
-}
-
-// --- Identity ---
-function updateNavIdentity() {
-  const el = document.getElementById('nav-identity');
-  if (identity) {
-    el.textContent = identity.length > 16
-      ? identity.slice(0, 8) + '...' + identity.slice(-6) : identity;
-    el.title = identity;
-  } else {
-    el.textContent = 'set identity';
-  }
-}
-
-function openIdentityModal() {
-  document.getElementById('identity-input').value = identity;
-  document.getElementById('identity-modal').classList.add('open');
-  document.getElementById('identity-input').focus();
-}
-function closeIdentityModal() {
-  document.getElementById('identity-modal').classList.remove('open');
-}
-function saveIdentity() {
-  identity = document.getElementById('identity-input').value.trim();
-  localStorage.setItem('fix-identity', identity);
-  updateNavIdentity();
-  closeIdentityModal();
-  toast('Identity saved');
-  loadContracts();
-}
-
-// --- API ---
-async function api(path, opts = {}) {
-  const res = await fetch(API + path, {
-    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
-    ...opts
+function copyInstall() {
+  navigator.clipboard.writeText('pip install fix-cli').then(() => {
+    const btn = document.getElementById('copy-btn');
+    btn.textContent = 'copied';
+    setTimeout(() => btn.textContent = 'copy', 1500);
   });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || 'Request failed');
-  }
-  return res.json();
 }
 
-async function loadContracts() {
+// Stats from API
+(async () => {
   try {
-    let all = [];
-    for (const s of ['open', 'in_progress', 'fulfilled', 'canceled', 'disputed', 'resolved']) {
-      try {
-        const r = await api('/contracts?status=' + s);
-        const list = r.contracts || r || [];
-        all = all.concat(list.map(normalizeContract));
-      } catch(_) {}
+    const r = await fetch('/stats');
+    if (r.ok) {
+      const d = await r.json();
+      if (d.resolved != null) document.getElementById('stat-resolved').textContent = d.resolved;
+      if (d.agents != null) document.getElementById('stat-agents').textContent = d.agents;
     }
-    contracts = all;
-  } catch (_) {
-    contracts = demoContracts();
-    toast('Using demo data — API unreachable');
+  } catch(_) {}
+})();
+
+// Terminal animation
+const lines = [
+  { type: 'input', text: '$ gcc server.c -o server' },
+  { type: 'err', text: 'server.c:14:10: fatal error: openssl/ssl.h: No such file or directory' },
+  { type: 'err', text: '   14 | #include <openssl/ssl.h>' },
+  { type: 'err', text: '      |          ^~~~~~~~~~~~~~~' },
+  { type: 'err', text: 'compilation terminated.' },
+  { type: 'pause', ms: 600 },
+  { type: 'input', text: '$ fix it' },
+  { type: 'pause', ms: 400 },
+  { type: 'dim', text: '  \u25b8 Last command: gcc server.c -o server' },
+  { type: 'err', text: '  \u2717 Exited 1' },
+  { type: 'pause', ms: 300 },
+  { type: 'blue', text: '  \u25b8 Investigating...' },
+  { type: 'pause', ms: 500 },
+  { type: 'dim', text: '  # dpkg -l | grep libssl-dev' },
+  { type: 'pause', ms: 400 },
+  { type: 'ok', text: '  \u25b8 sudo apt install libssl-dev && gcc server.c -o server -lssl -lcrypto' },
+  { type: 'pause', ms: 300 },
+  { type: 'ok', text: '  \u2714 Fix verified (exit 0)' },
+];
+
+async function animate() {
+  const el = document.getElementById('term');
+  el.innerHTML = '';
+  for (const line of lines) {
+    if (line.type === 'pause') {
+      await new Promise(r => setTimeout(r, line.ms));
+      continue;
+    }
+    const div = document.createElement('div');
+    div.className = 'line ' + line.type;
+    if (line.type === 'input') {
+      div.innerHTML = '<span class="prompt">' + esc(line.text.slice(0, 2)) + '</span><span class="cmd">' + esc(line.text.slice(2)) + '</span>';
+    } else {
+      div.className = 'line ' + (line.type === 'input' ? '' : line.type);
+      div.textContent = line.text;
+    }
+    el.appendChild(div);
+    el.scrollTop = el.scrollHeight;
+    // Type effect: delay per line
+    await new Promise(r => setTimeout(r, line.type === 'input' ? 60 : 30));
   }
-  if (!contracts.length) { contracts = demoContracts(); }
-  renderMarketplace();
-  renderMyContracts();
+  // Loop after pause
+  await new Promise(r => setTimeout(r, 3000));
+  animate();
 }
+function esc(s) { const d = document.createElement('span'); d.textContent = s; return d.innerHTML; }
 
-function normalizeContract(c) {
-  // API returns nested {id, status, contract: {task: {command, error}, ...}, ...}
-  // Flatten for the frontend
-  const ct = c.contract || {};
-  const task = ct.task || {};
-  const env = ct.environment || {};
-  const escrow = ct.escrow || {};
-  const statusMap = { in_progress: 'active', fulfilled: 'completed' };
-  return {
-    id: c.id,
-    status: statusMap[c.status] || c.status || 'open',
-    command: task.command || '',
-    error: task.error || '',
-    bounty: parseFloat(escrow.bounty || '0'),
-    environment: env.os ? `${env.os}, ${env.arch}` : '',
-    shell: '',
-    cwd: '',
-    principal: c.principal_pubkey || '',
-    agent: c.agent_pubkey || '',
-    created: c.created_at ? new Date(c.created_at * 1000).toISOString() : '',
-    context: '',
-    fix: '',
-    transcript: c.transcript || [],
-  };
-}
-
-function demoContracts() {
-  return [
-    { id:'d1', command:'npm install sharp', error:'Error: Could not load the "sharp" module using the linux-arm64 runtime\nCannot find module \'../build/Release/sharp-linux-arm64v8.node\'',
-      bounty:0.5, status:'open', environment:'Ubuntu 22.04 ARM64, Node 20.11', shell:'bash', principal:'nano_1demoprincipal', created:new Date().toISOString() },
-    { id:'d2', command:'cargo build --release', error:'error[E0308]: mismatched types\n  --> src/main.rs:42:5\n   | expected `String`, found `&str`',
-      bounty:1.2, status:'open', environment:'Arch Linux, rustc 1.75', shell:'zsh', principal:'nano_3testxyz', created:new Date(Date.now()-3600000).toISOString() },
-    { id:'d3', command:'docker compose up -d', error:'Error response from daemon: Bind for 0.0.0.0:5432 failed: port is already allocated',
-      bounty:0.25, status:'active', environment:'macOS 14.2, Docker 24.0', shell:'zsh', principal:'nano_1demoprincipal', agent:identity||'nano_agent1', created:new Date(Date.now()-7200000).toISOString() },
-    { id:'d4', command:'pip install tensorflow', error:'ERROR: No matching distribution found for tensorflow',
-      bounty:0.75, status:'completed', environment:'Python 3.12, Ubuntu 24.04', shell:'bash', principal:'nano_3testxyz', agent:identity||'nano_agent1',
-      fix:'pip install tensorflow==2.15.0  # 3.12 support landed in 2.15', created:new Date(Date.now()-86400000).toISOString() },
-    { id:'d5', command:'make -j$(nproc)', error:'fatal error: openssl/ssl.h: No such file or directory\n #include <openssl/ssl.h>\ncompilation terminated.',
-      bounty:0.15, status:'open', environment:'Debian 12, gcc 12.2', shell:'bash', principal:'nano_5builder', created:new Date(Date.now()-1800000).toISOString() },
-  ];
-}
-
-// --- Views ---
-function showView(name) {
-  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  document.getElementById('view-' + name).classList.add('active');
-  const tabs = document.querySelectorAll('.tabs button');
-  tabs.forEach(b => b.classList.remove('active'));
-  const map = { marketplace: 0, post: 1, my: 2, reputation: 3 };
-  if (tabs[map[name]]) tabs[map[name]].classList.add('active');
-}
-
-// --- Marketplace ---
-function renderMarketplace() {
-  const search = document.getElementById('filter-search').value.toLowerCase();
-  const status = document.getElementById('filter-status').value;
-  const sort = document.getElementById('filter-sort').value;
-
-  let f = contracts.filter(c => {
-    if (status !== 'all' && c.status !== status) return false;
-    if (search && !c.command.toLowerCase().includes(search) && !(c.error||'').toLowerCase().includes(search)) return false;
-    return true;
-  });
-  f.sort((a, b) => {
-    if (sort === 'bounty-desc') return (b.bounty||0) - (a.bounty||0);
-    if (sort === 'bounty-asc') return (a.bounty||0) - (b.bounty||0);
-    return new Date(b.created||0) - new Date(a.created||0);
-  });
-
-  const el = document.getElementById('marketplace-list');
-  el.innerHTML = f.length ? f.map(c => cardHTML(c, 'market')).join('') : '<div class="empty">No contracts found</div>';
-}
-
-function cardHTML(c, ctx) {
-  const sc = 'status-' + (c.status||'open');
-  const canAccept = ctx==='market' && c.status==='open' && identity && c.principal!==identity;
-  const canFix = ctx==='my' && c.status==='active' && c.agent===identity;
-  const canVerify = ctx==='my' && c.status==='active' && c.principal===identity;
-  const canDispute = ctx==='my' && c.principal===identity && (c.status==='active'||c.status==='completed');
-
-  return `<div class="card">
-    <div class="card-header">
-      <code class="card-command mono">${esc(c.command)}</code>
-      <span class="bounty-tag">${c.bounty||'?'} XNO</span>
-    </div>
-    <div class="card-error mono">${esc((c.error||'').slice(0,300))}</div>
-    <div class="card-meta">
-      <span class="status-tag ${sc}">${c.status||'open'}</span>
-      <span>${esc(c.environment||'unknown env')}</span>
-      <span>${timeAgo(c.created)}</span>
-      <span class="mono" style="font-size:11px">${trunc(c.principal)}</span>
-      <a href="#" onclick="toggleExp(this);return false" style="margin-left:auto">details</a>
-    </div>
-    <div class="card-expand">
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px;margin-bottom:12px">
-        <div><b>Shell:</b> ${esc(c.shell||'\u2014')}</div>
-        <div><b>CWD:</b> ${esc(c.cwd||'\u2014')}</div>
-        <div><b>Principal:</b> <span class="mono">${esc(c.principal||'\u2014')}</span></div>
-        <div><b>Agent:</b> <span class="mono">${esc(c.agent||'none')}</span></div>
-      </div>
-      ${c.context ? `<div style="font-size:13px;margin-bottom:12px"><b>Context:</b> ${esc(c.context)}</div>` : ''}
-      ${c.fix ? `<div style="margin-bottom:12px"><b>Submitted Fix:</b><pre class="mono" style="background:var(--bg);padding:8px;border-radius:4px;font-size:12px;margin-top:4px;white-space:pre-wrap">${esc(c.fix)}</pre></div>` : ''}
-      <div style="display:flex;gap:8px;margin-top:12px">
-        ${canAccept ? `<button class="btn btn-primary" onclick="acceptContract('${c.id}')">Accept Contract</button>` : ''}
-        ${canFix ? `<button class="btn btn-green" onclick="promptFix('${c.id}')">Submit Fix</button>` : ''}
-        ${canVerify ? `<button class="btn btn-green" onclick="verifyContract('${c.id}')">Verify &amp; Release</button>` : ''}
-        ${canDispute ? `<button class="btn btn-red" onclick="disputeContract('${c.id}')">Dispute</button>` : ''}
-      </div>
-    </div>
-  </div>`;
-}
-
-function toggleExp(el) {
-  const expand = el.closest('.card').querySelector('.card-expand');
-  expand.classList.toggle('open');
-  el.textContent = expand.classList.contains('open') ? 'collapse' : 'details';
-}
-
-// --- My Contracts ---
-function renderMyContracts() {
-  const role = document.getElementById('my-role').value;
-  const el = document.getElementById('my-list');
-  if (!identity) { el.innerHTML = '<div class="empty">Set your identity to see your contracts</div>'; return; }
-  const f = contracts.filter(c => role==='principal' ? c.principal===identity : c.agent===identity);
-  el.innerHTML = f.length ? f.map(c => cardHTML(c, 'my')).join('') : '<div class="empty">No contracts found</div>';
-}
-
-// --- Actions ---
-async function submitContract(e) {
-  e.preventDefault();
-  if (!identity) { toast('Set your identity first', 'err'); return; }
-  const bounty = document.getElementById('post-bounty').value;
-  const envStr = document.getElementById('post-env').value;
-  const body = {
-    contract: {
-      version: 2, protocol: 'fix',
-      task: {
-        type: 'fix_command',
-        command: document.getElementById('post-command').value,
-        error: document.getElementById('post-error').value,
-      },
-      environment: { os: envStr || 'unknown', arch: 'unknown', package_managers: [] },
-      capabilities: { sudo: { available: false }, network: { available: true } },
-      verification: [{ method: 'exit_code', expected: 0 }],
-      execution: { sandbox: false, root: null, max_attempts: 3, investigation_rounds: 5, timeout: 300 },
-      escrow: { bounty: bounty, currency: 'XNO', chain: 'nano', settle: 'nano_direct' },
-    },
-    principal_pubkey: identity,
-  };
-  try {
-    const res = await api('/contracts', { method:'POST', body:JSON.stringify(body) });
-    toast('Contract posted! ID: ' + res.contract_id, 'ok');
-    document.getElementById('post-form').reset();
-    loadContracts(); showView('marketplace');
-  } catch(e) { toast(e.message, 'err'); }
-}
-
-async function acceptContract(id) {
-  if (!identity) { toast('Set your identity first', 'err'); return; }
-  try {
-    await api(`/contracts/${id}/accept`, { method:'POST', body:JSON.stringify({agent_pubkey: identity}) });
-    toast('Contract accepted!', 'ok'); loadContracts();
-  } catch(e) { toast(e.message, 'err'); }
-}
-
-function promptFix(id) {
-  const fix = prompt('Enter your fix (corrected command or instructions):');
-  if (!fix) return;
-  api(`/contracts/${id}/fix`, { method:'POST', body:JSON.stringify({fix: fix, explanation: '', agent_pubkey: identity}) })
-    .then(() => { toast('Fix submitted!', 'ok'); loadContracts(); })
-    .catch(e => toast(e.message, 'err'));
-}
-
-async function verifyContract(id, success) {
-  const ok = success !== false;
-  if (ok && !confirm('Verify this fix and release escrow?')) return;
-  try {
-    await api(`/contracts/${id}/verify`, { method:'POST', body:JSON.stringify({success: ok, explanation: ''}) });
-    toast(ok ? 'Verified \u2014 escrow released!' : 'Rejected', 'ok'); loadContracts();
-  } catch(e) { toast(e.message, 'err'); }
-}
-
-async function disputeContract(id) {
-  const reason = prompt('Reason for dispute:');
-  if (!reason) return;
-  try {
-    await api(`/contracts/${id}/dispute`, { method:'POST', body:JSON.stringify({argument: reason, side: 'principal'}) });
-    toast('Dispute escalated to judge', 'ok'); loadContracts();
-  } catch(e) { toast(e.message, 'err'); }
-}
-
-// --- Reputation ---
-async function lookupReputation() {
-  const pk = document.getElementById('rep-pubkey').value.trim();
-  if (!pk) return;
+// Reputation lookup
+async function lookupRep() {
+  const pk = document.getElementById('rep-input').value.trim();
   const el = document.getElementById('rep-result');
-  let rep;
+  if (!pk) return;
+  el.innerHTML = '<div class="rep-empty">Loading...</div>';
   try {
-    rep = await api(`/reputation/${encodeURIComponent(pk)}`);
-  } catch(_) {
-    rep = null;
-  }
-  if (!rep) { el.innerHTML = '<div class="empty">Could not load reputation</div>'; return; }
-  // API returns: {as_agent: {fulfilled, canceled, backed_out}, as_principal: {...}, disputes_won, disputes_lost, evil_flags, total_earned, total_spent}
-  const aa = rep.as_agent || {};
-  const ap = rep.as_principal || {};
-  const jobs = (aa.fulfilled||0) + (aa.canceled||0) + (aa.backed_out||0);
-  const rate = jobs > 0 ? (aa.fulfilled||0) / jobs : 1;
-  el.innerHTML = `
-    <div class="rep-grid">
-      <div class="rep-stat"><div class="val" style="color:var(--blue)">${jobs}</div><div class="lbl">Agent Jobs</div></div>
-      <div class="rep-stat"><div class="val" style="color:var(--green)">${(rate*100).toFixed(0)}%</div><div class="lbl">Completion Rate</div></div>
-      <div class="rep-stat"><div class="val" style="color:var(--green)">${rep.total_earned||'0'} XNO</div><div class="lbl">Total Earned</div></div>
-      <div class="rep-stat"><div class="val" style="color:var(--orange)">${rep.disputes_won||0}</div><div class="lbl">Disputes Won</div></div>
-      <div class="rep-stat"><div class="val" style="color:var(--red)">${rep.disputes_lost||0}</div><div class="lbl">Disputes Lost</div></div>
-      <div class="rep-stat"><div class="val" style="color:var(--blue)">${(ap.fulfilled||0) + (ap.canceled||0)}</div><div class="lbl">Principal Jobs</div></div>
-    </div>
-    <div style="font-size:13px;color:var(--text2);margin-top:8px">
-      Total spent: ${rep.total_spent||'0'} XNO
-      &middot; Evil flags: ${rep.evil_flags||0}
+    const r = await fetch('/reputation/' + encodeURIComponent(pk));
+    if (!r.ok) throw new Error();
+    const rep = await r.json();
+    const aa = rep.as_agent || {};
+    const ap = rep.as_principal || {};
+    const jobs = (aa.fulfilled||0) + (aa.canceled||0) + (aa.backed_out||0);
+    const rate = jobs > 0 ? ((aa.fulfilled||0) / jobs * 100).toFixed(0) : '--';
+    el.innerHTML = `<div class="rep-grid">
+      <div class="rep-stat"><div class="val" style="color:var(--blue)">${jobs}</div><div class="lbl">Jobs done</div></div>
+      <div class="rep-stat"><div class="val" style="color:var(--green)">${rate}%</div><div class="lbl">Completion</div></div>
+      <div class="rep-stat"><div class="val" style="color:var(--green)">${rep.total_earned||'0'} XNO</div><div class="lbl">Earned</div></div>
+      <div class="rep-stat"><div class="val" style="color:var(--orange)">${rep.disputes_won||0}</div><div class="lbl">Disputes won</div></div>
+      <div class="rep-stat"><div class="val" style="color:var(--red)">${rep.disputes_lost||0}</div><div class="lbl">Disputes lost</div></div>
+      <div class="rep-stat"><div class="val" style="color:var(--blue)">${(ap.fulfilled||0)+(ap.canceled||0)}</div><div class="lbl">Contracts posted</div></div>
     </div>`;
+  } catch(_) {
+    el.innerHTML = '<div class="rep-empty">No reputation found for this address.</div>';
+  }
 }
 
-// --- Utils ---
-function esc(s) { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
-function trunc(a) { return !a ? '\u2014' : a.length>16 ? a.slice(0,10)+'...'+a.slice(-4) : a; }
-function timeAgo(ts) {
-  if (!ts) return '';
-  const s = Math.floor((Date.now()-new Date(ts))/1000);
-  if (s<60) return 'just now';
-  if (s<3600) return Math.floor(s/60)+'m ago';
-  if (s<86400) return Math.floor(s/3600)+'h ago';
-  return Math.floor(s/86400)+'d ago';
-}
-function toast(msg, type) {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.style.borderColor = type==='err' ? 'var(--red)' : type==='ok' ? 'var(--green)' : 'var(--border)';
-  el.classList.add('show');
-  clearTimeout(el._t);
-  el._t = setTimeout(() => el.classList.remove('show'), 3000);
-}
-
-document.addEventListener('keydown', e => { if (e.key==='Escape') closeIdentityModal(); });
-init();
+animate();
 </script>
 </body>
 </html>

@@ -20,12 +20,12 @@ fix --dry-run "make"    # show fix without running
 fix --local "make"      # force Ollama (free, local)
 ```
 
-### Remote mode (free platform agent)
+### Market mode (free platform agent)
 
 Post a contract to the platform. A free AI agent picks it up and proposes a fix.
 
 ```sh
-fix --remote "gcc foo.c"
+fix --market "gcc foo.c"
 ```
 
 Platform: `https://fix.notruefireman.org` (free during testing)

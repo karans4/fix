@@ -18,7 +18,7 @@ Options:
     fix --root DIR <command>            Jail agent investigation to DIR
     fix --msg "hint" <command>          Pass context to the agent
     fix --confirm <command>             Ask before applying (default: just do it)
-    fix --remote <command>              Post contract to platform, wait for remote agent
+    fix --market <command>              Post contract to platform, wait for remote agent
     fix serve                           Run as an agent: poll platform for contracts
 
 Config:
@@ -365,7 +365,7 @@ def generate_config():
         '# --- Remote mode (v2) ---',
         '',
         '# bounty = "0.01"        # USDC on Base, paid on fulfilled contract',
-        '# remote = False         # enable Nostr relay + escrow',
+        '# market = False         # post to fix market for remote agents',
         '# platform_url = "https://fix.notruefireman.org"',
         '',
         '# --- Custom agent ---',
@@ -383,11 +383,13 @@ def generate_config():
     return
 
 
-# fc -ln -2 works for bash/ksh/dash (POSIX). head -1 grabs the one before "fix it" itself.
+# Shell hooks for `fix it` / `fix !!`.
+# Walk backward through session history, skip any `fix` or `claude` commands.
+# If nothing non-fix was run this session, FIX_LAST_COMMAND stays empty.
 _POSIX_HOOK = """\
 fix() {
   if [ "$1" = "it" ] || [ "$1" = "!!" ]; then
-    FIX_LAST_COMMAND="$(fc -ln -2 | head -1 | sed 's/^[[:space:]]*//')" command fix "$@"
+    FIX_LAST_COMMAND="$(fc -ln 1 | grep -v '^[[:space:]]*fix ' | grep -v '^[[:space:]]*fix$' | grep -v '^[[:space:]]*claude' | tail -1 | sed 's/^[[:space:]]*//')" command fix "$@"
   else
     command fix "$@"
   fi
@@ -401,7 +403,7 @@ SHELL_HOOKS = {
     "zsh": """\
 fix() {
   if [[ "$1" == "it" || "$1" == "!!" ]]; then
-    FIX_LAST_COMMAND="${history[$((HISTCMD-1))]}" command fix "$@"
+    FIX_LAST_COMMAND="$(fc -ln 1 | grep -v '^[[:space:]]*fix ' | grep -v '^[[:space:]]*fix$' | grep -v '^[[:space:]]*claude' | tail -1 | sed 's/^[[:space:]]*//')" command fix "$@"
   else
     command fix "$@"
   fi
@@ -409,7 +411,7 @@ fix() {
     "fish": """\
 function fix --wraps=fix --description 'AI command fixer'
     if test (count $argv) -gt 0; and test "$argv[1]" = "it" -o "$argv[1]" = "!!"
-        set -lx FIX_LAST_COMMAND (builtin history search --max 1 --prefix "")
+        set -lx FIX_LAST_COMMAND (builtin history search --max 1 --prefix "" | string match -rv '^\s*fix |^\s*fix\$|^\s*claude')
         command fix $argv
     else
         command fix $argv
@@ -766,6 +768,103 @@ def get_api_key(key_type="anthropic"):
     return key
 
 
+def _first_run_setup():
+    """Interactive first-run setup. Choose backend: market, api, or local (ollama)."""
+    print(f"\n  {C_BOLD}fix{C_RESET} -- first-time setup\n")
+    print(f"  How do you want to run fix?\n")
+    print(f"    {C_BOLD}1{C_RESET}  market   Use fix.notruefireman.org (no API key needed)")
+    print(f"    {C_BOLD}2{C_RESET}  api      Use your own API key (Claude, OpenAI, or compatible)")
+    print(f"    {C_BOLD}3{C_RESET}  local    Use Ollama (runs locally, no network)\n")
+
+    choice = ""
+    while choice not in ("1", "2", "3"):
+        try:
+            choice = input(f"  Choice [1/2/3]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(1)
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    config_path = os.path.join(CONFIG_DIR, "config.py")
+
+    if choice == "1":
+        # Market mode -- use the platform
+        with open(config_path, "w") as f:
+            f.write('# fix global config -- market mode\n')
+            f.write('backend = "market"\n')
+            f.write('platform_url = "https://fix.notruefireman.org"\n')
+        print(f"\n  {C_GREEN}OK{C_RESET}  Configured for fix market.")
+        print(f"  {C_DIM}Config: {config_path}{C_RESET}")
+
+    elif choice == "2":
+        # API key mode
+        print(f"\n  Paste your API key (Claude, OpenAI, or any compatible):")
+        try:
+            key = input(f"  Key: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(1)
+        if not key:
+            print(f"  {C_RED}!{C_RESET}  No key provided.")
+            sys.exit(1)
+        # Detect provider from key prefix
+        if key.startswith("sk-ant-"):
+            provider = "anthropic"
+            keyfile = os.path.join(CONFIG_DIR, "api_key")
+            backend_line = 'backend = "claude"'
+        elif key.startswith("sk-"):
+            provider = "openai"
+            keyfile = os.path.join(CONFIG_DIR, "openai_key")
+            backend_line = 'backend = "openai"'
+        else:
+            provider = "custom"
+            keyfile = os.path.join(CONFIG_DIR, "custom_key")
+            backend_line = 'backend = "auto"'
+            print(f"  {C_DIM}Unrecognized key prefix, saved as custom.{C_RESET}")
+            print(f"  {C_DIM}Set FIX_API_URL and FIX_MODEL env vars for custom endpoints.{C_RESET}")
+        with open(keyfile, "w") as f:
+            f.write(key)
+        os.chmod(keyfile, 0o600)
+        with open(config_path, "w") as f:
+            f.write(f'# fix global config -- {provider} API\n')
+            f.write(f'{backend_line}\n')
+        print(f"\n  {C_GREEN}OK{C_RESET}  Key saved to {keyfile}")
+        print(f"  {C_DIM}Config: {config_path}{C_RESET}")
+
+    elif choice == "3":
+        # Local / Ollama
+        with open(config_path, "w") as f:
+            f.write('# fix global config -- local (Ollama)\n')
+            f.write('backend = "local"\n')
+            f.write(f'ollama_model = "{OLLAMA_MODEL}"\n')
+            f.write(f'ollama_url = "{OLLAMA_URL}"\n')
+        if ollama_available():
+            print(f"\n  {C_GREEN}OK{C_RESET}  Configured for Ollama (detected running).")
+        else:
+            print(f"\n  {C_GREEN}OK{C_RESET}  Configured for Ollama.")
+            print(f"  {C_DIM}Make sure Ollama is running: ollama serve{C_RESET}")
+        print(f"  {C_DIM}Config: {config_path}{C_RESET}")
+
+    print()
+    return True
+
+
+def _needs_first_run():
+    """Check if first-run setup is needed (no global config, no API keys found)."""
+    config_path = os.path.join(CONFIG_DIR, "config.py")
+    if os.path.exists(config_path):
+        return False
+    # Any API key files present?
+    for name in ("api_key", "openai_key", "custom_key"):
+        if os.path.exists(os.path.join(CONFIG_DIR, name)):
+            return False
+    # Any relevant env vars?
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "FIX_API_KEY"):
+        if os.environ.get(var):
+            return False
+    return True
+
+
 def resolve_backend(cfg, force_local=False):
     """Determine which backend to use.
 
@@ -776,6 +875,16 @@ def resolve_backend(cfg, force_local=False):
     agent_fn = cfg.get("agent")
     if callable(agent_fn) and not force_local:
         return "custom", {"fn": agent_fn}
+
+    # Explicit backend from config
+    explicit = cfg.get("backend", "auto")
+    if explicit == "local":
+        if ollama_available(cfg.get("ollama_url")):
+            return "ollama", {"model": cfg.get("ollama_model"), "url": cfg.get("ollama_url")}
+        raise RuntimeError("Ollama not running (backend = \"local\"). Start it: ollama serve")
+    if explicit == "market":
+        platform_url = cfg.get("platform_url", "https://fix.notruefireman.org")
+        return "market", {"platform_url": platform_url}
 
     if force_local:
         if ollama_available(cfg.get("ollama_url")):
@@ -1276,9 +1385,10 @@ def call_llm(prompt, backend_name, backend_kwargs, contract=None):
 # --- Shell History (fix !!) ---
 
 def get_last_failed_command():
-    """Get the last command from shell history.
+    """Fallback: try to get last non-fix command from history file.
 
-    Reads bash/zsh history file. Falls back to HISTFILE env var.
+    Returns None if shell hook isn't installed (preferred path).
+    Only reads history file as a last resort -- can't distinguish sessions.
     """
     histfile = os.environ.get("HISTFILE")
     if not histfile:
@@ -1293,20 +1403,19 @@ def get_last_failed_command():
 
     try:
         with open(histfile, "rb") as f:
-            # Read last few KB (history can be huge)
             f.seek(0, 2)
             size = f.tell()
             f.seek(max(0, size - 8192))
             data = f.read().decode("utf-8", errors="replace")
 
         lines = data.strip().splitlines()
-        # Filter out 'fix' commands and empty lines
         for line in reversed(lines):
             line = line.strip()
             # zsh history format: ": timestamp:0;command"
             if line.startswith(":") and ";" in line:
                 line = line.split(";", 1)[1]
-            if line and not line.startswith("fix ") and line != "fix" and line != "claude":
+            if line and not line.startswith("fix ") and line != "fix" \
+               and line != "claude" and not line.startswith("claude "):
                 return line
     except Exception:
         pass
@@ -1735,7 +1844,7 @@ def _probe_sandbox():
 
 def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             force_local=False, safe_mode=False, confirm=False, message=None,
-            remote=False):
+            market=False):
 
     # If safe_mode was auto-enabled, verify sandbox actually works.
     # If user explicitly asked for --safe, let it fail loudly.
@@ -1799,16 +1908,17 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
 
     env_info = get_env_fingerprint()
 
-    # --- Remote mode: post to platform, wait for agent ---
-    # Check this BEFORE resolve_backend so remote works without a local LLM.
-    if remote and _HAS_REMOTE:
+    # --- Market mode: post to platform, wait for agent ---
+    if cfg.get("backend") == "market":
+        market = True
+    if market and _HAS_REMOTE:
         import asyncio as _asyncio
-        status(f"{C_YELLOW}\u25cb{C_RESET}", f"Dispatching to platform (remote mode)...")
+        status(f"{C_YELLOW}\u25cb{C_RESET}", f"Dispatching to fix market...")
 
         contract = build_contract(
             command, scrubbed_stderr, env_info,
             verify_spec=verify_spec, safe_mode=safe_mode,
-            backend_name="remote", attempt=0,
+            backend_name="market", attempt=0,
             root=cfg.get("root"),
             bounty=cfg.get("bounty", "0.01"),
             judge=cfg.get("judge"),
@@ -2161,8 +2271,8 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             return final_rc
 
         return _asyncio.run(_run_remote())
-    elif remote and not _HAS_REMOTE:
-        status(f"{C_RED}!{C_RESET}", "Remote mode requires: pip install httpx")
+    elif market and not _HAS_REMOTE:
+        status(f"{C_RED}!{C_RESET}", "Market mode requires: pip install httpx")
         return 1
 
     # Resolve backend (only needed for local mode)
@@ -2453,6 +2563,11 @@ def main():
 
     cfg = load_config()
 
+    # First-run setup (interactive backend choice)
+    if sys.argv[1] not in ("init", "shell") and _needs_first_run() and sys.stdin.isatty():
+        _first_run_setup()
+        cfg = load_config()  # reload after setup
+
     # Subcommands
     if sys.argv[1] == "init":
         generate_config()
@@ -2501,7 +2616,7 @@ def main():
         "dry_run": False,
         "verify_spec": None,
         "message": None,
-        "remote": cfg.get("remote", False),
+        "market": cfg.get("market", False),
     }
     hidden_extra = []
     visible_only = []
@@ -2518,8 +2633,8 @@ def main():
             flags["safe_mode"] = True
         elif a == "--no-safe":
             flags["safe_mode"] = False
-        elif a == "--remote":
-            flags["remote"] = True
+        elif a == "--market":
+            flags["market"] = True
         elif a == "--explain":
             flags["explain_only"] = True
         elif a == "--dry-run":

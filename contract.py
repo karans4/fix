@@ -106,7 +106,7 @@ def build_contract(command, stderr, env_info, **kwargs):
     root = kwargs.get("root")
     bounty = kwargs.get("bounty")
     judge = kwargs.get("judge")
-    remote = kwargs.get("remote", False)
+    market = kwargs.get("market", False)
     redaction_config = kwargs.get("redaction_config")
 
     # Scrub stderr — always, even local
@@ -166,8 +166,8 @@ def build_contract(command, stderr, env_info, **kwargs):
             scrubbed_failures.append(sf[:500])
         contract["prior_failures"] = scrubbed_failures
 
-    # Remote mode: add escrow + terms
-    if remote:
+    # Market mode: add escrow + terms
+    if market:
         bounty_str = str(bounty) if bounty else "0.01"
         contract["escrow"] = {
             "bounty": bounty_str,

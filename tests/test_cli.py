@@ -25,10 +25,10 @@ class TestCLIBasic:
         # Should not be 0 (command failed), but shouldn't be a traceback either
         assert "Traceback" not in err
 
-    def test_remote_failing_command_no_server(self):
-        """--remote with unreachable server should fail gracefully."""
+    def test_market_failing_command_no_server(self):
+        """--market with unreachable server should fail gracefully."""
         # Point at a bogus URL so it doesn't hit the real server
-        rc, out, err = run_fix("--remote", "false")
+        rc, out, err = run_fix("--market", "false")
         # Key: no TypeError, no Traceback from bad kwargs
         assert "Traceback" not in err
 

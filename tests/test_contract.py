@@ -81,15 +81,15 @@ class TestLocalMode:
         assert "terms" not in basic_contract
 
 
-# --- 3. Remote mode ---
+# --- 3. Market mode ---
 
-class TestRemoteMode:
+class TestMarketMode:
     def test_escrow_present(self, env_info):
         c = build_contract(
             command="apt install foo",
             stderr="E: Unable to locate package foo",
             env_info=env_info,
-            remote=True,
+            market=True,
             bounty="0.01",
         )
         assert "escrow" in c
@@ -100,7 +100,7 @@ class TestRemoteMode:
             command="apt install foo",
             stderr="E: Unable to locate package foo",
             env_info=env_info,
-            remote=True,
+            market=True,
             bounty="0.01",
         )
         assert "bounty" in c["escrow"] or "amount" in c["escrow"]
