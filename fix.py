@@ -2404,6 +2404,15 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             prior_failures.append((fix_cmd, verify_proc.stderr[:500] if verify_proc.stderr else "exit non-zero"))
             continue
 
+    # All attempts exhausted
+    print(file=sys.stderr)
+    status(f"{C_RED}\u2717{C_RESET}", f"All {MAX_FIX_ATTEMPTS} attempts failed.")
+    is_market = contract.get("escrow") is not None
+    if is_market:
+        status(f"{C_DIM}\u2696{C_RESET}", f"Run {C_BOLD}fix --market --dispute{C_RESET} to dispute this contract.")
+    else:
+        status(f"{C_DIM}\u25b8{C_RESET}", f"Try {C_BOLD}fix --msg \"context about what you need\"{C_RESET} to give the agent more info.")
+
     return 1
 
 

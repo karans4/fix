@@ -34,13 +34,34 @@ def parse_llm_investigation(response: str) -> list[str]:
     return commands
 
 
-def build_agent_prompt(contract: dict, investigation_results: list[dict]) -> str:
-    """Build the prompt for the LLM with contract and investigation context."""
+MEMORY_RE = re.compile(r'^MEMORY:\s*(.+)$', re.MULTILINE)
+
+
+def build_agent_prompt(contract: dict, investigation_results: list[dict],
+                       agent_memory: list[str] | None = None,
+                       prior_failures: list[dict] | None = None) -> str:
+    """Build the prompt for the LLM with contract, investigation, and memory context."""
     parts = []
-    parts.append("You are a fix agent. Your job is to diagnose and fix the problem described in this contract.\n")
+    parts.append("You are a fix agent. Your job is to diagnose and fix the problem described in this contract.")
+    parts.append("You may decline (\"accepted\": false) before or after investigation, as long as you haven't accepted yet.\n")
     parts.append("## Contract\n")
     parts.append(json.dumps(contract, indent=2))
     parts.append("")
+
+    if agent_memory:
+        parts.append("## Your Memory (observations from prior attempts)\n")
+        for note in agent_memory:
+            parts.append(f"- {note}")
+        parts.append("")
+
+    if prior_failures:
+        parts.append("## Prior Failed Attempts\n")
+        parts.append("These fixes were tried and failed. Do not repeat them.\n")
+        for i, f in enumerate(prior_failures, 1):
+            parts.append(f"### Attempt {i}")
+            parts.append(f"Fix: `{f['fix']}`")
+            parts.append(f"Result: {f['error']}")
+            parts.append("")
 
     if investigation_results:
         parts.append("## Investigation Results So Far\n")
@@ -56,9 +77,17 @@ def build_agent_prompt(contract: dict, investigation_results: list[dict]) -> str
         "the principal's machine.\n"
     )
     parts.append(
+        "Save observations with 'MEMORY: <note>' lines. These persist across "
+        "retry attempts so you remember what you learned even if your fix fails.\n"
+    )
+    parts.append(
         "When you have enough information to propose a fix, output a JSON block:\n"
         "```json\n"
-        '{"fix": "<shell command or script>", "explanation": "<why this fixes it>"}\n'
+        '{"accepted": true, "fix": "<shell command>", "explanation": "<why this fixes it>"}\n'
+        "```\n\n"
+        "To decline (before or after investigation):\n"
+        "```json\n"
+        '{"accepted": false, "explanation": "<why this cannot be fixed>"}\n'
         "```\n"
     )
     return "\n".join(parts)
@@ -144,10 +173,22 @@ class FixAgent:
             "investigation_rounds", MAX_INVESTIGATION_ROUNDS
         )
 
+        agent_memory = []
+        prior_failures = []
         fix_data = None
+
         for _round in range(max_rounds):
-            prompt = build_agent_prompt(prompt_contract, investigation_results)
+            prompt = build_agent_prompt(prompt_contract, investigation_results,
+                                        agent_memory=agent_memory,
+                                        prior_failures=prior_failures)
             llm_response = await self._call_llm(prompt)
+
+            # Extract MEMORY: notes
+            mem_notes = MEMORY_RE.findall(llm_response)
+            for note in mem_notes:
+                note = note.strip()
+                if note and note not in agent_memory:
+                    agent_memory.append(note)
 
             fix_data = self._extract_fix_proposal(llm_response)
             if fix_data:
@@ -164,8 +205,10 @@ class FixAgent:
                 if result_output is not None:
                     investigation_results.append({"command": cmd, "output": result_output})
         else:
-            # Exhausted rounds — one final LLM call
-            prompt = build_agent_prompt(prompt_contract, investigation_results)
+            # Exhausted rounds -- one final LLM call
+            prompt = build_agent_prompt(prompt_contract, investigation_results,
+                                        agent_memory=agent_memory,
+                                        prior_failures=prior_failures)
             llm_response = await self._call_llm(prompt)
             fix_data = self._extract_fix_proposal(llm_response)
 
