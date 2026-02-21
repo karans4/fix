@@ -320,7 +320,10 @@ def scrub(text, config=None):
         matched_categories is a set of category names that had matches.
     """
     if isinstance(text, bytes):
-        return text, set()
+        try:
+            text = text.decode("utf-8", errors="replace")
+        except Exception:
+            return text, set()
     if text is None:
         return "", set()
     if not text:

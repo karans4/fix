@@ -132,6 +132,20 @@ def validate_investigate_command(cmd, root=None):
     if not cmd:
         return False, "empty command"
 
+    # Block command substitution: $(...), `...`, <(...)
+    if re.search(r'\$\(', cmd):
+        return False, "blocked: contains $() command substitution"
+    if '`' in cmd:
+        return False, "blocked: contains backtick command substitution"
+    if re.search(r'<\(', cmd):
+        return False, "blocked: contains <() process substitution"
+    if re.search(r'>\(', cmd):
+        return False, "blocked: contains >() process substitution"
+
+    # Block newlines (could hide commands after whitelist check)
+    if '\n' in cmd or '\r' in cmd:
+        return False, "blocked: contains newline"
+
     # Block write redirections (but allow 2>&1, 2>/dev/null, etc.)
     if _RE_WRITE_REDIRECT.search(cmd) or _RE_APPEND_REDIRECT.search(cmd):
         return False, "blocked: contains redirect (write operation)"
@@ -1020,38 +1034,50 @@ else:
 
 
 def _get_signing_key():
-    """Load or generate a 256-bit HMAC key at ~/.fix/key."""
-    import hashlib, hmac
-    keyfile = os.path.join(CONFIG_DIR, "key")
-    if os.path.exists(keyfile):
-        with open(keyfile, "rb") as f:
-            return f.read()
+    """Load or generate an Ed25519 private key at ~/.fix/key.ed25519.
+
+    Auto-migrates from the old HMAC key if it exists.
+    Returns 32 bytes (raw Ed25519 private key).
+    """
+    from crypto import generate_ed25519_keypair, load_ed25519_key, save_ed25519_key
+
+    ed25519_keyfile = os.path.join(CONFIG_DIR, "key.ed25519")
+    if os.path.exists(ed25519_keyfile):
+        return load_ed25519_key(ed25519_keyfile)
+
+    # Auto-generate new Ed25519 key
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    key = os.urandom(32)
-    with open(keyfile, "wb") as f:
-        f.write(key)
-    os.chmod(keyfile, 0o600)
-    return key
+    priv, _ = generate_ed25519_keypair()
+    save_ed25519_key(ed25519_keyfile, priv)
+    return priv
 
 
 def get_pubkey():
-    """Derive a public identity from the signing key (sha256 hex of the key)."""
-    import hashlib
-    key = _get_signing_key()
-    return "fix_" + hashlib.sha256(key).hexdigest()[:16]
+    """Get the local fix identity: 'fix_<64-hex-ed25519-pubkey>'."""
+    from crypto import ed25519_privkey_to_pubkey, pubkey_to_fix_id
+    priv = _get_signing_key()
+    pub = ed25519_privkey_to_pubkey(priv)
+    return pubkey_to_fix_id(pub)
+
+
+def get_pubkey_hex():
+    """Get the raw hex pubkey (for auth headers)."""
+    from crypto import ed25519_privkey_to_pubkey
+    priv = _get_signing_key()
+    return ed25519_privkey_to_pubkey(priv).hex()
 
 
 def sign_contract(contract):
-    """Hash and HMAC-sign a contract. Returns (sha256_hex, signature_hex).
+    """Hash and Ed25519-sign a contract. Returns (sha256_hex, signature_hex).
 
     The hash is over the canonical JSON (sorted keys, no whitespace).
-    The signature is HMAC-SHA256 with the local key at ~/.fix/key.
+    The signature is Ed25519 with the local key at ~/.fix/key.ed25519.
     """
-    import hashlib, hmac
+    from crypto import ed25519_sign, sha256_hash
     canonical = json.dumps(contract, sort_keys=True, separators=(",", ":"))
-    digest = hashlib.sha256(canonical.encode()).hexdigest()
-    key = _get_signing_key()
-    sig = hmac.new(key, canonical.encode(), hashlib.sha256).hexdigest()
+    digest = sha256_hash(canonical.encode())
+    priv = _get_signing_key()
+    sig = ed25519_sign(priv, canonical.encode())
     return digest, sig
 
 

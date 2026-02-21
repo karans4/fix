@@ -3,6 +3,9 @@
 Endpoints for contract lifecycle: post, browse, accept, investigate,
 submit fix, verify, dispute, chat, bond, review, and reputation queries.
 
+Ed25519 authentication: every mutating request must be signed.
+Every transcript entry is a signed chain entry forming a tamper-evident log.
+
 Two execution modes:
 - supervised: principal stays connected, real-time verification
 - autonomous: agent works independently, fix enters review window
@@ -15,7 +18,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from decimal import Decimal
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -24,11 +27,20 @@ from typing import Optional
 from server.store import ContractStore
 from server.escrow import EscrowManager
 from server.reputation import ReputationManager
+from server.nano import validate_nano_address
 from server.judge import AIJudge, TieredCourt, Evidence, JudgeRuling
+from crypto import (
+    verify_request_ed25519, hash_chain_init, hash_chain_append,
+    generate_ed25519_keypair, load_ed25519_key, save_ed25519_key,
+    ed25519_privkey_to_pubkey, pubkey_to_fix_id,
+    build_chain_entry, chain_entry_hash, verify_chain, canonical_json,
+    sha256_hash, fix_id_to_pubkey, ReplayGuard,
+)
 from protocol import (
     DEFAULT_REVIEW_WINDOW, DEFAULT_INVESTIGATION_RATE, DEFAULT_RULING_TIMEOUT,
     MODE_SUPERVISED, MODE_AUTONOMOUS, COURT_TIERS, MAX_DISPUTE_LEVEL,
     DISPUTE_RESPONSE_WINDOW, PLATFORM_FEE_RATE, PLATFORM_FEE_MIN, MINIMUM_BOUNTY,
+    SERVER_ENTRY_TYPES,
 )
 
 
@@ -51,24 +63,27 @@ class InvestigateRequest(BaseModel):
 class InvestigationResultRequest(BaseModel):
     command: str
     output: str
+    principal_pubkey: str  # required
 
 class SubmitFixRequest(BaseModel):
     fix: str
     explanation: str = ""
-    agent_pubkey: str = ""
+    agent_pubkey: str  # required
 
 class VerifyRequest(BaseModel):
     success: bool
     explanation: str = ""
-    principal_pubkey: str = ""
+    principal_pubkey: str  # required
 
 class DisputeRequest(BaseModel):
     argument: str
     side: str = "principal"  # "principal" or "agent"
+    pubkey: str  # required — must match side
 
 class RespondRequest(BaseModel):
     argument: str
     side: str  # must be the OTHER side from the dispute filer
+    pubkey: str  # required — must match side
 
 class HaltRequest(BaseModel):
     reason: str
@@ -77,15 +92,18 @@ class HaltRequest(BaseModel):
 class SetAccountsRequest(BaseModel):
     principal_account: str = ""
     agent_account: str = ""
+    pubkey: str  # required — caller's pubkey for auth
 
 class ChatMessage(BaseModel):
     message: str
     from_side: str  # "agent" or "principal"
     msg_type: str = "message"  # "ask", "answer", or "message"
+    pubkey: str  # required — must match from_side party
 
 class ReviewAction(BaseModel):
     action: str  # "accept" or "dispute"
     argument: str = ""  # required if action is "dispute"
+    principal_pubkey: str  # required — must be the principal
 
 class RulingResponse(BaseModel):
     outcome: str
@@ -103,6 +121,53 @@ def _check_party(data: dict, pubkey: str, role: str):
         raise HTTPException(403, f"Missing {role} pubkey")
     if pubkey != stored:
         raise HTTPException(403, f"Not the {role} of this contract")
+
+
+async def _verify_auth(request: Request, pubkey: str):
+    """Verify Ed25519-signed request from a party.
+
+    Requires X-Fix-Timestamp, X-Fix-Signature, and X-Fix-Pubkey headers.
+    The signature covers: METHOD\nPATH\nTIMESTAMP\nBODY
+    """
+    timestamp = request.headers.get("X-Fix-Timestamp", "")
+    signature = request.headers.get("X-Fix-Signature", "")
+    pubkey_hex = request.headers.get("X-Fix-Pubkey", "")
+
+    if not timestamp or not signature or not pubkey_hex:
+        return False
+
+    body = (await request.body()).decode("utf-8", errors="replace")
+    ok, err = verify_request_ed25519(
+        request.method, request.url.path, body,
+        timestamp, signature, pubkey_hex,
+    )
+    if not ok:
+        raise HTTPException(401, f"Authentication failed: {err}")
+
+    # Replay protection
+    replay_guard = getattr(request.app.state, "replay_guard", None)
+    if replay_guard and not replay_guard.check_and_record(signature):
+        raise HTTPException(401, "Replay detected")
+
+    # Verify the pubkey in headers matches the claimed identity
+    expected_hex = _pubkey_str_to_hex(pubkey)
+    if expected_hex and pubkey_hex != expected_hex:
+        raise HTTPException(401, "Pubkey mismatch: header pubkey does not match request body pubkey")
+
+    return True
+
+
+def _pubkey_str_to_hex(pubkey: str) -> str:
+    """Convert a fix_id (fix_<hex>) or raw hex pubkey to raw hex."""
+    if pubkey.startswith("fix_"):
+        return pubkey[4:]
+    return pubkey
+
+
+def _require_auth(authenticated: bool):
+    """Raise 401 if request was not authenticated."""
+    if not authenticated:
+        raise HTTPException(401, "Signed request required (X-Fix-Timestamp + X-Fix-Signature + X-Fix-Pubkey headers)")
 
 
 def build_briefing(contract_id: str, data: dict) -> str:
@@ -329,8 +394,13 @@ def create_app(
     reputation_mgr: ReputationManager | None = None,
     judge: AIJudge | None = None,
     court: TieredCourt | None = None,
+    server_privkey: bytes | None = None,
 ) -> FastAPI:
-    """Create FastAPI app with injected dependencies."""
+    """Create FastAPI app with injected dependencies.
+
+    If server_privkey is not provided, checks FIX_SERVER_KEY env var
+    (path to key file) or auto-generates one.
+    """
 
     app = FastAPI(title="Fix Platform", version="3.0")
 
@@ -343,6 +413,22 @@ def create_app(
     async def index():
         return FileResponse(os.path.join(static_dir, "index.html"))
 
+    # Server identity
+    if server_privkey:
+        _server_privkey = server_privkey
+    else:
+        key_path = os.environ.get("FIX_SERVER_KEY", "")
+        if key_path and os.path.exists(key_path):
+            _server_privkey = load_ed25519_key(key_path)
+        else:
+            _server_privkey, _ = generate_ed25519_keypair()
+
+    _server_pubkey = ed25519_privkey_to_pubkey(_server_privkey)
+    _server_fix_id = pubkey_to_fix_id(_server_pubkey)
+
+    # Replay protection
+    _replay_guard = ReplayGuard()
+
     # Defaults
     _store = store or ContractStore()
     _escrow = escrow_mgr or EscrowManager()
@@ -351,13 +437,40 @@ def create_app(
     _court = court  # Tiered court system (preferred)
 
     # Expose for testing
+    app.state.replay_guard = _replay_guard
     app.state.store = _store
     app.state.escrow = _escrow
     app.state.reputation = _reputation
     app.state.judge = _judge
     app.state.court = _court
+    app.state.server_privkey = _server_privkey
+    app.state.server_pubkey = _server_pubkey
+    app.state.server_fix_id = _server_fix_id
 
     # --- Helpers ---
+
+    def _server_sign_and_append(contract_id: str, entry_type: str, data: dict) -> dict:
+        """Build a server-signed chain entry and append it to the transcript."""
+        head = _store.get_chain_head(contract_id)
+        if head is None:
+            head = hash_chain_init()
+
+        contract_data = _store.get(contract_id)
+        seq = len(contract_data["transcript"]) if contract_data else 0
+
+        entry = build_chain_entry(
+            entry_type=entry_type,
+            data=data,
+            seq=seq,
+            author=_server_fix_id,
+            prev_hash=head,
+            privkey_bytes=_server_privkey,
+        )
+
+        ok, err = _store.append_chain_entry(contract_id, entry)
+        if not ok:
+            raise HTTPException(500, f"Chain append failed: {err}")
+        return entry
 
     def _check_review_expiry(data: dict) -> dict | None:
         """Check if review window has expired. Auto-fulfill if so. Returns updated data or None."""
@@ -366,10 +479,7 @@ def create_app(
         expires = data.get("review_expires_at")
         if expires and time.time() >= expires:
             _store.update_status(data["id"], "fulfilled")
-            _store.append_message(data["id"], {
-                "type": "auto_fulfill",
-                "from": "system",
-            })
+            _server_sign_and_append(data["id"], "auto_fulfill", {})
             # Resolve escrow
             escrow = _escrow.get(data["id"])
             if escrow and not escrow["resolved"]:
@@ -383,11 +493,38 @@ def create_app(
             return _store.get(data["id"])
         return None
 
+    def _compute_hash_chain(transcript: list[dict]) -> str:
+        """Compute hash chain from transcript for evidence integrity."""
+        import json as _json
+        chain = hash_chain_init()
+        for msg in transcript:
+            chain = hash_chain_append(chain, _json.dumps(msg, sort_keys=True))
+        return chain
+
+    def _verify_transcript_chain(transcript: list[dict]) -> bool:
+        """Check if transcript entries form a valid signed chain."""
+        # Only verify entries that have signatures (chain entries)
+        chain_entries = [e for e in transcript if "signature" in e]
+        if not chain_entries:
+            return True  # No chain entries yet (legacy or empty)
+        ok, _ = verify_chain(chain_entries)
+        return ok
+
     # --- Contract lifecycle ---
 
+    @app.get("/server_pubkey")
+    async def get_server_pubkey():
+        """Get the server's Ed25519 public key so clients can verify server-signed entries."""
+        return {"pubkey": _server_pubkey.hex(), "fix_id": _server_fix_id}
+
     @app.post("/contracts")
-    async def post_contract(req: PostContractRequest):
+    async def post_contract(req: PostContractRequest, request: Request):
         """Post a new contract and lock escrow. Principal's bond locked upfront."""
+        # Auth is optional for contract posting (backward compat for anonymous posts)
+        if req.principal_pubkey:
+            authed = await _verify_auth(request, req.principal_pubkey)
+            _require_auth(authed)
+
         contract = req.contract
 
         # Enforce minimum bounty
@@ -397,7 +534,7 @@ def create_app(
             if bounty < Decimal(MINIMUM_BOUNTY):
                 raise HTTPException(400, f"Bounty {bounty} below minimum {MINIMUM_BOUNTY} XNO")
 
-        contract_id = _store.create(contract, req.principal_pubkey)
+        contract_id = _store.create(contract, req.principal_pubkey, server_pubkey=_server_pubkey.hex())
 
         # Lock escrow if contract has escrow terms
         escrow_data = contract.get("escrow", {})
@@ -413,7 +550,7 @@ def create_app(
             _escrow.lock(contract_id, escrow_data["bounty"], terms,
                         judge_account=judge_account, judge_fee=judge_fee)
 
-        return {"contract_id": contract_id, "status": "open"}
+        return {"contract_id": contract_id, "status": "open", "server_pubkey": _server_pubkey.hex()}
 
     @app.get("/contracts")
     async def list_contracts(status: str = "open", limit: int = 50):
@@ -435,14 +572,27 @@ def create_app(
         result["briefing"] = build_briefing(contract_id, result)
         return result
 
+    @app.get("/contracts/{contract_id}/chain_head")
+    async def get_chain_head(contract_id: str):
+        """Get current chain head for building next entry."""
+        head = _store.get_chain_head(contract_id)
+        if head is None:
+            raise HTTPException(404, "Contract not found")
+        data = _store.get(contract_id)
+        seq = len(data["transcript"]) if data else 0
+        return {"chain_head": head, "seq": seq}
+
     @app.post("/contracts/{contract_id}/bond")
-    async def post_bond(contract_id: str, req: BondRequest):
+    async def post_bond(contract_id: str, req: BondRequest, request: Request):
         """Agent posts dispute bond to start investigating. OPEN -> INVESTIGATING."""
+        authed = await _verify_auth(request, req.agent_pubkey)
+        _require_auth(authed)
+
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         if data["status"] != "open":
-            raise HTTPException(409, f"Contract is {data['status']}, not open")
+            raise HTTPException(409, "Contract not available")
 
         # Lock agent bond
         try:
@@ -451,24 +601,26 @@ def create_app(
             bond_result = {"status": "no_escrow"}
 
         # Assign agent (without transitioning to in_progress yet)
-        now = time.time()
-        _store.db.execute(
-            "UPDATE contracts SET agent_pubkey = ?, status = 'investigating', updated_at = ? WHERE id = ?",
-            (req.agent_pubkey, now, contract_id),
-        )
-        _store.db.commit()
+        with _store._lock:
+            now = time.time()
+            _store.db.execute(
+                "UPDATE contracts SET agent_pubkey = ?, status = 'investigating', updated_at = ? WHERE id = ? AND status = 'open'",
+                (req.agent_pubkey, now, contract_id),
+            )
+            _store.db.commit()
 
-        _store.append_message(contract_id, {
-            "type": "bond",
+        _server_sign_and_append(contract_id, "bond", {
             "agent_pubkey": req.agent_pubkey,
-            "from": "agent",
         })
 
         return {"status": "investigating", "bond": bond_result}
 
     @app.post("/contracts/{contract_id}/accept")
-    async def accept_contract(contract_id: str, req: AcceptRequest):
+    async def accept_contract(contract_id: str, req: AcceptRequest, request: Request):
         """Agent accepts a contract. From INVESTIGATING (bonded) or OPEN (legacy)."""
+        authed = await _verify_auth(request, req.agent_pubkey)
+        _require_auth(authed)
+
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
@@ -476,7 +628,8 @@ def create_app(
             raise HTTPException(403, "Cannot accept your own contract")
 
         if data["status"] == "investigating":
-            # Agent already bonded, transition to in_progress
+            # Verify the caller is the agent who bonded
+            _check_party(data, req.agent_pubkey, "agent")
             _store.update_status(contract_id, "in_progress")
         elif data["status"] == "open":
             # Legacy flow: direct accept without bond
@@ -484,22 +637,30 @@ def create_app(
             if not ok:
                 raise HTTPException(409, "Could not assign agent")
         else:
-            raise HTTPException(409, f"Contract is {data['status']}, expected investigating or open")
+            raise HTTPException(409, "Contract not available for acceptance")
 
-        _store.append_message(contract_id, {
-            "type": "accept",
+        _server_sign_and_append(contract_id, "accept", {
             "agent_pubkey": req.agent_pubkey,
         })
         return {"status": "in_progress"}
 
+    class DeclineRequest(BaseModel):
+        agent_pubkey: str
+
     @app.post("/contracts/{contract_id}/decline")
-    async def decline_investigation(contract_id: str):
+    async def decline_investigation(contract_id: str, req: DeclineRequest, request: Request):
         """Agent declines after investigating. Bond returned, contract reopens."""
+        authed = await _verify_auth(request, req.agent_pubkey)
+        _require_auth(authed)
+
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         if data["status"] != "investigating":
-            raise HTTPException(409, f"Contract is {data['status']}, not investigating")
+            raise HTTPException(409, "Contract not in investigating state")
+
+        # Verify the caller is the investigating agent
+        _check_party(data, req.agent_pubkey, "agent")
 
         # Release agent bond
         try:
@@ -508,28 +669,31 @@ def create_app(
             pass
 
         # Reopen: clear agent, set back to open
-        now = time.time()
-        _store.db.execute(
-            "UPDATE contracts SET agent_pubkey = NULL, status = 'open', updated_at = ? WHERE id = ?",
-            (now, contract_id),
-        )
-        _store.db.commit()
+        with _store._lock:
+            now = time.time()
+            _store.db.execute(
+                "UPDATE contracts SET agent_pubkey = NULL, status = 'open', updated_at = ? WHERE id = ?",
+                (now, contract_id),
+            )
+            _store.db.commit()
 
-        _store.append_message(contract_id, {
-            "type": "decline",
-            "from": "agent",
-        })
+        _server_sign_and_append(contract_id, "decline", {})
 
         return {"status": "open"}
 
     @app.post("/contracts/{contract_id}/investigate")
-    async def request_investigation(contract_id: str, req: InvestigateRequest):
+    async def request_investigation(contract_id: str, req: InvestigateRequest, request: Request):
         """Agent requests an investigation command. Rate-limited."""
+        authed = await _verify_auth(request, req.agent_pubkey)
+        _require_auth(authed)
+
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         if data["status"] not in ("in_progress", "investigating"):
-            raise HTTPException(409, f"Contract is {data['status']}")
+            raise HTTPException(409, "Contract not in progress")
+        # Verify caller is the agent
+        _check_party(data, req.agent_pubkey, "agent")
 
         # Rate limiting
         rate_limit = data["contract"].get("execution", {}).get(
@@ -542,22 +706,24 @@ def create_app(
             raise HTTPException(429, f"Rate limited. Wait {wait:.1f}s")
 
         _store.set_last_investigation(contract_id, now)
-        _store.append_message(contract_id, {
-            "type": "investigate",
+        _server_sign_and_append(contract_id, "investigate", {
             "command": req.command,
             "from": "agent",
         })
         return {"status": "pending_result", "command": req.command}
 
     @app.post("/contracts/{contract_id}/result")
-    async def submit_investigation_result(contract_id: str, req: InvestigationResultRequest):
+    async def submit_investigation_result(contract_id: str, req: InvestigationResultRequest, request: Request):
         """Principal returns investigation result."""
+        authed = await _verify_auth(request, req.principal_pubkey)
+        _require_auth(authed)
+
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
+        _check_party(data, req.principal_pubkey, "principal")
 
-        _store.append_message(contract_id, {
-            "type": "result",
+        _server_sign_and_append(contract_id, "result", {
             "command": req.command,
             "output": req.output,
             "from": "principal",
@@ -565,36 +731,42 @@ def create_app(
         return {"status": "ok"}
 
     @app.post("/contracts/{contract_id}/chat")
-    async def chat(contract_id: str, req: ChatMessage):
+    async def chat(contract_id: str, req: ChatMessage, request: Request):
         """Send a chat message. Works in any state except voided/canceled."""
+        authed = await _verify_auth(request, req.pubkey)
+        _require_auth(authed)
+
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         if data["status"] in ("voided", "canceled"):
-            raise HTTPException(409, f"Contract is {data['status']}, chat not available")
+            raise HTTPException(409, "Chat not available")
         if req.msg_type not in ("ask", "answer", "message"):
-            raise HTTPException(400, f"Invalid msg_type: {req.msg_type}")
+            raise HTTPException(400, "Invalid msg_type")
 
-        _store.append_message(contract_id, {
-            "type": req.msg_type,
+        # Verify caller matches the side they claim
+        _check_party(data, req.pubkey, req.from_side)
+
+        _server_sign_and_append(contract_id, req.msg_type, {
             "message": req.message,
             "from": req.from_side,
         })
         return {"status": "sent"}
 
     @app.post("/contracts/{contract_id}/fix")
-    async def submit_fix(contract_id: str, req: SubmitFixRequest):
+    async def submit_fix(contract_id: str, req: SubmitFixRequest, request: Request):
         """Agent submits a fix. In autonomous mode, enters review state."""
+        authed = await _verify_auth(request, req.agent_pubkey)
+        _require_auth(authed)
+
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
-        if req.agent_pubkey and data.get("agent_pubkey"):
-            _check_party(data, req.agent_pubkey, "agent")
+        _check_party(data, req.agent_pubkey, "agent")
         if data["status"] != "in_progress":
-            raise HTTPException(409, f"Contract is {data['status']}")
+            raise HTTPException(409, "Contract not in progress")
 
-        _store.append_message(contract_id, {
-            "type": "fix",
+        _server_sign_and_append(contract_id, "fix", {
             "fix": req.fix,
             "explanation": req.explanation,
             "from": "agent",
@@ -614,15 +786,17 @@ def create_app(
             return {"status": "pending_verification"}
 
     @app.post("/contracts/{contract_id}/verify")
-    async def verify_fix(contract_id: str, req: VerifyRequest):
+    async def verify_fix(contract_id: str, req: VerifyRequest, request: Request):
         """Principal reports verification result (supervised mode)."""
+        authed = await _verify_auth(request, req.principal_pubkey)
+        _require_auth(authed)
+
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         _check_party(data, req.principal_pubkey, "principal")
 
-        _store.append_message(contract_id, {
-            "type": "verify",
+        _server_sign_and_append(contract_id, "verify", {
             "success": req.success,
             "explanation": req.explanation,
             "from": "principal",
@@ -636,7 +810,7 @@ def create_app(
             contract = data.get("contract", {})
             max_attempts = contract.get("execution", {}).get("max_attempts", 3)
             transcript = data.get("transcript", [])
-            attempts_so_far = sum(1 for m in transcript if m.get("type") == "verify" and not m.get("success"))
+            attempts_so_far = sum(1 for m in transcript if m.get("type") == "verify" and not m.get("data", {}).get("success", m.get("success")))
             # +1 for this verify we just appended
             attempts_so_far += 1
 
@@ -665,11 +839,15 @@ def create_app(
         return {"status": ruling}
 
     @app.post("/contracts/{contract_id}/review")
-    async def review_action(contract_id: str, req: ReviewAction):
+    async def review_action(contract_id: str, req: ReviewAction, request: Request):
         """Principal acts during review window: accept or dispute."""
+        authed = await _verify_auth(request, req.principal_pubkey)
+        _require_auth(authed)
+
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
+        _check_party(data, req.principal_pubkey, "principal")
 
         # Check auto-fulfill first
         updated = _check_review_expiry(data)
@@ -681,10 +859,7 @@ def create_app(
 
         if req.action == "accept":
             _store.update_status(contract_id, "fulfilled")
-            _store.append_message(contract_id, {
-                "type": "review_accept",
-                "from": "principal",
-            })
+            _server_sign_and_append(contract_id, "review_accept", {})
             # Resolve escrow
             escrow = _escrow.get(contract_id)
             if escrow and not escrow["resolved"]:
@@ -702,8 +877,7 @@ def create_app(
                 raise HTTPException(400, "Dispute requires an argument")
             # Delegate to dispute endpoint logic
             _store.update_status(contract_id, "disputed")
-            _store.append_message(contract_id, {
-                "type": "dispute",
+            _server_sign_and_append(contract_id, "dispute_filed", {
                 "argument": req.argument,
                 "side": "principal",
             })
@@ -711,22 +885,21 @@ def create_app(
             if not _judge:
                 raise HTTPException(501, "No judge configured")
 
+            transcript = _store.get(contract_id)["transcript"]
+            chain_valid = _verify_transcript_chain(transcript)
+
             evidence = Evidence(
                 contract=data["contract"],
-                messages=data["transcript"],
-                hash_chain="",
+                messages=transcript,
+                hash_chain=_compute_hash_chain(transcript),
                 arguments={"principal": req.argument},
+                chain_valid=chain_valid,
             )
 
-            # Check judge timeout
-            ruling_timeout = data["contract"].get("judge", {}).get(
-                "ruling_timeout", DEFAULT_RULING_TIMEOUT
-            )
             ruling = await _judge.rule(evidence)
 
             _store.update_status(contract_id, "resolved")
-            _store.append_message(contract_id, {
-                "type": "ruling",
+            _server_sign_and_append(contract_id, "ruling", {
                 "outcome": ruling.outcome,
                 "reasoning": ruling.reasoning,
                 "flags": ruling.flags,
@@ -780,12 +953,16 @@ def create_app(
 
         court_name = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]["name"]
 
+        transcript = data["transcript"]
+        chain_valid = _verify_transcript_chain(transcript)
+
         evidence = Evidence(
             contract=data["contract"],
-            messages=data["transcript"],
-            hash_chain="",
+            messages=transcript,
+            hash_chain=_compute_hash_chain(transcript),
             arguments=arguments,
             prior_rulings=[r for r in prior_rulings],
+            chain_valid=chain_valid,
         )
 
         if _court:
@@ -803,8 +980,7 @@ def create_app(
         else:
             _store.update_status(contract_id, "in_progress")
 
-        _store.append_message(contract_id, {
-            "type": "ruling",
+        _server_sign_and_append(contract_id, "ruling", {
             "outcome": ruling.outcome,
             "reasoning": ruling.reasoning,
             "court": ruling.court,
@@ -856,33 +1032,39 @@ def create_app(
         }
 
     @app.post("/contracts/{contract_id}/dispute")
-    async def dispute_contract(contract_id: str, req: DisputeRequest):
-        """File a dispute. Two-phase: file -> other side has 30s to respond -> judge rules.
+    async def dispute_contract(contract_id: str, req: DisputeRequest, request: Request):
+        """File a dispute. Two-phase: file -> other side has 30s to respond -> judge rules."""
+        authed = await _verify_auth(request, req.pubkey)
+        _require_auth(authed)
 
-        If the other side responds in time, judge hears both arguments.
-        If not, judge rules in absentia (silence is not guilt, but you don't get to make your case).
-        """
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
+
+        # Verify caller matches the side they claim
+        _check_party(data, req.pubkey, req.side)
 
         # Check for pending dispute awaiting response
         transcript = data.get("transcript", [])
         pending_filed = None
         for msg in reversed(transcript):
-            if msg.get("type") == "ruling":
-                break  # a ruling after the last dispute_filed means it's resolved
-            if msg.get("type") == "dispute_filed":
+            msg_type = msg.get("type", "")
+            # Chain entries have type in top level, data in "data" subdict
+            if msg_type == "ruling":
+                break
+            if msg_type == "dispute_filed":
                 pending_filed = msg
                 break
 
         if pending_filed:
-            deadline = pending_filed.get("response_deadline", 0)
+            # Get data from either top-level (legacy) or data subdict (chain entry)
+            pf_data = pending_filed.get("data", pending_filed)
+            deadline = pf_data.get("response_deadline", 0)
             if time.time() >= deadline:
                 # Response window expired -- trigger ruling in absentia
                 prior_rulings = [m for m in transcript if m.get("type") == "ruling"]
-                level = pending_filed.get("level", 0)
-                arguments = {pending_filed["side"]: pending_filed["argument"]}
+                level = pf_data.get("level", 0)
+                arguments = {pf_data["side"]: pf_data["argument"]}
                 return await _execute_ruling(contract_id, _store.get(contract_id),
                                              arguments, prior_rulings, level)
             else:
@@ -899,7 +1081,8 @@ def create_app(
         # For appeals: only the loser can appeal
         if level > 0:
             last_ruling = prior_rulings[-1]
-            last_outcome = last_ruling.get("outcome", "")
+            last_data = last_ruling.get("data", last_ruling)
+            last_outcome = last_data.get("outcome", "")
             if last_outcome in ("fulfilled", "evil_principal"):
                 loser = "principal"
             else:
@@ -913,8 +1096,7 @@ def create_app(
         deadline = time.time() + DISPUTE_RESPONSE_WINDOW
 
         _store.update_status(contract_id, "disputed")
-        _store.append_message(contract_id, {
-            "type": "dispute_filed",
+        _server_sign_and_append(contract_id, "dispute_filed", {
             "argument": req.argument,
             "side": req.side,
             "level": level,
@@ -936,14 +1118,17 @@ def create_app(
         }
 
     @app.post("/contracts/{contract_id}/respond")
-    async def respond_to_dispute(contract_id: str, req: RespondRequest):
-        """Counter-argue a pending dispute. Must be the other side, within the response window.
+    async def respond_to_dispute(contract_id: str, req: RespondRequest, request: Request):
+        """Counter-argue a pending dispute. Must be the other side, within the response window."""
+        authed = await _verify_auth(request, req.pubkey)
+        _require_auth(authed)
 
-        After response is received (or window expires), the judge rules with both arguments.
-        """
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
+
+        # Verify caller matches claimed side
+        _check_party(data, req.pubkey, req.side)
 
         # Find the pending dispute (must not have a ruling after it)
         transcript = data.get("transcript", [])
@@ -957,29 +1142,30 @@ def create_app(
 
         if not last_filed:
             raise HTTPException(409, "No pending dispute to respond to")
-        filer_side = last_filed["side"]
+
+        lf_data = last_filed.get("data", last_filed)
+        filer_side = lf_data["side"]
 
         # Must be the other side
         if req.side == filer_side:
             raise HTTPException(400, f"You filed the dispute. Only the {('agent' if filer_side == 'principal' else 'principal')} can respond.")
 
         # Check deadline
-        deadline = last_filed.get("response_deadline", 0)
+        deadline = lf_data.get("response_deadline", 0)
         if time.time() > deadline:
             raise HTTPException(410, "Response window has expired. Ruling will proceed in absentia.")
 
         # Record response
-        _store.append_message(contract_id, {
-            "type": "dispute_response",
+        _server_sign_and_append(contract_id, "dispute_response", {
             "argument": req.argument,
             "side": req.side,
         })
 
         # Both sides heard -- trigger ruling immediately
         prior_rulings = [m for m in data.get("transcript", []) if m.get("type") == "ruling"]
-        level = last_filed.get("level", 0)
+        level = lf_data.get("level", 0)
         arguments = {
-            filer_side: last_filed["argument"],
+            filer_side: lf_data["argument"],
             req.side: req.argument,
         }
 
@@ -998,7 +1184,8 @@ def create_app(
             return {"status": "no_pending_dispute"}
 
         last_filed = pending[-1]
-        deadline = last_filed.get("response_deadline", 0)
+        lf_data = last_filed.get("data", last_filed)
+        deadline = lf_data.get("response_deadline", 0)
         remaining = max(0, deadline - time.time())
 
         # Check if response was already submitted
@@ -1007,29 +1194,38 @@ def create_app(
 
         return {
             "status": "awaiting_response" if remaining > 0 and not responded else "ready_for_ruling",
-            "filer": last_filed["side"],
-            "court": last_filed.get("court"),
-            "level": last_filed.get("level"),
+            "filer": lf_data.get("side", lf_data.get("data", {}).get("side")),
+            "court": lf_data.get("court"),
+            "level": lf_data.get("level"),
             "response_deadline": deadline,
             "remaining": round(remaining, 1),
             "responded": responded,
         }
 
+    class VoidRequest(BaseModel):
+        pubkey: str  # must be a party to the contract
+
     @app.post("/contracts/{contract_id}/void")
-    async def void_contract(contract_id: str):
+    async def void_contract(contract_id: str, req: VoidRequest, request: Request):
         """Void a disputed contract (judge timeout). All funds returned."""
+        authed = await _verify_auth(request, req.pubkey)
+        _require_auth(authed)
+
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
+
+        # Must be a party to the contract
+        is_principal = data.get("principal_pubkey") == req.pubkey
+        is_agent = data.get("agent_pubkey") == req.pubkey
+        if not is_principal and not is_agent:
+            raise HTTPException(403, "Not a party to this contract")
+
         if data["status"] != "disputed":
-            raise HTTPException(409, f"Contract is {data['status']}, not disputed")
+            raise HTTPException(409, "Contract not in disputed state")
 
         _store.update_status(contract_id, "voided")
-        _store.append_message(contract_id, {
-            "type": "voided",
-            "reason": "judge_timeout",
-            "from": "system",
-        })
+        _server_sign_and_append(contract_id, "voided", {"reason": "judge_timeout"})
 
         # Resolve escrow as voided -- everything returned
         escrow = _escrow.get(contract_id)
@@ -1039,23 +1235,20 @@ def create_app(
         return {"status": "voided"}
 
     @app.post("/contracts/{contract_id}/halt")
-    async def halt_contract(contract_id: str, req: HaltRequest):
-        """Emergency halt by principal -- freeze contract and escalate to district court.
+    async def halt_contract(contract_id: str, req: HaltRequest, request: Request):
+        """Emergency halt by principal -- freeze contract and escalate to district court."""
+        authed = await _verify_auth(request, req.principal_pubkey)
+        _require_auth(authed)
 
-        Halts are emergencies so the ruling is immediate (no response window).
-        But the ruling is at district level and non-final -- the losing side
-        can appeal through the normal dispute flow with full response windows.
-        """
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         _check_party(data, req.principal_pubkey, "principal")
         if data["status"] not in ("in_progress", "review"):
-            raise HTTPException(409, f"Contract is {data['status']}, not in_progress or review")
+            raise HTTPException(409, "Contract not in progress or review")
 
         _store.update_status(contract_id, "halted")
-        _store.append_message(contract_id, {
-            "type": "halt",
+        _server_sign_and_append(contract_id, "halt", {
             "reason": req.reason,
             "from": "principal",
         })
@@ -1064,11 +1257,15 @@ def create_app(
 
         if _court or _judge:
             # Immediate district court ruling (no response window for emergencies)
+            transcript = _store.get(contract_id)["transcript"]
+            chain_valid = _verify_transcript_chain(transcript)
+
             evidence = Evidence(
                 contract=data["contract"],
-                messages=data["transcript"],
-                hash_chain="",
+                messages=transcript,
+                hash_chain=_compute_hash_chain(transcript),
                 arguments={"principal": req.reason},
+                chain_valid=chain_valid,
             )
             if _court:
                 ruling = await _court.rule(evidence, level=0)
@@ -1083,8 +1280,7 @@ def create_app(
             else:
                 _store.update_status(contract_id, "resolved")
 
-            _store.append_message(contract_id, {
-                "type": "ruling",
+            _server_sign_and_append(contract_id, "ruling", {
                 "outcome": ruling.outcome,
                 "reasoning": ruling.reasoning,
                 "court": ruling.court if hasattr(ruling, 'court') else "district",
@@ -1131,8 +1327,31 @@ def create_app(
             raise HTTPException(404, "Contract not found")
         for msg in reversed(data["transcript"]):
             if msg.get("type") == "ruling":
-                return {"outcome": msg["outcome"], "reasoning": msg["reasoning"], "flags": msg.get("flags", [])}
+                msg_data = msg.get("data", msg)
+                return {"outcome": msg_data.get("outcome"), "reasoning": msg_data.get("reasoning"), "flags": msg_data.get("flags", [])}
         return None
+
+    @app.get("/contracts/{contract_id}/verify_chain")
+    async def verify_contract_chain(contract_id: str):
+        """Verify the signed message chain for a contract."""
+        data = _store.get(contract_id)
+        if not data:
+            raise HTTPException(404, "Contract not found")
+
+        transcript = data["transcript"]
+        chain_entries = [e for e in transcript if "signature" in e]
+
+        if not chain_entries:
+            return {"valid": True, "entries": 0, "detail": "No signed chain entries (legacy transcript)"}
+
+        ok, err = verify_chain(chain_entries)
+        return {
+            "valid": ok,
+            "entries": len(chain_entries),
+            "total_transcript": len(transcript),
+            "error": err if not ok else None,
+            "chain_head": data.get("chain_head", ""),
+        }
 
     @app.get("/reputation/{pubkey}")
     async def get_reputation(pubkey: str):
@@ -1141,7 +1360,40 @@ def create_app(
         return stats.to_dict()
 
     @app.post("/contracts/{contract_id}/accounts")
-    async def set_accounts(contract_id: str, req: SetAccountsRequest):
+    async def set_accounts(contract_id: str, req: SetAccountsRequest, request: Request):
+        """Set payment accounts. Each party can only set their own account."""
+        authed = await _verify_auth(request, req.pubkey)
+        _require_auth(authed)
+
+        data = _store.get(contract_id)
+        if not data:
+            raise HTTPException(404, "Contract not found")
+
+        # Block account changes after escrow resolution
+        escrow = _escrow.get(data["id"])
+        if escrow and escrow.get("resolved"):
+            raise HTTPException(409, "Cannot change accounts after escrow resolution")
+
+        # Validate Nano addresses before anything else
+        if req.principal_account:
+            valid, err = validate_nano_address(req.principal_account)
+            if not valid:
+                raise HTTPException(400, f"Invalid principal Nano address: {err}")
+        if req.agent_account:
+            valid, err = validate_nano_address(req.agent_account)
+            if not valid:
+                raise HTTPException(400, f"Invalid agent Nano address: {err}")
+
+        # Enforce: you can only set YOUR OWN account
+        is_principal = data.get("principal_pubkey") == req.pubkey
+        is_agent = data.get("agent_pubkey") == req.pubkey
+        if not is_principal and not is_agent:
+            raise HTTPException(403, "Not a party to this contract")
+        if req.principal_account and not is_principal:
+            raise HTTPException(403, "Cannot set principal account -- not the principal")
+        if req.agent_account and not is_agent:
+            raise HTTPException(403, "Cannot set agent account -- not the agent")
+
         ok = _escrow.set_accounts(contract_id, req.principal_account, req.agent_account)
         if not ok:
             raise HTTPException(404, "No escrow for this contract")

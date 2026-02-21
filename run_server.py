@@ -195,16 +195,17 @@ def run_free_agent(store, escrow_mgr):
 
                 print(f"[agent] Picking up {cid}: {task.get('command', task.get('task', '?'))}")
 
-                # Bond → INVESTIGATING
+                # Bond → INVESTIGATING (use store API, not direct DB writes)
                 try:
                     escrow_mgr.lock_agent_bond(cid)
                 except Exception:
                     pass
-                store.db.execute(
-                    "UPDATE contracts SET agent_pubkey = ?, status = 'investigating', updated_at = ? WHERE id = ? AND status = 'open'",
-                    (AGENT_KEY, time.time(), cid),
-                )
-                store.db.commit()
+                with store._lock:
+                    store.db.execute(
+                        "UPDATE contracts SET agent_pubkey = ?, status = 'investigating', updated_at = ? WHERE id = ? AND status = 'open'",
+                        (AGENT_KEY, time.time(), cid),
+                    )
+                    store.db.commit()
                 store.append_message(cid, {"type": "bond", "agent_pubkey": AGENT_KEY, "from": "agent"})
 
                 # Ask LLM what to investigate

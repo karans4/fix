@@ -20,6 +20,7 @@ class Evidence:
     hash_chain: str
     arguments: dict[str, str]  # side -> argument text
     prior_rulings: list[dict] = field(default_factory=list)  # previous tier rulings
+    chain_valid: bool = True  # whether the signed chain verified correctly
 
     def summary(self) -> str:
         """Human-readable summary for LLM prompt."""
@@ -33,6 +34,11 @@ class Evidence:
             parts.append(json.dumps(msg, separators=(",", ":")))
         parts.append("")
         parts.append(f"## Hash Chain: {self.hash_chain}")
+        if not self.chain_valid:
+            parts.append("")
+            parts.append("## WARNING: CHAIN INTEGRITY CHECK FAILED")
+            parts.append("The signed message chain could not be verified. "
+                         "Evidence may have been tampered with. Treat transcript with suspicion.")
         parts.append("")
         parts.append("## Arguments")
         for side, text in self.arguments.items():
@@ -189,13 +195,23 @@ Respond with a JSON object:
             text = text[start:end]
         try:
             data = json.loads(text)
-            outcome = data.get("outcome", "canceled")
+            outcome = data.get("outcome", "")
             reasoning = data.get("reasoning", "No reasoning provided")
             if outcome not in VALID_OUTCOMES:
-                outcome = "canceled"
+                # Don't default to a side -- judge malfunction should void
+                return JudgeRuling(
+                    outcome="impossible",
+                    reasoning=f"Judge returned invalid outcome '{outcome}'. "
+                              f"Ruling treated as impossible (no penalty to either side).",
+                )
             return JudgeRuling(outcome=outcome, reasoning=reasoning)
         except (json.JSONDecodeError, KeyError):
-            return JudgeRuling(outcome="canceled", reasoning=f"Could not parse judge response: {raw[:200]}")
+            # Can't parse judge output at all -- void, don't punish either side
+            return JudgeRuling(
+                outcome="impossible",
+                reasoning=f"Could not parse judge response (judge malfunction). "
+                          f"No penalty to either side. Raw: {raw[:200]}",
+            )
 
 
 class TieredCourt:

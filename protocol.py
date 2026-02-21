@@ -56,6 +56,36 @@ AGENT_PICKUP_DELAY = 15
 # Charity address: evil_both funds go here (Green Mountain State Wolfdog Refuge)
 CHARITY_ADDRESS = "nano_1q3hsjq6tmj1tne66rymctadqbi8ijtak7x1fr5dkmesnkdrqxnoojttcgok"
 
+# Sanity check: validate charity address at import time (inline to avoid circular import)
+def _validate_charity():
+    import hashlib
+    _alphabet = '13456789abcdefghijkmnopqrstuwxyz'
+    addr = CHARITY_ADDRESS
+    if not addr.startswith('nano_') and not addr.startswith('xrb_'):
+        raise RuntimeError(f"CHARITY_ADDRESS has invalid prefix")
+    payload = addr[5:] if addr.startswith('nano_') else addr[4:]
+    if len(payload) != 60:
+        raise RuntimeError(f"CHARITY_ADDRESS has invalid length")
+    for c in payload:
+        if c not in _alphabet:
+            raise RuntimeError(f"CHARITY_ADDRESS has invalid character '{c}'")
+    key_part, ck_part = payload[:52], payload[52:]
+    val = 0
+    for c in key_part:
+        val = (val << 5) | _alphabet.index(c)
+    val &= (1 << 256) - 1
+    pubkey = val.to_bytes(32, 'big')
+    ck_val = 0
+    for c in ck_part:
+        ck_val = (ck_val << 5) | _alphabet.index(c)
+    decoded_ck = ck_val.to_bytes(5, 'big')
+    expected_ck = hashlib.blake2b(pubkey, digest_size=5).digest()[::-1]
+    if decoded_ck != expected_ck:
+        raise RuntimeError(f"CHARITY_ADDRESS has invalid checksum")
+
+_validate_charity()
+del _validate_charity
+
 # Investigation rate limiting
 DEFAULT_INVESTIGATION_RATE = 5  # seconds between commands
 
@@ -88,10 +118,10 @@ STATE_TRANSITIONS = {
         ContractState.HALTED,
         ContractState.REVIEW,
     },
-    ContractState.REVIEW: {ContractState.FULFILLED, ContractState.DISPUTED, ContractState.CANCELED},
+    ContractState.REVIEW: {ContractState.FULFILLED, ContractState.DISPUTED, ContractState.CANCELED, ContractState.HALTED},
     ContractState.BACKED_OUT: {ContractState.OPEN},  # reopen
-    ContractState.DISPUTED: {ContractState.RESOLVED, ContractState.VOIDED},
-    ContractState.HALTED: {ContractState.RESOLVED},
+    ContractState.DISPUTED: {ContractState.RESOLVED, ContractState.VOIDED, ContractState.IN_PROGRESS},
+    ContractState.HALTED: {ContractState.RESOLVED, ContractState.IN_PROGRESS},
     ContractState.FULFILLED: set(),
     ContractState.CANCELED: set(),
     ContractState.RESOLVED: set(),
@@ -148,3 +178,19 @@ INVESTIGATE_WHITELIST = {
     "readlink", "realpath", "basename", "dirname", "diff", "cmp",
     "strings", "nm", "ldd", "objdump", "pkg-config", "test", "timeout",
 }
+
+
+# --- Chain Entry Types ---
+
+# All valid chain entry types
+CHAIN_ENTRY_TYPES = {
+    "post", "bond", "accept", "decline", "investigate", "result",
+    "fix", "verify", "dispute_filed", "dispute_response",
+    "chat", "ask", "answer", "message",
+    "halt", "review_accept",
+    # Server-only types
+    "ruling", "auto_fulfill", "voided",
+}
+
+# Only the server can sign these types
+SERVER_ENTRY_TYPES = {"ruling", "auto_fulfill", "voided"}

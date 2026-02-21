@@ -4,8 +4,9 @@ Covers: autonomous flow, review window, chat messages, bond lifecycle,
 investigation rate limiting, judge timeout/voiding, decline after investigate.
 """
 
-import sys, os
+import sys, os, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(__file__))
 
 import time
 import pytest
@@ -17,6 +18,13 @@ from server.store import ContractStore
 from server.escrow import EscrowManager
 from server.reputation import ReputationManager
 from server.judge import AIJudge, TieredCourt, Evidence, JudgeRuling
+from conftest import signed_post, PRINCIPAL_PUBKEY, AGENT_PUBKEY, PRINCIPAL_PRIV, AGENT_PRIV, SERVER_PRIV
+from crypto import generate_ed25519_keypair, pubkey_to_fix_id
+
+# Extra agent keypair for tests that need a second agent
+_a2_priv, _a2_pub = generate_ed25519_keypair()
+AGENT2_PUBKEY = pubkey_to_fix_id(_a2_pub)
+AGENT2_PRIV = _a2_priv
 
 
 SAMPLE_CONTRACT = {
@@ -51,7 +59,7 @@ def app():
     store = ContractStore(":memory:")
     escrow_mgr = EscrowManager(":memory:")
     reputation_mgr = ReputationManager(":memory:")
-    return create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr)
+    return create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, server_privkey=SERVER_PRIV)
 
 
 @pytest.fixture
@@ -60,25 +68,25 @@ def client(app):
 
 
 def _create_contract(client, contract=None):
-    resp = client.post("/contracts", json={
+    resp = signed_post(client, "/contracts", {
         "contract": contract or SAMPLE_CONTRACT,
-        "principal_pubkey": "principal_abc",
-    })
+        "principal_pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
     return resp.json()
 
 
-def _accept_contract(client, contract_id, agent="agent_xyz"):
-    resp = client.post(f"/contracts/{contract_id}/accept", json={"agent_pubkey": agent})
+def _accept_contract(client, contract_id, agent=AGENT_PUBKEY, agent_priv=AGENT_PRIV):
+    resp = signed_post(client, f"/contracts/{contract_id}/accept", {"agent_pubkey": agent}, agent, agent_priv)
     assert resp.status_code == 200
     return resp.json()
 
 
-def _bond_and_accept(client, contract_id, agent="agent_xyz"):
+def _bond_and_accept(client, contract_id, agent=AGENT_PUBKEY, agent_priv=AGENT_PRIV):
     """Bond then accept (new flow)."""
-    resp = client.post(f"/contracts/{contract_id}/bond", json={"agent_pubkey": agent})
+    resp = signed_post(client, f"/contracts/{contract_id}/bond", {"agent_pubkey": agent}, agent, agent_priv)
     assert resp.status_code == 200
-    resp = client.post(f"/contracts/{contract_id}/accept", json={"agent_pubkey": agent})
+    resp = signed_post(client, f"/contracts/{contract_id}/accept", {"agent_pubkey": agent}, agent, agent_priv)
     assert resp.status_code == 200
     return resp.json()
 
@@ -120,21 +128,21 @@ def test_bond_starts_investigating(client):
     data = _create_contract(client, JUDGE_CONTRACT)
     cid = data["contract_id"]
 
-    resp = client.post(f"/contracts/{cid}/bond", json={"agent_pubkey": "agent_xyz"})
+    resp = signed_post(client, f"/contracts/{cid}/bond", {"agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 200
     assert resp.json()["status"] == "investigating"
 
     contract = client.get(f"/contracts/{cid}").json()
     assert contract["status"] == "investigating"
-    assert contract["agent_pubkey"] == "agent_xyz"
+    assert contract["agent_pubkey"] == AGENT_PUBKEY
 
 
 def test_bond_then_accept(client):
     data = _create_contract(client, JUDGE_CONTRACT)
     cid = data["contract_id"]
 
-    client.post(f"/contracts/{cid}/bond", json={"agent_pubkey": "agent_xyz"})
-    resp = client.post(f"/contracts/{cid}/accept", json={"agent_pubkey": "agent_xyz"})
+    signed_post(client, f"/contracts/{cid}/bond", {"agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
+    resp = signed_post(client, f"/contracts/{cid}/accept", {"agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 200
     assert resp.json()["status"] == "in_progress"
 
@@ -146,9 +154,9 @@ def test_bond_then_decline(client, app):
     data = _create_contract(client, JUDGE_CONTRACT)
     cid = data["contract_id"]
 
-    client.post(f"/contracts/{cid}/bond", json={"agent_pubkey": "agent_xyz"})
+    signed_post(client, f"/contracts/{cid}/bond", {"agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
 
-    resp = client.post(f"/contracts/{cid}/decline")
+    resp = signed_post(client, f"/contracts/{cid}/decline", {"agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 200
     assert resp.json()["status"] == "open"
 
@@ -164,7 +172,7 @@ def test_bond_then_decline(client, app):
 def test_decline_wrong_status_409(client):
     data = _create_contract(client)
     cid = data["contract_id"]
-    resp = client.post(f"/contracts/{cid}/decline")
+    resp = signed_post(client, f"/contracts/{cid}/decline", {"agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 409
 
 
@@ -172,7 +180,7 @@ def test_bond_wrong_status_409(client):
     data = _create_contract(client)
     cid = data["contract_id"]
     _accept_contract(client, cid)
-    resp = client.post(f"/contracts/{cid}/bond", json={"agent_pubkey": "agent_2"})
+    resp = signed_post(client, f"/contracts/{cid}/bond", {"agent_pubkey": AGENT2_PUBKEY}, AGENT2_PUBKEY, AGENT2_PRIV)
     assert resp.status_code == 409
 
 
@@ -185,15 +193,15 @@ def test_investigate_rate_limiting(client):
     _accept_contract(client, cid)
 
     # First investigation should work
-    resp = client.post(f"/contracts/{cid}/investigate", json={
-        "command": "ls", "agent_pubkey": "agent_xyz",
-    })
+    resp = signed_post(client, f"/contracts/{cid}/investigate", {
+        "command": "ls", "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 200
 
     # Immediate second should be rate limited
-    resp = client.post(f"/contracts/{cid}/investigate", json={
-        "command": "pwd", "agent_pubkey": "agent_xyz",
-    })
+    resp = signed_post(client, f"/contracts/{cid}/investigate", {
+        "command": "pwd", "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 429
 
 
@@ -201,11 +209,11 @@ def test_investigate_during_investigating(client):
     """Agent can investigate while in INVESTIGATING state (before accepting)."""
     data = _create_contract(client, JUDGE_CONTRACT)
     cid = data["contract_id"]
-    client.post(f"/contracts/{cid}/bond", json={"agent_pubkey": "agent_xyz"})
+    signed_post(client, f"/contracts/{cid}/bond", {"agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
 
-    resp = client.post(f"/contracts/{cid}/investigate", json={
-        "command": "ls", "agent_pubkey": "agent_xyz",
-    })
+    resp = signed_post(client, f"/contracts/{cid}/investigate", {
+        "command": "ls", "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 200
 
 
@@ -216,11 +224,12 @@ def test_chat_message(client):
     cid = data["contract_id"]
     _accept_contract(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/chat", json={
+    resp = signed_post(client, f"/contracts/{cid}/chat", {
         "message": "What version of gcc?",
         "from_side": "agent",
         "msg_type": "ask",
-    })
+        "pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 200
     assert resp.json()["status"] == "sent"
 
@@ -228,8 +237,8 @@ def test_chat_message(client):
     contract = client.get(f"/contracts/{cid}").json()
     ask_msgs = [m for m in contract["transcript"] if m["type"] == "ask"]
     assert len(ask_msgs) == 1
-    assert ask_msgs[0]["message"] == "What version of gcc?"
-    assert ask_msgs[0]["from"] == "agent"
+    assert ask_msgs[0]["data"]["message"] == "What version of gcc?"
+    assert ask_msgs[0]["data"]["from"] == "agent"
 
 
 def test_chat_answer(client):
@@ -237,11 +246,12 @@ def test_chat_answer(client):
     cid = data["contract_id"]
     _accept_contract(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/chat", json={
+    resp = signed_post(client, f"/contracts/{cid}/chat", {
         "message": "gcc 12.3",
         "from_side": "principal",
         "msg_type": "answer",
-    })
+        "pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
 
 
@@ -250,22 +260,24 @@ def test_chat_general_message(client):
     cid = data["contract_id"]
     _accept_contract(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/chat", json={
+    resp = signed_post(client, f"/contracts/{cid}/chat", {
         "message": "Working on it",
         "from_side": "agent",
         "msg_type": "message",
-    })
+        "pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 200
 
 
 def test_chat_on_open_ok(client):
     data = _create_contract(client)
     cid = data["contract_id"]
-    resp = client.post(f"/contracts/{cid}/chat", json={
+    resp = signed_post(client, f"/contracts/{cid}/chat", {
         "message": "hello",
         "from_side": "principal",
         "msg_type": "message",
-    })
+        "pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
 
 
@@ -274,11 +286,12 @@ def test_chat_invalid_type_400(client):
     cid = data["contract_id"]
     _accept_contract(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/chat", json={
+    resp = signed_post(client, f"/contracts/{cid}/chat", {
         "message": "hi",
         "from_side": "agent",
         "msg_type": "invalid_type",
-    })
+        "pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 400
 
 
@@ -289,13 +302,14 @@ def test_chat_during_review(client):
     _accept_contract(client, cid)
 
     # Submit fix to enter review
-    client.post(f"/contracts/{cid}/fix", json={"fix": "apt install gcc", "agent_pubkey": "agent_xyz"})
+    signed_post(client, f"/contracts/{cid}/fix", {"fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
 
-    resp = client.post(f"/contracts/{cid}/chat", json={
+    resp = signed_post(client, f"/contracts/{cid}/chat", {
         "message": "Please check the fix",
         "from_side": "agent",
         "msg_type": "message",
-    })
+        "pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 200
 
 
@@ -303,13 +317,14 @@ def test_chat_during_investigating(client):
     """Chat works during investigating state."""
     data = _create_contract(client, JUDGE_CONTRACT)
     cid = data["contract_id"]
-    client.post(f"/contracts/{cid}/bond", json={"agent_pubkey": "agent_xyz"})
+    signed_post(client, f"/contracts/{cid}/bond", {"agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
 
-    resp = client.post(f"/contracts/{cid}/chat", json={
+    resp = signed_post(client, f"/contracts/{cid}/chat", {
         "message": "What's the project structure?",
         "from_side": "agent",
         "msg_type": "ask",
-    })
+        "pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 200
 
 
@@ -320,11 +335,11 @@ def test_autonomous_fix_enters_review(client):
     cid = data["contract_id"]
     _accept_contract(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/fix", json={
+    resp = signed_post(client, f"/contracts/{cid}/fix", {
         "fix": "apt install gcc",
         "explanation": "missing compiler",
-        "agent_pubkey": "agent_xyz",
-    })
+        "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "review"
@@ -339,9 +354,9 @@ def test_supervised_fix_stays_pending(client):
     cid = data["contract_id"]
     _accept_contract(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/fix", json={
-        "fix": "apt install gcc", "agent_pubkey": "agent_xyz",
-    })
+    resp = signed_post(client, f"/contracts/{cid}/fix", {
+        "fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.json()["status"] == "pending_verification"
 
 
@@ -349,9 +364,9 @@ def test_review_accept(client, app):
     data = _create_contract(client, AUTONOMOUS_CONTRACT)
     cid = data["contract_id"]
     _accept_contract(client, cid)
-    client.post(f"/contracts/{cid}/fix", json={"fix": "apt install gcc", "agent_pubkey": "agent_xyz"})
+    signed_post(client, f"/contracts/{cid}/fix", {"fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
 
-    resp = client.post(f"/contracts/{cid}/review", json={"action": "accept"})
+    resp = signed_post(client, f"/contracts/{cid}/review", {"action": "accept", "principal_pubkey": PRINCIPAL_PUBKEY}, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
     assert resp.json()["status"] == "fulfilled"
 
@@ -368,7 +383,7 @@ def test_review_auto_fulfill_on_expiry(client, app):
     data = _create_contract(client, AUTONOMOUS_CONTRACT)
     cid = data["contract_id"]
     _accept_contract(client, cid)
-    client.post(f"/contracts/{cid}/fix", json={"fix": "apt install gcc", "agent_pubkey": "agent_xyz"})
+    signed_post(client, f"/contracts/{cid}/fix", {"fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
 
     # Manually set review_expires_at to the past
     app.state.store.set_review_expires(cid, time.time() - 1)
@@ -385,7 +400,7 @@ def test_review_status_endpoint(client):
     data = _create_contract(client, AUTONOMOUS_CONTRACT)
     cid = data["contract_id"]
     _accept_contract(client, cid)
-    client.post(f"/contracts/{cid}/fix", json={"fix": "apt install gcc", "agent_pubkey": "agent_xyz"})
+    signed_post(client, f"/contracts/{cid}/fix", {"fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
 
     resp = client.get(f"/contracts/{cid}/review_status")
     assert resp.status_code == 200
@@ -407,9 +422,9 @@ def test_review_invalid_action_400(client):
     data = _create_contract(client, AUTONOMOUS_CONTRACT)
     cid = data["contract_id"]
     _accept_contract(client, cid)
-    client.post(f"/contracts/{cid}/fix", json={"fix": "apt install gcc", "agent_pubkey": "agent_xyz"})
+    signed_post(client, f"/contracts/{cid}/fix", {"fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
 
-    resp = client.post(f"/contracts/{cid}/review", json={"action": "invalid"})
+    resp = signed_post(client, f"/contracts/{cid}/review", {"action": "invalid", "principal_pubkey": PRINCIPAL_PUBKEY}, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 400
 
 
@@ -424,7 +439,7 @@ def test_void_disputed_contract(client, app):
     # Manually set to disputed (normally judge would do this)
     app.state.store.update_status(cid, "disputed")
 
-    resp = client.post(f"/contracts/{cid}/void")
+    resp = signed_post(client, f"/contracts/{cid}/void", {"pubkey": PRINCIPAL_PUBKEY}, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
     assert resp.json()["status"] == "voided"
 
@@ -439,7 +454,7 @@ def test_void_disputed_contract(client, app):
 def test_void_non_disputed_409(client):
     data = _create_contract(client)
     cid = data["contract_id"]
-    resp = client.post(f"/contracts/{cid}/void")
+    resp = signed_post(client, f"/contracts/{cid}/void", {"pubkey": PRINCIPAL_PUBKEY}, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 409
 
 
@@ -450,10 +465,10 @@ def test_halt_contract(client):
     cid = data["contract_id"]
     _accept_contract(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/halt", json={
+    resp = signed_post(client, f"/contracts/{cid}/halt", {
         "reason": "Agent is exfiltrating data",
-        "principal_pubkey": "principal_abc",
-    })
+        "principal_pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "halted"
@@ -464,7 +479,7 @@ def test_halt_contract(client):
 
     halt_msgs = [m for m in contract["transcript"] if m["type"] == "halt"]
     assert len(halt_msgs) == 1
-    assert halt_msgs[0]["reason"] == "Agent is exfiltrating data"
+    assert halt_msgs[0]["data"]["reason"] == "Agent is exfiltrating data"
 
 
 def test_halt_during_review(client):
@@ -472,12 +487,12 @@ def test_halt_during_review(client):
     data = _create_contract(client, AUTONOMOUS_CONTRACT)
     cid = data["contract_id"]
     _accept_contract(client, cid)
-    client.post(f"/contracts/{cid}/fix", json={"fix": "rm -rf /", "agent_pubkey": "agent_xyz"})
+    signed_post(client, f"/contracts/{cid}/fix", {"fix": "rm -rf /", "agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
 
-    resp = client.post(f"/contracts/{cid}/halt", json={
+    resp = signed_post(client, f"/contracts/{cid}/halt", {
         "reason": "Malicious fix detected",
-        "principal_pubkey": "principal_abc",
-    })
+        "principal_pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
     assert resp.json()["status"] == "halted"
 
@@ -485,12 +500,12 @@ def test_halt_during_review(client):
 def test_halt_not_in_progress_or_review(client):
     data = _create_contract(client)
     cid = data["contract_id"]
-    resp = client.post(f"/contracts/{cid}/halt", json={"reason": "suspicious", "principal_pubkey": "principal_abc"})
+    resp = signed_post(client, f"/contracts/{cid}/halt", {"reason": "suspicious", "principal_pubkey": PRINCIPAL_PUBKEY}, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 409
 
 
 def test_halt_not_found(client):
-    resp = client.post("/contracts/nonexistent/halt", json={"reason": "bad agent", "principal_pubkey": "principal_abc"})
+    resp = signed_post(client, "/contracts/nonexistent/halt", {"reason": "bad agent", "principal_pubkey": PRINCIPAL_PUBKEY}, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 404
 
 
@@ -505,7 +520,7 @@ def test_principal_bond_locked_on_create(app, client):
 def test_agent_bond_locked_on_bond(app, client):
     data = _create_contract(client, JUDGE_CONTRACT)
     cid = data["contract_id"]
-    client.post(f"/contracts/{cid}/bond", json={"agent_pubkey": "agent_xyz"})
+    signed_post(client, f"/contracts/{cid}/bond", {"agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
     escrow = app.state.escrow.get(cid)
     assert escrow["agent_bond_locked"] is True
 
@@ -532,19 +547,20 @@ def test_review_dispute_with_judge(app):
     store = ContractStore(":memory:")
     escrow_mgr = EscrowManager(":memory:")
     reputation_mgr = ReputationManager(":memory:")
-    app = create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, judge=judge)
+    app = create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, judge=judge, server_privkey=SERVER_PRIV)
     client = TestClient(app)
 
     data = _create_contract(client, AUTONOMOUS_JUDGE_CONTRACT)
     cid = data["contract_id"]
     _bond_and_accept(client, cid)
 
-    client.post(f"/contracts/{cid}/fix", json={"fix": "apt install gcc", "agent_pubkey": "agent_xyz"})
+    signed_post(client, f"/contracts/{cid}/fix", {"fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
 
-    resp = client.post(f"/contracts/{cid}/review", json={
+    resp = signed_post(client, f"/contracts/{cid}/review", {
         "action": "dispute",
         "argument": "Fix doesn't work",
-    })
+        "principal_pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
     body = resp.json()
     assert body["outcome"] == "fulfilled"
@@ -564,7 +580,7 @@ def test_dispute_with_judge_agent_loses():
     store = ContractStore(":memory:")
     escrow_mgr = EscrowManager(":memory:")
     reputation_mgr = ReputationManager(":memory:")
-    app = create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, judge=judge)
+    app = create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, judge=judge, server_privkey=SERVER_PRIV)
     client = TestClient(app)
 
     data = _create_contract(client, JUDGE_CONTRACT)
@@ -582,29 +598,47 @@ def test_review_dispute_requires_argument(client):
     data = _create_contract(client, AUTONOMOUS_CONTRACT)
     cid = data["contract_id"]
     _accept_contract(client, cid)
-    client.post(f"/contracts/{cid}/fix", json={"fix": "apt install gcc", "agent_pubkey": "agent_xyz"})
+    signed_post(client, f"/contracts/{cid}/fix", {"fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
 
-    resp = client.post(f"/contracts/{cid}/review", json={
+    resp = signed_post(client, f"/contracts/{cid}/review", {
         "action": "dispute",
         "argument": "",
-    })
+        "principal_pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 400
 
 
 # --- Helpers for two-phase dispute ---
 
+def _pubkey_for_side(side):
+    """Return the pubkey for a dispute side."""
+    return PRINCIPAL_PUBKEY if side == "principal" else AGENT_PUBKEY
+
+
+def _privkey_for_side(side):
+    """Return the private key for a dispute side."""
+    return PRINCIPAL_PRIV if side == "principal" else AGENT_PRIV
+
+
 def _file_dispute(client, cid, argument, side="principal"):
     """File a dispute and trigger ruling (other side responds to skip window)."""
-    resp = client.post(f"/contracts/{cid}/dispute", json={"argument": argument, "side": side})
+    pubkey = _pubkey_for_side(side)
+    privkey = _privkey_for_side(side)
+    resp = signed_post(client, f"/contracts/{cid}/dispute", {
+        "argument": argument, "side": side, "pubkey": pubkey,
+    }, pubkey, privkey)
     assert resp.status_code == 200
     body = resp.json()
     if body.get("status") == "awaiting_response":
         # Other side responds (or doesn't -- trigger ruling by re-calling dispute after deadline)
         other = "agent" if side == "principal" else "principal"
-        resp = client.post(f"/contracts/{cid}/respond", json={
+        other_pubkey = _pubkey_for_side(other)
+        other_privkey = _privkey_for_side(other)
+        resp = signed_post(client, f"/contracts/{cid}/respond", {
             "argument": "(no contest)",
             "side": other,
-        })
+            "pubkey": other_pubkey,
+        }, other_pubkey, other_privkey)
         assert resp.status_code == 200
         return resp.json()
     return body  # Legacy judge returns ruling directly
@@ -612,7 +646,11 @@ def _file_dispute(client, cid, argument, side="principal"):
 
 def _file_dispute_no_respond(client, cid, argument, side="principal"):
     """File a dispute without response (for testing the awaiting state)."""
-    resp = client.post(f"/contracts/{cid}/dispute", json={"argument": argument, "side": side})
+    pubkey = _pubkey_for_side(side)
+    privkey = _privkey_for_side(side)
+    resp = signed_post(client, f"/contracts/{cid}/dispute", {
+        "argument": argument, "side": side, "pubkey": pubkey,
+    }, pubkey, privkey)
     assert resp.status_code == 200
     return resp.json()
 
@@ -643,7 +681,7 @@ def _make_tiered_app(rulings=None):
     store = ContractStore(":memory:")
     escrow_mgr = EscrowManager(":memory:")
     reputation_mgr = ReputationManager(":memory:")
-    app = create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, court=court)
+    app = create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, court=court, server_privkey=SERVER_PRIV)
     return app, store, escrow_mgr, court
 
 
@@ -727,7 +765,9 @@ def test_tiered_supreme_is_final():
     assert escrow["resolved"] is True
 
     # No further disputes allowed
-    resp = client.post(f"/contracts/{cid}/dispute", json={"argument": "again", "side": "agent"})
+    resp = signed_post(client, f"/contracts/{cid}/dispute", {
+        "argument": "again", "side": "agent", "pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 409
 
 
@@ -746,7 +786,9 @@ def test_tiered_only_loser_can_appeal():
     _file_dispute(client, cid, "bad", "principal")
 
     # Principal tries to appeal (but principal won!) -> should fail
-    resp = client.post(f"/contracts/{cid}/dispute", json={"argument": "appeal anyway", "side": "principal"})
+    resp = signed_post(client, f"/contracts/{cid}/dispute", {
+        "argument": "appeal anyway", "side": "principal", "pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 409
     assert "losing party" in resp.json()["detail"]
 
@@ -762,9 +804,9 @@ def test_dispute_returns_awaiting_response():
     cid = data["contract_id"]
     _bond_and_accept(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/dispute", json={
-        "argument": "Agent failed", "side": "principal",
-    })
+    resp = signed_post(client, f"/contracts/{cid}/dispute", {
+        "argument": "Agent failed", "side": "principal", "pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "awaiting_response"
@@ -783,14 +825,14 @@ def test_respond_triggers_ruling():
     _bond_and_accept(client, cid)
 
     # File dispute
-    client.post(f"/contracts/{cid}/dispute", json={
-        "argument": "Agent was lazy", "side": "principal",
-    })
+    signed_post(client, f"/contracts/{cid}/dispute", {
+        "argument": "Agent was lazy", "side": "principal", "pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
 
     # Agent responds
-    resp = client.post(f"/contracts/{cid}/respond", json={
-        "argument": "I tried my best, the task was impossible", "side": "agent",
-    })
+    resp = signed_post(client, f"/contracts/{cid}/respond", {
+        "argument": "I tried my best, the task was impossible", "side": "agent", "pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 200
     body = resp.json()
     assert "outcome" in body
@@ -807,13 +849,13 @@ def test_respond_wrong_side_rejected():
     cid = data["contract_id"]
     _bond_and_accept(client, cid)
 
-    client.post(f"/contracts/{cid}/dispute", json={
-        "argument": "bad agent", "side": "principal",
-    })
+    signed_post(client, f"/contracts/{cid}/dispute", {
+        "argument": "bad agent", "side": "principal", "pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
 
-    resp = client.post(f"/contracts/{cid}/respond", json={
-        "argument": "responding to myself", "side": "principal",
-    })
+    resp = signed_post(client, f"/contracts/{cid}/respond", {
+        "argument": "responding to myself", "side": "principal", "pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 400
 
 
@@ -826,9 +868,9 @@ def test_respond_no_pending_dispute():
     cid = data["contract_id"]
     _bond_and_accept(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/respond", json={
-        "argument": "nothing to respond to", "side": "agent",
-    })
+    resp = signed_post(client, f"/contracts/{cid}/respond", {
+        "argument": "nothing to respond to", "side": "agent", "pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 409
 
 
@@ -842,15 +884,17 @@ def test_dispute_in_absentia():
     _bond_and_accept(client, cid)
 
     # File dispute
-    client.post(f"/contracts/{cid}/dispute", json={
-        "argument": "Agent failed", "side": "principal",
-    })
+    signed_post(client, f"/contracts/{cid}/dispute", {
+        "argument": "Agent failed", "side": "principal", "pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
 
     # Manually expire the deadline by patching the transcript
     transcript = store.get(cid)["transcript"]
     for msg in transcript:
         if msg.get("type") == "dispute_filed":
-            msg["response_deadline"] = time.time() - 1  # expired
+            # Chain entries store data in msg["data"]
+            msg_data = msg.get("data", msg)
+            msg_data["response_deadline"] = time.time() - 1  # expired
     store.db.execute(
         "UPDATE contracts SET transcript = ? WHERE id = ?",
         (__import__("json").dumps(transcript), cid),
@@ -858,9 +902,9 @@ def test_dispute_in_absentia():
     store.db.commit()
 
     # Re-call dispute -- should trigger in absentia ruling
-    resp = client.post(f"/contracts/{cid}/dispute", json={
-        "argument": "Agent failed", "side": "principal",
-    })
+    resp = signed_post(client, f"/contracts/{cid}/dispute", {
+        "argument": "Agent failed", "side": "principal", "pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
     body = resp.json()
     assert "outcome" in body
@@ -880,9 +924,9 @@ def test_dispute_status_endpoint():
     assert resp.json()["status"] == "no_pending_dispute"
 
     # File dispute
-    client.post(f"/contracts/{cid}/dispute", json={
-        "argument": "bad agent", "side": "principal",
-    })
+    signed_post(client, f"/contracts/{cid}/dispute", {
+        "argument": "bad agent", "side": "principal", "pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
 
     resp = client.get(f"/contracts/{cid}/dispute_status")
     body = resp.json()

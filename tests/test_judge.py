@@ -107,22 +107,24 @@ class TestParseRuling:
         assert r.outcome == "evil_agent"
         assert r.reasoning == "Sabotage"
 
-    def test_invalid_json_returns_canceled(self):
+    def test_invalid_json_returns_impossible(self):
+        """Parse failure -> impossible (no penalty to either side), not canceled."""
         raw = "I have no idea what format you want"
         r = AIJudge._parse_ruling(raw)
-        assert r.outcome == "canceled"
+        assert r.outcome == "impossible"
         assert "Could not parse" in r.reasoning
 
-    def test_invalid_outcome_in_json_defaults_to_canceled(self):
+    def test_invalid_outcome_in_json_defaults_to_impossible(self):
+        """Invalid outcome -> impossible (judge malfunction), not canceled."""
         raw = '{"outcome": "maybe", "reasoning": "unsure"}'
         r = AIJudge._parse_ruling(raw)
-        assert r.outcome == "canceled"
+        assert r.outcome == "impossible"
 
-    def test_missing_fields_use_defaults(self):
+    def test_missing_fields_returns_impossible(self):
+        """Empty JSON -> impossible (no valid outcome), not canceled."""
         raw = "{}"
         r = AIJudge._parse_ruling(raw)
-        assert r.outcome == "canceled"
-        assert r.reasoning == "No reasoning provided"
+        assert r.outcome == "impossible"
 
 
 # --- AIJudge.rule ---

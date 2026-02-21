@@ -137,7 +137,7 @@ async def test_dispute(fix_client, mock_transport):
     assert result["outcome"] == "fulfilled"
     assert mock_transport.calls[-1] == (
         "POST", "/contracts/c1/dispute",
-        {"argument": "agent cheated", "side": "principal"},
+        {"argument": "agent cheated", "side": "principal", "pubkey": ""},
     )
 
 
@@ -178,7 +178,7 @@ async def test_submit_investigation_result(fix_client, mock_transport):
     result = await fix_client.submit_investigation_result("c1", "ls", "file.txt")
     assert mock_transport.calls[-1] == (
         "POST", "/contracts/c1/result",
-        {"command": "ls", "output": "file.txt"},
+        {"command": "ls", "output": "file.txt", "principal_pubkey": ""},
     )
 
 
@@ -203,12 +203,24 @@ def test_http_transport_strips_trailing_slash():
 
 def test_http_transport_headers():
     t = HTTPTransport(api_key="mykey")
-    headers = t._headers()
+    headers = t._headers("GET", "/test")
     assert headers["Authorization"] == "Bearer mykey"
     assert headers["Content-Type"] == "application/json"
 
 
 def test_http_transport_headers_no_key():
     t = HTTPTransport()
-    headers = t._headers()
+    headers = t._headers("GET", "/test")
     assert "Authorization" not in headers
+
+
+def test_http_transport_ed25519_auth():
+    """HTTPTransport includes Ed25519 auth headers when privkey is provided."""
+    from crypto import generate_ed25519_keypair
+    priv, pub = generate_ed25519_keypair()
+    t = HTTPTransport(privkey_bytes=priv)
+    headers = t._headers("POST", "/test", "body")
+    assert "X-Fix-Signature" in headers
+    assert "X-Fix-Timestamp" in headers
+    assert "X-Fix-Pubkey" in headers
+    assert headers["X-Fix-Pubkey"] == pub.hex()

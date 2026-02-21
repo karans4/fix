@@ -1,7 +1,8 @@
 """Tests for server/app.py endpoints."""
 
-import sys, os
+import sys, os, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.dirname(__file__))
 
 import pytest
 from starlette.testclient import TestClient
@@ -9,6 +10,21 @@ from server.app import create_app
 from server.store import ContractStore
 from server.escrow import EscrowManager
 from server.reputation import ReputationManager
+from crypto import generate_ed25519_keypair, pubkey_to_fix_id
+from conftest import (
+    signed_post, PRINCIPAL_PUBKEY, AGENT_PUBKEY,
+    PRINCIPAL_PRIV, AGENT_PRIV, AGENT_PUB_HEX, PRINCIPAL_PUB_HEX,
+    SERVER_PRIV,
+)
+
+# Ad-hoc keypairs for tests that need extra identities
+_a2_priv, _a2_pub = generate_ed25519_keypair()
+AGENT2_PUBKEY = pubkey_to_fix_id(_a2_pub)
+AGENT2_PRIV = _a2_priv
+
+_x_priv, _x_pub = generate_ed25519_keypair()
+X_PUBKEY = pubkey_to_fix_id(_x_pub)
+X_PRIV = _x_priv
 
 
 SAMPLE_CONTRACT = {
@@ -29,7 +45,7 @@ def app():
     store = ContractStore(":memory:")
     escrow_mgr = EscrowManager(":memory:")
     reputation_mgr = ReputationManager(":memory:")
-    return create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr)
+    return create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, server_privkey=SERVER_PRIV)
 
 
 @pytest.fixture
@@ -39,19 +55,19 @@ def client(app):
 
 def _create_contract(client, contract=None):
     """Helper: post a contract, return response JSON."""
-    resp = client.post("/contracts", json={
+    resp = signed_post(client, "/contracts", {
         "contract": contract or SAMPLE_CONTRACT,
-        "principal_pubkey": "principal_abc",
-    })
+        "principal_pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
     return resp.json()
 
 
-def _accept_contract(client, contract_id, agent="agent_xyz"):
-    """Helper: accept a contract."""
-    resp = client.post(f"/contracts/{contract_id}/accept", json={
-        "agent_pubkey": agent,
-    })
+def _accept_contract(client, contract_id, agent_pubkey=AGENT_PUBKEY, agent_priv=AGENT_PRIV):
+    """Helper: accept a contract via signed request."""
+    path = f"/contracts/{contract_id}/accept"
+    data = {"agent_pubkey": agent_pubkey}
+    resp = signed_post(client, path, data, agent_pubkey, agent_priv)
     assert resp.status_code == 200
     return resp.json()
 
@@ -119,7 +135,7 @@ def test_accept_contract(client):
     # Verify status changed in store
     resp = client.get(f"/contracts/{cid}")
     assert resp.json()["status"] == "in_progress"
-    assert resp.json()["agent_pubkey"] == "agent_xyz"
+    assert resp.json()["agent_pubkey"] == AGENT_PUBKEY
 
 
 def test_accept_non_open_contract_409(client):
@@ -128,12 +144,14 @@ def test_accept_non_open_contract_409(client):
     _accept_contract(client, cid)
 
     # Try to accept again -- should 409
-    resp = client.post(f"/contracts/{cid}/accept", json={"agent_pubkey": "agent_2"})
+    path = f"/contracts/{cid}/accept"
+    resp = signed_post(client, path, {"agent_pubkey": AGENT2_PUBKEY}, AGENT2_PUBKEY, AGENT2_PRIV)
     assert resp.status_code == 409
 
 
 def test_accept_nonexistent_404(client):
-    resp = client.post("/contracts/nonexistent/accept", json={"agent_pubkey": "x"})
+    path = "/contracts/nonexistent/accept"
+    resp = signed_post(client, path, {"agent_pubkey": X_PUBKEY}, X_PUBKEY, X_PRIV)
     assert resp.status_code == 404
 
 
@@ -144,10 +162,11 @@ def test_investigate(client):
     cid = data["contract_id"]
     _accept_contract(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/investigate", json={
+    path = f"/contracts/{cid}/investigate"
+    resp = signed_post(client, path, {
         "command": "ls -la",
-        "agent_pubkey": "agent_xyz",
-    })
+        "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 200
     assert resp.json()["status"] == "pending_result"
     assert resp.json()["command"] == "ls -la"
@@ -157,10 +176,11 @@ def test_investigate_wrong_status_409(client):
     data = _create_contract(client)
     cid = data["contract_id"]
     # Contract is "open", not "in_progress"
-    resp = client.post(f"/contracts/{cid}/investigate", json={
+    path = f"/contracts/{cid}/investigate"
+    resp = signed_post(client, path, {
         "command": "ls",
-        "agent_pubkey": "agent_xyz",
-    })
+        "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 409
 
 
@@ -171,10 +191,12 @@ def test_submit_result(client):
     cid = data["contract_id"]
     _accept_contract(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/result", json={
+    path = f"/contracts/{cid}/result"
+    resp = signed_post(client, path, {
         "command": "ls -la",
         "output": "total 0\ndrwxr-xr-x  2 root root 40 Jan  1 00:00 .",
-    })
+        "principal_pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
 
@@ -182,7 +204,7 @@ def test_submit_result(client):
     contract = client.get(f"/contracts/{cid}").json()
     result_msgs = [m for m in contract["transcript"] if m["type"] == "result"]
     assert len(result_msgs) == 1
-    assert result_msgs[0]["output"].startswith("total 0")
+    assert result_msgs[0]["data"]["output"].startswith("total 0")
 
 
 # --- POST /contracts/{id}/fix ---
@@ -192,11 +214,12 @@ def test_submit_fix(client):
     cid = data["contract_id"]
     _accept_contract(client, cid)
 
-    resp = client.post(f"/contracts/{cid}/fix", json={
+    path = f"/contracts/{cid}/fix"
+    resp = signed_post(client, path, {
         "fix": "apt install gcc",
         "explanation": "missing compiler",
-        "agent_pubkey": "agent_xyz",
-    })
+        "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
     assert resp.status_code == 200
     assert resp.json()["status"] == "pending_verification"
 
@@ -204,12 +227,13 @@ def test_submit_fix(client):
 def test_submit_fix_wrong_status_409(client):
     data = _create_contract(client)
     cid = data["contract_id"]
-    # Still "open"
-    resp = client.post(f"/contracts/{cid}/fix", json={
+    # Still "open" — agent not assigned, so 403 (not a party)
+    path = f"/contracts/{cid}/fix"
+    resp = signed_post(client, path, {
         "fix": "echo hi",
-        "agent_pubkey": "agent_xyz",
-    })
-    assert resp.status_code == 409
+        "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
+    assert resp.status_code == 403
 
 
 # --- POST /contracts/{id}/verify ---
@@ -218,15 +242,16 @@ def test_verify_success_fulfills(client):
     data = _create_contract(client)
     cid = data["contract_id"]
     _accept_contract(client, cid)
-    client.post(f"/contracts/{cid}/fix", json={
-        "fix": "apt install gcc", "agent_pubkey": "agent_xyz",
-    })
+    signed_post(client, f"/contracts/{cid}/fix", {
+        "fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
 
-    resp = client.post(f"/contracts/{cid}/verify", json={
+    path = f"/contracts/{cid}/verify"
+    resp = signed_post(client, path, {
         "success": True,
         "explanation": "build passes now",
-        "principal_pubkey": "principal_abc",
-    })
+        "principal_pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
     assert resp.json()["status"] == "fulfilled"
 
@@ -239,15 +264,16 @@ def test_verify_failure_retries(client):
     data = _create_contract(client)
     cid = data["contract_id"]
     _accept_contract(client, cid)
-    client.post(f"/contracts/{cid}/fix", json={
-        "fix": "echo nope", "agent_pubkey": "agent_xyz",
-    })
+    signed_post(client, f"/contracts/{cid}/fix", {
+        "fix": "echo nope", "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
 
-    resp = client.post(f"/contracts/{cid}/verify", json={
+    path = f"/contracts/{cid}/verify"
+    resp = signed_post(client, path, {
         "success": False,
         "explanation": "still broken",
-        "principal_pubkey": "principal_abc",
-    })
+        "principal_pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 200
     assert resp.json()["status"] == "retry"
 
@@ -263,14 +289,14 @@ def test_verify_failure_cancels_after_max_attempts(client):
 
     # Exhaust all 5 attempts
     for i in range(5):
-        client.post(f"/contracts/{cid}/fix", json={
-            "fix": f"echo nope{i}", "agent_pubkey": "agent_xyz",
-        })
-        resp = client.post(f"/contracts/{cid}/verify", json={
+        signed_post(client, f"/contracts/{cid}/fix", {
+            "fix": f"echo nope{i}", "agent_pubkey": AGENT_PUBKEY,
+        }, AGENT_PUBKEY, AGENT_PRIV)
+        resp = signed_post(client, f"/contracts/{cid}/verify", {
             "success": False,
             "explanation": f"still broken attempt {i+1}",
-            "principal_pubkey": "principal_abc",
-        })
+            "principal_pubkey": PRINCIPAL_PUBKEY,
+        }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
 
     assert resp.json()["status"] == "canceled"
     contract = client.get(f"/contracts/{cid}").json()
@@ -281,10 +307,12 @@ def test_verify_resolves_escrow(app, client):
     data = _create_contract(client)
     cid = data["contract_id"]
     _accept_contract(client, cid)
-    client.post(f"/contracts/{cid}/fix", json={
-        "fix": "apt install gcc", "agent_pubkey": "agent_xyz",
-    })
-    client.post(f"/contracts/{cid}/verify", json={"success": True, "principal_pubkey": "principal_abc"})
+    signed_post(client, f"/contracts/{cid}/fix", {
+        "fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
+    signed_post(client, f"/contracts/{cid}/verify", {
+        "success": True, "principal_pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
 
     escrow = app.state.escrow.get(cid)
     assert escrow["resolved"] is True
@@ -304,36 +332,41 @@ def test_reputation_after_fulfillment(client):
     data = _create_contract(client)
     cid = data["contract_id"]
     _accept_contract(client, cid)
-    client.post(f"/contracts/{cid}/fix", json={
-        "fix": "apt install gcc", "agent_pubkey": "agent_xyz",
-    })
-    client.post(f"/contracts/{cid}/verify", json={"success": True, "principal_pubkey": "principal_abc"})
+    signed_post(client, f"/contracts/{cid}/fix", {
+        "fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
+    signed_post(client, f"/contracts/{cid}/verify", {
+        "success": True, "principal_pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
 
-    agent_rep = client.get("/reputation/agent_xyz").json()
+    agent_rep = client.get(f"/reputation/{AGENT_PUBKEY}").json()
     assert agent_rep["as_agent"]["fulfilled"] == 1
 
-    principal_rep = client.get("/reputation/principal_abc").json()
+    principal_rep = client.get(f"/reputation/{PRINCIPAL_PUBKEY}").json()
     assert principal_rep["as_principal"]["fulfilled"] == 1
 
 
 # --- 404 on nonexistent contract for various endpoints ---
 
 def test_result_nonexistent_404(client):
-    resp = client.post("/contracts/nope/result", json={
-        "command": "ls", "output": "hi",
-    })
+    path = "/contracts/nope/result"
+    resp = signed_post(client, path, {
+        "command": "ls", "output": "hi", "principal_pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 404
 
 
 def test_fix_nonexistent_404(client):
-    resp = client.post("/contracts/nope/fix", json={
-        "fix": "echo", "agent_pubkey": "x",
-    })
+    path = "/contracts/nope/fix"
+    resp = signed_post(client, path, {
+        "fix": "echo", "agent_pubkey": X_PUBKEY,
+    }, X_PUBKEY, X_PRIV)
     assert resp.status_code == 404
 
 
 def test_verify_nonexistent_404(client):
-    resp = client.post("/contracts/nope/verify", json={
-        "success": True, "principal_pubkey": "principal_abc",
-    })
+    path = "/contracts/nope/verify"
+    resp = signed_post(client, path, {
+        "success": True, "principal_pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 404

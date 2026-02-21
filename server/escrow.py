@@ -9,10 +9,12 @@ pays the judge. Winner's bond is returned.
 
 import sqlite3
 import json
+import threading
 from decimal import Decimal
 from pathlib import Path
 
 from protocol import DEFAULT_CANCEL_FEE, DEFAULT_JUDGE_FEE, GRACE_PERIOD_SECONDS, PLATFORM_FEE_RATE, PLATFORM_FEE_MIN, Ruling
+from server.nano import validate_nano_address
 
 
 def calculate_fee(bounty: Decimal, fee: Decimal) -> Decimal:
@@ -215,9 +217,11 @@ class EscrowManager:
         self.payment = payment_backend or StubBackend()
         self.db = sqlite3.connect(db_path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
         self._init_db()
 
     def _init_db(self):
+        self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS escrows (
                 contract_id TEXT PRIMARY KEY,
@@ -284,24 +288,47 @@ class EscrowManager:
 
     def set_accounts(self, contract_id: str, principal_account: str = "",
                      agent_account: str = "") -> bool:
-        """Set participant Nano addresses for a contract."""
-        updates = []
-        params = []
-        if principal_account:
-            updates.append("principal_account = ?")
-            params.append(principal_account)
-        if agent_account:
-            updates.append("agent_account = ?")
-            params.append(agent_account)
-        if not updates:
-            return False
-        params.append(contract_id)
-        cursor = self.db.execute(
-            f"UPDATE escrows SET {', '.join(updates)} WHERE contract_id = ?",
-            params,
-        )
-        self.db.commit()
-        return cursor.rowcount > 0
+        """Set participant Nano addresses for a contract.
+        Can only set your own account (enforced by caller in app.py).
+        Cannot change after escrow resolution (defense in depth)."""
+        with self._lock:
+            # Check not already resolved
+            row = self.db.execute(
+                "SELECT resolved FROM escrows WHERE contract_id = ?",
+                (contract_id,),
+            ).fetchone()
+            if not row:
+                return False
+            if row["resolved"]:
+                return False  # Cannot change accounts after resolution
+
+            # Validate Nano addresses
+            if principal_account:
+                valid, err = validate_nano_address(principal_account)
+                if not valid:
+                    raise ValueError(f"Invalid principal Nano address: {err}")
+            if agent_account:
+                valid, err = validate_nano_address(agent_account)
+                if not valid:
+                    raise ValueError(f"Invalid agent Nano address: {err}")
+
+            updates = []
+            params = []
+            if principal_account:
+                updates.append("principal_account = ?")
+                params.append(principal_account)
+            if agent_account:
+                updates.append("agent_account = ?")
+                params.append(agent_account)
+            if not updates:
+                return False
+            params.append(contract_id)
+            cursor = self.db.execute(
+                f"UPDATE escrows SET {', '.join(updates)} WHERE contract_id = ? AND resolved = 0",
+                params,
+            )
+            self.db.commit()
+            return cursor.rowcount > 0
 
     def check_deposit(self, contract_id: str) -> bool:
         """Check if escrow deposit has been received."""
@@ -316,58 +343,99 @@ class EscrowManager:
 
         For disputes: dispute_loser's bond goes to judge, winner's bond returned.
         For voided: everything returned.
+
+        CRITICAL: If payment fails, escrow is NOT marked resolved -- funds stay
+        in escrow for manual recovery. Only marks resolved on successful payment.
         """
-        row = self.db.execute("SELECT * FROM escrows WHERE contract_id = ?", (contract_id,)).fetchone()
-        if not row:
-            raise ValueError(f"No escrow for contract {contract_id}")
+        with self._lock:
+            row = self.db.execute("SELECT * FROM escrows WHERE contract_id = ?", (contract_id,)).fetchone()
+            if not row:
+                raise ValueError(f"No escrow for contract {contract_id}")
 
-        escrow = Escrow(row["bounty"], json.loads(row["terms"]))
-        escrow.locked = bool(row["locked"])
-        escrow.principal_bond_locked = bool(row["principal_bond_locked"])
-        escrow.agent_bond_locked = bool(row["agent_bond_locked"])
+            # Double-resolution guard
+            if row["resolved"]:
+                return json.loads(row["resolution"]) if row["resolution"] else {"error": "already resolved"}
 
-        result = escrow.resolve(
-            ruling, flags=flags,
-            dispute_loser=dispute_loser,
-            judge_account=row["judge_account"],
-            **kwargs,
-        )
+            # Must be locked before resolving
+            if not row["locked"]:
+                raise ValueError(f"Escrow for {contract_id} was never locked")
 
-        # Move funds via payment backend
-        block_hash = None
-        action = result.get("action")
-        bounty = row["bounty"]
-        try:
-            if action == "release_to_agent" and row["agent_account"]:
-                block_hash = self.payment.send(contract_id, row["agent_account"], bounty)
-            elif action == "return_to_principal" and row["principal_account"]:
-                block_hash = self.payment.send(contract_id, row["principal_account"], bounty)
-            elif action == "voided" and row["principal_account"]:
-                # Return bounty to principal
-                block_hash = self.payment.send(contract_id, row["principal_account"], bounty)
+            escrow = Escrow(row["bounty"], json.loads(row["terms"]))
+            escrow.locked = bool(row["locked"])
+            escrow.principal_bond_locked = bool(row["principal_bond_locked"])
+            escrow.agent_bond_locked = bool(row["agent_bond_locked"])
+
+            result = escrow.resolve(
+                ruling, flags=flags,
+                dispute_loser=dispute_loser,
+                judge_account=row["judge_account"],
+                **kwargs,
+            )
+
+            # Calculate actual payment amounts after fee deductions
+            action = result.get("action")
+            bounty = Decimal(row["bounty"])
+            platform_fee = Decimal(result.get("platform_fee_per_side", "0"))
+            # Total platform fee from both sides
+            total_platform_fee = platform_fee * 2
+
+            # Deduct fees from the payout
+            fee_amount = Decimal(result["fee_amount"]) if result.get("fee_amount") else Decimal("0")
+            if action == "release_to_agent":
+                payout = bounty - total_platform_fee
+            elif action == "return_to_principal":
+                payout = bounty - fee_amount - total_platform_fee
+            elif action == "voided":
+                payout = bounty  # No fees on void
             elif action == "send_to_charity":
-                if hasattr(self.payment, 'charity_account') and self.payment.charity_account:
-                    block_hash = self.payment.send(contract_id, self.payment.charity_account, bounty)
+                payout = bounty
+            else:
+                payout = bounty
 
-            # Route dispute bond to judge if applicable
-            if result.get("bond_to_judge") and row["judge_account"]:
-                try:
+            payout = max(payout, Decimal("0"))
+            result["actual_payout"] = str(payout)
+            result["total_platform_fee"] = str(total_platform_fee)
+
+            # Move funds via payment backend
+            block_hash = None
+            try:
+                payout_str = str(payout)
+                if action == "release_to_agent" and row["agent_account"]:
+                    block_hash = self.payment.send(contract_id, row["agent_account"], payout_str)
+                elif action == "return_to_principal" and row["principal_account"]:
+                    block_hash = self.payment.send(contract_id, row["principal_account"], payout_str)
+                elif action == "voided" and row["principal_account"]:
+                    block_hash = self.payment.send(contract_id, row["principal_account"], payout_str)
+                elif action == "send_to_charity":
+                    if hasattr(self.payment, 'charity_account') and self.payment.charity_account:
+                        block_hash = self.payment.send(contract_id, self.payment.charity_account, payout_str)
+
+                # Route dispute bond to judge if applicable
+                if result.get("bond_to_judge") and row["judge_account"]:
                     self.payment.send(contract_id, row["judge_account"], result["bond_to_judge"])
-                except Exception:
-                    result["bond_payment_error"] = "failed to send bond to judge"
 
-        except Exception as e:
-            result["payment_error"] = str(e)
+            except Exception as e:
+                # CRITICAL: Do NOT mark as resolved if payment fails.
+                # Funds stay in escrow for manual recovery.
+                result["payment_error"] = str(e)
+                result["payment_failed"] = True
+                self.db.execute(
+                    "UPDATE escrows SET resolution = ? WHERE contract_id = ?",
+                    (json.dumps(result), contract_id),
+                )
+                self.db.commit()
+                return result
 
-        if block_hash:
-            result["block_hash"] = block_hash
+            if block_hash:
+                result["block_hash"] = block_hash
 
-        self.db.execute(
-            "UPDATE escrows SET resolved = 1, resolution = ? WHERE contract_id = ?",
-            (json.dumps(result), contract_id),
-        )
-        self.db.commit()
-        return result
+            # Payment succeeded -- now mark as resolved
+            self.db.execute(
+                "UPDATE escrows SET resolved = 1, resolution = ? WHERE contract_id = ?",
+                (json.dumps(result), contract_id),
+            )
+            self.db.commit()
+            return result
 
     def get(self, contract_id: str) -> dict | None:
         """Get escrow state for a contract."""
