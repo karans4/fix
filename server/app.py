@@ -538,11 +538,11 @@ def create_app(
 
     @app.post("/contracts/{contract_id}/chat")
     async def chat(contract_id: str, req: ChatMessage):
-        """Send a chat message. Works in any active state (investigating/in_progress/review)."""
+        """Send a chat message. Works in any state except voided/canceled."""
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
-        if data["status"] not in ("investigating", "in_progress", "review"):
+        if data["status"] in ("voided", "canceled"):
             raise HTTPException(409, f"Contract is {data['status']}, chat not available")
         if req.msg_type not in ("ask", "answer", "message"):
             raise HTTPException(400, f"Invalid msg_type: {req.msg_type}")

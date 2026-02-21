@@ -257,16 +257,15 @@ def test_chat_general_message(client):
     assert resp.status_code == 200
 
 
-def test_chat_wrong_status_409(client):
+def test_chat_on_open_ok(client):
     data = _create_contract(client)
     cid = data["contract_id"]
-    # Still open -- chat not available
     resp = client.post(f"/contracts/{cid}/chat", json={
         "message": "hello",
-        "from_side": "agent",
+        "from_side": "principal",
         "msg_type": "message",
     })
-    assert resp.status_code == 409
+    assert resp.status_code == 200
 
 
 def test_chat_invalid_type_400(client):

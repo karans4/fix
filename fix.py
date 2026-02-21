@@ -2063,14 +2063,14 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                             level = len(rulings)
                             if level > 0:
                                 last = rulings[-1]
-                                court = last.get("court", "?")
+                                prev_court = last.get("court", "?")
                                 if last.get("final"):
                                     status(f"{C_RED}!{C_RESET}",
                                            f"Supreme court has ruled. No further appeals.")
                                     continue
                                 next_court = ["district", "appeals", "supreme"][min(level, 2)]
                                 status(f"{C_DIM}\u25b8{C_RESET}",
-                                       f"Appealing {court} court ruling to {next_court} court")
+                                       f"Appealing {prev_court} court ruling to {next_court} court")
                             else:
                                 status(f"{C_DIM}\u25b8{C_RESET}",
                                        "Filing dispute (district court)")
@@ -2083,32 +2083,33 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                             status(f"{C_RED}!{C_RESET}", "Dispute requires a reason")
                             continue
                         try:
+                            status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for judge...")
                             result = await fix_client.dispute(contract_id, arg, side="principal")
                             court = result.get("court", "?")
-                            status(f"{C_BLUE}\u2696{C_RESET}",
-                                   f"Dispute filed ({court} court)")
-                            status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for judge...")
-                            for _ in range(120):
-                                await _asyncio.sleep(1)
-                                d = await fix_client.get_contract(contract_id)
-                                if not d:
-                                    continue
-                                # Show new rulings
-                                t = d.get("transcript", [])
-                                new_rulings = [m for m in t if m.get("type") == "ruling"]
-                                if len(new_rulings) > len(rulings if 'rulings' in dir() else []):
-                                    for r in new_rulings[len(rulings) if 'rulings' in dir() else 0:]:
-                                        _show_chat(r)
-                                    break
-                                if d.get("status") in ("resolved", "voided", "in_progress"):
-                                    break
-                            # Show appeal option if not final
+                            outcome = result.get("outcome", "?")
+                            reasoning = result.get("reasoning", "")
+                            final = result.get("final", False)
+
+                            final_label = " [FINAL]" if final else ""
+                            icon = C_GREEN + "\u2696" + C_RESET if outcome == "fulfilled" else C_RED + "\u2696" + C_RESET
+                            status(icon, f"{court.title()} court ruled: {C_BOLD}{outcome}{C_RESET}{final_label}")
+                            if reasoning:
+                                for line in reasoning.splitlines():
+                                    print(f"  {C_DIM}    {line}{C_RESET}", file=sys.stderr)
+
                             if result.get("can_appeal"):
                                 status(f"{C_YELLOW}\u25b8{C_RESET}",
                                        f"You may appeal to {result['next_court']} court "
                                        f"(fee: {result['next_fee']} XNO)")
+                            elif final:
+                                status(f"{C_DIM}\u25b8{C_RESET}",
+                                       "This ruling is final. No further appeals.")
                         except Exception as e:
-                            status(f"{C_RED}!{C_RESET}", f"Dispute failed: {e}")
+                            err = str(e)
+                            if "409" in err:
+                                status(f"{C_RED}!{C_RESET}", "No further appeals allowed")
+                            else:
+                                status(f"{C_RED}!{C_RESET}", f"Dispute failed: {e}")
 
                     elif choice in ("m", "message", "msg"):
                         try:
