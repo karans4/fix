@@ -28,7 +28,7 @@ _RE_TOKENS = re.compile(
     r'|sk_live_[A-Za-z0-9]{20,}'        # Stripe secret
     r'|pk_live_[A-Za-z0-9]{20,}'        # Stripe publishable
     r'|rk_live_[A-Za-z0-9]{20,}'        # Stripe restricted
-    r'|AKIA[A-Z0-9]{16}'                # AWS access key
+    r'|AKIA[A-Z0-9]{16}(?:/[A-Za-z0-9/+]{20,})?' # AWS access key (+ optional secret)
     r'|AIza[A-Za-z0-9_-]{35}'           # Google API key
     r'|ya29\.[A-Za-z0-9_-]+'            # Google OAuth token
     r'|SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}'  # SendGrid
