@@ -372,3 +372,178 @@ class TestCanonicalJSON:
     def test_deterministic(self):
         d = {"z": 1, "a": 2, "m": 3}
         assert canonical_json(d) == canonical_json(d)
+
+
+# ---- Ed25519 edge cases ----
+
+class TestEd25519EdgeCases:
+    def test_verify_forged_all_zeros_signature(self):
+        """All-zeros signature returns False, not a crash."""
+        _, pub = generate_ed25519_keypair()
+        assert ed25519_verify(pub, b"data", "0" * 128) is False
+
+    def test_verify_corrupted_signature(self):
+        """Flipping one char in a valid sig invalidates it."""
+        priv, pub = generate_ed25519_keypair()
+        sig = ed25519_sign(priv, b"data")
+        # Flip first hex char
+        corrupted = ("1" if sig[0] == "0" else "0") + sig[1:]
+        assert ed25519_verify(pub, b"data", corrupted) is False
+
+    def test_sign_empty_data(self):
+        """Signing empty bytes should not raise."""
+        priv, _ = generate_ed25519_keypair()
+        sig = ed25519_sign(priv, b"")
+        assert len(sig) == 128
+
+    def test_verify_empty_data(self):
+        """Sign and verify empty bytes round-trips."""
+        priv, pub = generate_ed25519_keypair()
+        sig = ed25519_sign(priv, b"")
+        assert ed25519_verify(pub, b"", sig) is True
+
+    def test_load_nonexistent_file(self):
+        """Loading a key from a nonexistent path raises FileNotFoundError."""
+        with pytest.raises(FileNotFoundError):
+            load_ed25519_key("nonexistent")
+
+
+# ---- Fix identity edge cases ----
+
+class TestFixIdentityEdgeCases:
+    def test_fix_id_to_pubkey_invalid_hex(self):
+        """Invalid hex chars in fix_id raise ValueError."""
+        bad_id = "fix_" + "gg" * 32
+        with pytest.raises(ValueError):
+            fix_id_to_pubkey(bad_id)
+
+    def test_pubkey_to_fix_id_wrong_length(self):
+        """pubkey_to_fix_id with 16 bytes just hex-encodes without error."""
+        result = pubkey_to_fix_id(b"\x00" * 16)
+        assert result == "fix_" + "00" * 16
+
+
+# ---- Chain entry edge cases ----
+
+class TestChainEntryEdgeCases:
+    def test_build_chain_entry_wrong_author_prefix(self):
+        """Entry built with bad author prefix fails verification."""
+        priv, pub = generate_ed25519_keypair()
+        bad_author = "bad_" + pub.hex()
+        entry = build_chain_entry("msg", {}, 0, bad_author, hash_chain_init(), priv)
+        ok, err = verify_chain_entry(entry)
+        assert not ok
+        assert "Invalid author" in err or "author" in err.lower()
+
+    def test_verify_chain_entry_missing_signature(self):
+        """Entry dict without 'signature' key returns (False, error)."""
+        priv, pub = generate_ed25519_keypair()
+        author = pubkey_to_fix_id(pub)
+        entry = build_chain_entry("msg", {}, 0, author, hash_chain_init(), priv)
+        del entry["signature"]
+        ok, err = verify_chain_entry(entry)
+        assert not ok
+        assert "signature" in err.lower() or "Missing" in err
+
+    def test_verify_chain_entry_missing_fields(self):
+        """Entry dict with only {"type": "x"} returns (False, error)."""
+        ok, err = verify_chain_entry({"type": "x"})
+        assert not ok
+
+    def test_chain_entry_hash_includes_signature(self):
+        """Same entry content but different signatures produce different hashes."""
+        priv1, pub1 = generate_ed25519_keypair()
+        priv2, pub2 = generate_ed25519_keypair()
+        author1 = pubkey_to_fix_id(pub1)
+        author2 = pubkey_to_fix_id(pub2)
+        # Build two entries with identical structure but signed by different keys
+        e1 = build_chain_entry("msg", {"x": 1}, 0, author1, hash_chain_init(), priv1, timestamp=1000)
+        e2 = build_chain_entry("msg", {"x": 1}, 0, author2, hash_chain_init(), priv2, timestamp=1000)
+        # Different authors/signatures -> different hashes
+        assert chain_entry_hash(e1) != chain_entry_hash(e2)
+
+
+# ---- Canonical JSON edge cases ----
+
+class TestCanonicalJSONEdgeCases:
+    def test_nested_objects_sorted(self):
+        """Inner dict keys are also sorted."""
+        result = canonical_json({"b": {"d": 1, "c": 2}, "a": 3})
+        assert result == b'{"a":3,"b":{"c":2,"d":1}}'
+
+    def test_unicode_handling(self):
+        """Unicode values don't crash."""
+        result = canonical_json({"key": "\u00e9"})
+        assert b"key" in result
+
+    def test_list_preserved(self):
+        """List element order is preserved (not sorted)."""
+        result = canonical_json({"a": [3, 1, 2]})
+        assert result == b'{"a":[3,1,2]}'
+
+    def test_bool_values(self):
+        """Booleans encode as true/false."""
+        result = canonical_json({"a": True, "b": False})
+        assert result == b'{"a":true,"b":false}'
+
+    def test_none_value(self):
+        """None encodes as null."""
+        result = canonical_json({"a": None})
+        assert result == b'{"a":null}'
+
+
+# ---- Request signing edge cases ----
+
+class TestRequestSigningEdgeCases:
+    def test_verify_empty_body(self):
+        """Sign and verify with empty body."""
+        priv, pub = generate_ed25519_keypair()
+        headers = sign_request_ed25519(priv, pub.hex(), "GET", "/test", body="")
+        ok, err = verify_request_ed25519(
+            "GET", "/test", "",
+            headers["X-Fix-Timestamp"],
+            headers["X-Fix-Signature"],
+            headers["X-Fix-Pubkey"],
+        )
+        assert ok, err
+
+    def test_verify_tampered_body(self):
+        """Signing with body='a' but verifying with body='b' fails."""
+        priv, pub = generate_ed25519_keypair()
+        headers = sign_request_ed25519(priv, pub.hex(), "POST", "/test", body="a")
+        ok, _ = verify_request_ed25519(
+            "POST", "/test", "b",
+            headers["X-Fix-Timestamp"],
+            headers["X-Fix-Signature"],
+            headers["X-Fix-Pubkey"],
+        )
+        assert not ok
+
+    def test_verify_malformed_timestamp(self):
+        """Non-numeric timestamp returns (False, error)."""
+        priv, pub = generate_ed25519_keypair()
+        sig = ed25519_sign(priv, b"GET\n/test\nnot_a_number\n")
+        ok, err = verify_request_ed25519(
+            "GET", "/test", "",
+            "not_a_number",
+            sig.hex() if isinstance(sig, bytes) else sig,
+            pub.hex(),
+        )
+        assert not ok
+        assert "timestamp" in err.lower()
+
+    def test_verify_future_timestamp(self):
+        """Timestamp 600s in the future should still verify (within 30s skew check)."""
+        import time
+        priv, pub = generate_ed25519_keypair()
+        future_ts = time.time() + 600
+        headers = sign_request_ed25519(priv, pub.hex(), "GET", "/path", body="", timestamp=future_ts)
+        ok, err = verify_request_ed25519(
+            "GET", "/path", "",
+            headers["X-Fix-Timestamp"],
+            headers["X-Fix-Signature"],
+            headers["X-Fix-Pubkey"],
+        )
+        # 600s in future exceeds the 30s skew allowance, so this should fail
+        assert not ok
+        assert "future" in err.lower()

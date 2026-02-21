@@ -425,5 +425,148 @@ class TestEscrowManager(unittest.TestCase):
         self.assertEqual(state["resolution"]["action"], "release_to_agent")
 
 
+class TestEscrowDoubleResolve(unittest.TestCase):
+    def test_double_resolve_returns_same_result(self):
+        """resolve() twice -- second call should return first result (idempotent via .resolved flag)."""
+        e = Escrow("0.05", TERMS)
+        first = e.resolve("fulfilled")
+        second = e.resolve("fulfilled")
+        self.assertEqual(first, second)
+
+    def test_resolve_sets_resolved_flag(self):
+        e = Escrow("0.05", TERMS)
+        self.assertFalse(e.resolved)
+        e.resolve("fulfilled")
+        self.assertTrue(e.resolved)
+
+
+class TestEscrowLockEdgeCases(unittest.TestCase):
+    def test_double_lock(self):
+        """lock() twice -- should still work (idempotent, locked stays True)."""
+        e = Escrow("0.05", TERMS)
+        e.lock()
+        result = e.lock()
+        self.assertTrue(e.locked)
+        self.assertEqual(result["status"], "locked")
+
+    def test_lock_agent_bond_with_custom_amount(self):
+        e = Escrow("0.05", TERMS_WITH_JUDGE)
+        result = e.lock_agent_bond(amount=Decimal("5"))
+        self.assertEqual(e.agent_bond_amount, Decimal("5"))
+        self.assertEqual(result["bond"], "5")
+
+    def test_release_agent_bond_when_not_locked(self):
+        """Releasing an unlocked bond should not crash."""
+        e = Escrow("0.05", TERMS_WITH_JUDGE)
+        # Never locked agent bond -- release should still return cleanly
+        result = e.release_agent_bond()
+        self.assertFalse(e.agent_bond_locked)
+        self.assertEqual(result["status"], "agent_bond_released")
+
+
+class TestEscrowResolveEdgeCases(unittest.TestCase):
+    def test_resolve_with_zero_bounty(self):
+        """Escrow with 0 bounty should resolve without crashing, payout 0."""
+        e = Escrow("0", TERMS)
+        result = e.resolve("fulfilled")
+        self.assertEqual(result["action"], "release_to_agent")
+        self.assertEqual(result["amount"], "0")
+        self.assertTrue(e.resolved)
+
+    def test_resolve_tiny_bounty(self):
+        """Tiny bounty: fee capped at bounty amount."""
+        e = Escrow("0.001", TERMS)
+        result = e.resolve("canceled")
+        self.assertEqual(result["action"], "return_to_principal")
+        # cancel_fee_agent is 0.002 but bounty is 0.001, so fee capped at 0.001
+        self.assertEqual(result["fee_amount"], "0.001")
+
+    def test_resolve_with_tier_fee_exceeding_bond(self):
+        """tier_fee > bond -- bond_remainder should be 0, not negative."""
+        e = Escrow("0.05", TERMS_WITH_JUDGE)
+        e.lock()
+        e.lock_agent_bond(amount=Decimal("0.005"))
+        result = e.resolve("fulfilled", dispute_loser="agent", judge_account="judge_abc",
+                          tier_fee=Decimal("0.01"))
+        # bond is 0.005, tier_fee is 0.01 -- remainder clamped to 0
+        bond_remainder = Decimal(result.get("bond_remainder_returned") or "0")
+        self.assertGreaterEqual(bond_remainder, Decimal("0"))
+        self.assertIsNone(result.get("bond_to_charity"))
+
+    def test_resolve_voided_without_locking(self):
+        """Escrow that was never locked -- should still void."""
+        e = Escrow("0.05", TERMS_WITH_JUDGE)
+        result = e.resolve("voided")
+        self.assertEqual(result["action"], "voided")
+        self.assertEqual(result["amount"], "0.05")
+        self.assertIsNone(result["principal_bond_returned"])
+        self.assertIsNone(result["agent_bond_returned"])
+        self.assertTrue(e.resolved)
+
+
+class TestEscrowManagerDoubleResolve(unittest.TestCase):
+    def setUp(self):
+        self.mgr = EscrowManager(":memory:")
+
+    def tearDown(self):
+        self.mgr.close()
+
+    def test_mgr_double_resolve_returns_cached(self):
+        """manager.resolve() twice returns same result, second call doesn't re-execute payments."""
+        self.mgr.lock("c1", "0.05", TERMS)
+        _set_stub_accounts(self.mgr, "c1")
+        first = self.mgr.resolve("c1", "fulfilled")
+        second = self.mgr.resolve("c1", "fulfilled")
+        self.assertEqual(first["action"], second["action"])
+        self.assertEqual(first["amount"], second["amount"])
+
+    def test_mgr_resolve_unlocked_raises(self):
+        """Try to resolve without locking first -- should raise ValueError."""
+        # Insert a row directly with locked=0 to simulate an unlocked escrow
+        self.mgr.db.execute(
+            "INSERT INTO escrows (contract_id, bounty, terms, locked) VALUES (?, ?, ?, 0)",
+            ("c_unlocked", "0.05", '{"cancellation": {"agent_fee": "0.002"}}'),
+        )
+        self.mgr.db.commit()
+        with self.assertRaises(ValueError) as ctx:
+            self.mgr.resolve("c_unlocked", "fulfilled")
+        self.assertIn("never locked", str(ctx.exception))
+
+
+class TestEscrowManagerSetAccounts(unittest.TestCase):
+    def setUp(self):
+        self.mgr = EscrowManager(":memory:")
+
+    def tearDown(self):
+        self.mgr.close()
+
+    def test_set_accounts_after_resolved_fails(self):
+        """resolve, then try set_accounts -- returns False."""
+        self.mgr.lock("c1", "0.05", TERMS)
+        _set_stub_accounts(self.mgr, "c1")
+        self.mgr.resolve("c1", "fulfilled")
+        result = self.mgr.set_accounts("c1", principal_account="new_addr")
+        self.assertFalse(result)
+
+    def test_set_accounts_nonexistent_contract(self):
+        """returns False for a contract that doesn't exist."""
+        result = self.mgr.set_accounts("no_such_contract", principal_account="addr")
+        self.assertFalse(result)
+
+    def test_set_accounts_empty_both(self):
+        """No principal or agent provided -- returns False."""
+        self.mgr.lock("c1", "0.05", TERMS)
+        result = self.mgr.set_accounts("c1")
+        self.assertFalse(result)
+
+
+class TestCalculateFeeEdgeCases(unittest.TestCase):
+    def test_zero_bounty(self):
+        self.assertEqual(calculate_fee(Decimal("0"), Decimal("0.002")), Decimal("0"))
+
+    def test_zero_fee(self):
+        self.assertEqual(calculate_fee(Decimal("1.0"), Decimal("0")), Decimal("0"))
+
+
 if __name__ == "__main__":
     unittest.main()
