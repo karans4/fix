@@ -168,7 +168,7 @@ def build_contract(command, stderr, env_info, **kwargs):
 
     # Market mode: add escrow + terms
     if market:
-        bounty_str = str(bounty) if bounty else "0.01"
+        bounty_str = str(bounty) if bounty else "0.05"
         contract["escrow"] = {
             "bounty": bounty_str,
             "currency": "XNO",

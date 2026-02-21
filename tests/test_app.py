@@ -903,10 +903,10 @@ def test_platform_fee_in_resolution():
 
 
 def test_platform_fee_minimum():
-    """Platform fee floors at 0.005 XNO for tiny bounties."""
+    """Platform fee floors at 0.002 XNO for tiny bounties."""
     from server.escrow import Escrow
-    escrow = Escrow("0.01", {"judge_fee": "0.21"})
+    escrow = Escrow("0.01", {"judge_fee": "0.17"})
     escrow.lock()
     result = escrow.resolve("fulfilled")
-    # 10% of 0.01 = 0.001, but min is 0.005
-    assert Decimal(result["platform_fee_per_side"]) == Decimal("0.005")
+    # 10% of 0.01 = 0.001, but min is 0.002
+    assert Decimal(result["platform_fee_per_side"]) == Decimal("0.002")

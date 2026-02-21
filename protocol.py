@@ -10,11 +10,11 @@ from enum import Enum
 
 PROTOCOL_VERSION = 2
 
-DEFAULT_BOUNTY = "0.1"
+DEFAULT_BOUNTY = "0.05"
 DEFAULT_CURRENCY = "XNO"
 DEFAULT_CHAIN = "nano"
-DEFAULT_CANCEL_FEE = "0.01"
-MINIMUM_BOUNTY = "0.1"
+DEFAULT_CANCEL_FEE = "0.005"
+MINIMUM_BOUNTY = "0.05"
 GRACE_PERIOD_SECONDS = 30
 ABANDONMENT_TIMEOUT = 120
 MAX_INVESTIGATION_ROUNDS = 5
@@ -29,14 +29,14 @@ MODE_AUTONOMOUS = "autonomous"
 DEFAULT_REVIEW_WINDOW = 7200  # 2 hours
 
 # Judge defaults
-DEFAULT_JUDGE_FEE = "0.21"  # XNO -- each side stakes this as dispute bond
+DEFAULT_JUDGE_FEE = "0.17"  # XNO -- each side stakes this as dispute bond
 DEFAULT_RULING_TIMEOUT = 60  # seconds judge has to rule
 
 # Tiered court system: escalating models and fees
 COURT_TIERS = [
     {"name": "district",  "model": "claude-haiku-4-5-20251001", "fee": "0.02"},
-    {"name": "appeals",   "model": "claude-haiku-4-5-20251001", "fee": "0.04"},
-    {"name": "supreme",   "model": "claude-opus-4-6",           "fee": "0.15"},
+    {"name": "appeals",   "model": "claude-haiku-4-5-20251001", "fee": "0.05"},
+    {"name": "supreme",   "model": "claude-opus-4-6",           "fee": "0.10"},
 ]
 MAX_DISPUTE_LEVEL = len(COURT_TIERS) - 1  # supreme is final
 # Bond = sum of all tier fees (covers worst-case full appeal)
@@ -45,7 +45,7 @@ DISPUTE_BOND = str(sum(Decimal(t["fee"]) for t in COURT_TIERS))  # "0.21"
 # Platform fee: percentage of bounty from BOTH sides on every resolution
 # Covers platform costs (agent LLM, hosting). Non-refundable.
 PLATFORM_FEE_RATE = Decimal("0.10")  # 10% of bounty per side
-PLATFORM_FEE_MIN = Decimal("0.005")  # XNO minimum per side
+PLATFORM_FEE_MIN = Decimal("0.002")  # XNO minimum per side
 
 # Response window: seconds the other side has to counter-argue in a dispute
 DISPUTE_RESPONSE_WINDOW = 30  # seconds
