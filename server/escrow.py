@@ -12,7 +12,7 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
-from protocol import DEFAULT_CANCEL_FEE, DEFAULT_JUDGE_FEE, GRACE_PERIOD_SECONDS, PLATFORM_FEE, Ruling
+from protocol import DEFAULT_CANCEL_FEE, DEFAULT_JUDGE_FEE, GRACE_PERIOD_SECONDS, PLATFORM_FEE_RATE, PLATFORM_FEE_MIN, Ruling
 
 
 def calculate_fee(bounty: Decimal, fee: Decimal) -> Decimal:
@@ -146,8 +146,10 @@ class Escrow:
             result["bond_to_judge"] = None
             result["judge_account"] = None
             result["bond_returned_to"] = None
-        # Platform fee: deducted from both sides on every resolution
-        result["platform_fee_per_side"] = PLATFORM_FEE
+        # Platform fee: 10% of bounty per side, min 0.005 XNO
+        bounty = Decimal(result.get("amount", "0"))
+        fee = max(bounty * PLATFORM_FEE_RATE, PLATFORM_FEE_MIN)
+        result["platform_fee_per_side"] = str(fee)
 
     def _void(self) -> dict:
         """Judge didn't show. Everything returned: bounty to principal, both bonds returned."""

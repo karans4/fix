@@ -28,7 +28,7 @@ from server.judge import AIJudge, TieredCourt, Evidence, JudgeRuling
 from protocol import (
     DEFAULT_REVIEW_WINDOW, DEFAULT_INVESTIGATION_RATE, DEFAULT_RULING_TIMEOUT,
     MODE_SUPERVISED, MODE_AUTONOMOUS, COURT_TIERS, MAX_DISPUTE_LEVEL,
-    DISPUTE_RESPONSE_WINDOW, PLATFORM_FEE,
+    DISPUTE_RESPONSE_WINDOW, PLATFORM_FEE_RATE, PLATFORM_FEE_MIN, MINIMUM_BOUNTY,
 )
 
 
@@ -249,6 +249,9 @@ PARTIES
        Appeals court:   {COURT_TIERS[1]['fee']} {cur}  (thorough review)
        Supreme court:   {COURT_TIERS[2]['fee']} {cur}  (FINAL, no appeal)
 
+     Platform fee: 10% of bounty per side (min 0.005 {cur}).
+     Deducted from both parties on every resolution.
+
      Fee paid by the losing party from their dispute bond.
      The prevailing party's bond is returned in full.
      Only the loser of the previous ruling may appeal.
@@ -376,6 +379,14 @@ def create_app(
     async def post_contract(req: PostContractRequest):
         """Post a new contract and lock escrow. Principal's bond locked upfront."""
         contract = req.contract
+
+        # Enforce minimum bounty
+        escrow_data = contract.get("escrow", {})
+        if escrow_data.get("bounty"):
+            bounty = Decimal(escrow_data["bounty"])
+            if bounty < Decimal(MINIMUM_BOUNTY):
+                raise HTTPException(400, f"Bounty {bounty} below minimum {MINIMUM_BOUNTY} XNO")
+
         contract_id = _store.create(contract, req.principal_pubkey)
 
         # Lock escrow if contract has escrow terms

@@ -11,3 +11,4 @@ demo_judge.py
 sandbox/cow.c
 sandbox/*.so
 .fix.py
+config.py

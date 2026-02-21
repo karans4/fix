@@ -14,11 +14,16 @@ from server.store import ContractStore
 from server.escrow import EscrowManager
 from server.reputation import ReputationManager
 from server.judge import AIJudge, TieredCourt
+from protocol import MINIMUM_BOUNTY, AGENT_PICKUP_DELAY
+from decimal import Decimal
 
 API_KEY = os.environ.get("FIX_API_KEY", "")
 MODEL = os.environ.get("FIX_MODEL", "claude-haiku-4-5-20251001")
 AGENT_MODEL = os.environ.get("FIX_AGENT_MODEL", "claude-haiku-4-5-20251001")
 DB_PATH = os.environ.get("FIX_DB", "/var/lib/fix/fix.db")
+KIMI_KEY = os.environ.get("KIMI_API_KEY", "")
+KIMI_BASE = os.environ.get("KIMI_BASE_URL", "https://api.moonshot.ai/v1")
+KIMI_MODEL = os.environ.get("KIMI_MODEL", "kimi-k2.5")
 PORT = int(os.environ.get("FIX_PORT", "8000"))
 
 if not API_KEY:
@@ -67,6 +72,55 @@ def agent_llm_call(prompt):
     return resp.json()["content"][0]["text"]
 
 
+def kimi_llm_call(prompt, model=None):
+    """OpenAI-compatible call to Kimi (or any OpenAI-compat endpoint)."""
+    if not KIMI_KEY:
+        return agent_llm_call(prompt)  # fallback to Claude
+    use_model = model or KIMI_MODEL
+    resp = httpx.post(
+        f"{KIMI_BASE}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {KIMI_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": use_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1024,
+        },
+        timeout=60,
+    )
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+async def kimi_judge_call(system_prompt, user_prompt, model=None):
+    """Async OpenAI-compatible call for judges. Falls back to Claude if no Kimi key."""
+    if not KIMI_KEY:
+        return await judge_llm_call(system_prompt, user_prompt, model=model)
+    use_model = model or KIMI_MODEL
+    # For supreme court, always use Claude Opus
+    if model and "opus" in model:
+        return await judge_llm_call(system_prompt, user_prompt, model=model)
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{KIMI_BASE}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {KIMI_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": use_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "max_tokens": 1024,
+            },
+            timeout=60,
+        )
+        return resp.json()["choices"][0]["message"]["content"]
+
+
 def _parse_llm_json(raw):
     """Extract JSON from LLM response (strips markdown fences)."""
     text = raw.strip()
@@ -98,9 +152,42 @@ def run_free_agent(store, escrow_mgr):
         time.sleep(POLL_INTERVAL)
         try:
             # --- Phase 1: Pick up new contracts, start investigating ---
-            contracts = store.list_by_status("open", limit=1)
-            if contracts:
-                c = contracts[0]
+            contracts = store.list_by_status("open", limit=5)
+            c = None
+            for candidate in contracts:
+                contract = candidate.get("contract", {})
+                bounty = Decimal(contract.get("escrow", {}).get("bounty", "0"))
+                min_bounty = Decimal(MINIMUM_BOUNTY)
+                
+                # Reject below minimum
+                if bounty < min_bounty:
+                    print(f"[agent] Rejecting {candidate['id']}: bounty {bounty} < min {min_bounty}")
+                    continue
+                
+                # Estimate complexity from error
+                task = contract.get("task", {})
+                error = task.get("error", "")
+                # Simple heuristic: long errors or segfaults need higher bounty
+                complexity = 1
+                if len(error) > 500:
+                    complexity = 2
+                if any(w in error.lower() for w in ("segfault", "segmentation", "core dump", "memory")):
+                    complexity = 3
+                needed = min_bounty * complexity
+                if bounty < needed:
+                    print(f"[agent] Rejecting {candidate['id']}: bounty {bounty} too low for complexity {complexity} (need {needed})")
+                    continue
+                
+                # Check age: only pick up if waiting >= AGENT_PICKUP_DELAY
+                created = candidate.get("created_at", 0)
+                age = time.time() - created if created else 999
+                if age < AGENT_PICKUP_DELAY:
+                    continue  # let independent agents have first crack
+                
+                c = candidate
+                break
+            
+            if c:
                 cid = c["id"]
                 contract = c["contract"]
                 task = contract.get("task", {})
@@ -136,7 +223,7 @@ Respond with JSON only (no markdown):
 If the error is obvious and you don't need to investigate, respond:
 {{"commands": [], "reasoning": "error is clear, no investigation needed"}}"""
 
-                raw = agent_llm_call(inv_prompt)
+                raw = kimi_llm_call(inv_prompt)
                 inv_result = _parse_llm_json(raw)
                 inv_commands = inv_result.get("commands", [])
                 reasoning = inv_result.get("reasoning", "")
@@ -209,7 +296,7 @@ Respond with JSON only (no markdown):
 If you cannot fix it, respond:
 {{"fix": null, "explanation": "why it cannot be fixed"}}"""
 
-                raw = agent_llm_call(fix_prompt)
+                raw = kimi_llm_call(fix_prompt)
                 result = _parse_llm_json(raw)
                 fix_cmd = result.get("fix", "")
                 explanation = result.get("explanation", "")
@@ -286,7 +373,7 @@ Respond with JSON only (no markdown):
 {{"fix": "shell command(s)", "explanation": "why this is different and better"}}"""
 
                 print(f"[agent] Retrying {cid} (attempt {len(failures) + 1})")
-                raw = agent_llm_call(retry_prompt)
+                raw = kimi_llm_call(retry_prompt)
                 result = _parse_llm_json(raw)
                 fix_cmd = result.get("fix", "")
                 explanation = result.get("explanation", "")
@@ -310,7 +397,7 @@ store = ContractStore(DB_PATH)
 escrow_mgr = EscrowManager(DB_PATH.replace(".db", "_escrow.db"))
 reputation_mgr = ReputationManager(DB_PATH.replace(".db", "_rep.db"))
 judge = AIJudge(model=MODEL, llm_call=judge_llm_call)
-court = TieredCourt(llm_call=judge_llm_call)
+court = TieredCourt(llm_call=kimi_judge_call if KIMI_KEY else judge_llm_call)
 
 app = create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, judge=judge, court=court)
 
@@ -318,6 +405,8 @@ app = create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_m
 agent_thread = threading.Thread(target=run_free_agent, args=(store, escrow_mgr), daemon=True)
 agent_thread.start()
 print(f"[server] Free agent running (model: {AGENT_MODEL})")
+if KIMI_KEY:
+    print(f"[server] Kimi backend active (model: {KIMI_MODEL}, supreme: claude-opus)")
 print(f"[server] Tiered court active (district/appeals/supreme)")
 print(f"[server] Listening on :{PORT}")
 

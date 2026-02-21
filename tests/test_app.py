@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import time
 import pytest
+from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 from starlette.testclient import TestClient
 from server.app import create_app
@@ -25,7 +26,7 @@ SAMPLE_CONTRACT = {
     "capabilities": {},
     "verification": [{"method": "exit_code", "expected": 0}],
     "execution": {"sandbox": False, "root": None, "max_attempts": 5, "investigation_rounds": 5, "timeout": 300},
-    "escrow": {"bounty": "0.05", "currency": "XNO", "chain": "nano"},
+    "escrow": {"bounty": "0.5", "currency": "XNO", "chain": "nano"},
     "terms": {"cancellation": {"agent_fee": "0.002", "principal_fee": "0.002", "grace_period": 30}},
 }
 
@@ -890,10 +891,21 @@ def test_dispute_status_endpoint():
 
 
 def test_platform_fee_in_resolution():
-    """Platform fee is included in every escrow resolution."""
+    """Platform fee is included in every escrow resolution (10% of bounty, min 0.005)."""
     from server.escrow import Escrow
-    escrow = Escrow("1.0", {"judge_fee": "0.026"})
+    escrow = Escrow("1.0", {"judge_fee": "0.21"})
     escrow.lock()
     result = escrow.resolve("fulfilled")
     assert "platform_fee_per_side" in result
-    assert result["platform_fee_per_side"] == "0.001"
+    # 10% of 1.0 = 0.100
+    assert Decimal(result["platform_fee_per_side"]) == Decimal("0.1")
+
+
+def test_platform_fee_minimum():
+    """Platform fee floors at 0.005 XNO for tiny bounties."""
+    from server.escrow import Escrow
+    escrow = Escrow("0.01", {"judge_fee": "0.21"})
+    escrow.lock()
+    result = escrow.resolve("fulfilled")
+    # 10% of 0.01 = 0.001, but min is 0.005
+    assert Decimal(result["platform_fee_per_side"]) == Decimal("0.005")
