@@ -72,14 +72,15 @@ if nano is not None:
         DEFAULT_NODE = "https://proxy.nanos.cc/proxy"
 
         def __init__(self, seed: str | None = None, node_url: str | None = None,
-                     charity_account: str = ""):
+                     charity_account: str | None = None):
             self.seed = seed or os.environ.get("FIX_NANO_SEED", "")
             if not self.seed:
                 raise ValueError("Nano seed required: set FIX_NANO_SEED env var or pass seed=")
             if len(self.seed) != 64:
                 raise ValueError("Nano seed must be 64 hex characters")
             self.node_url = node_url or os.environ.get("FIX_NANO_NODE", self.DEFAULT_NODE)
-            self.charity_account = charity_account
+            from protocol import CHARITY_ADDRESS
+            self.charity_account = charity_account if charity_account is not None else CHARITY_ADDRESS
             self.rpc = nano.RPC(self.node_url)
             self._index_cache: dict[str, int] = {}
 

@@ -53,6 +53,9 @@ DISPUTE_RESPONSE_WINDOW = 30  # seconds
 # Agent auto-pickup: seconds a contract sits before platform agent grabs it
 AGENT_PICKUP_DELAY = 15
 
+# Charity address: evil_both funds go here (Green Mountain State Wolfdog Refuge)
+CHARITY_ADDRESS = "nano_1q3hsjq6tmj1tne66rymctadqbi8ijtak7x1fr5dkmesnkdrqxnoojttcgok"
+
 # Investigation rate limiting
 DEFAULT_INVESTIGATION_RATE = 5  # seconds between commands
 
