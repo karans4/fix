@@ -1077,7 +1077,7 @@ def create_app(
             escrow = _escrow.get(contract_id)
             if escrow and not escrow["resolved"]:
                 _escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
-                              dispute_loser=dispute_loser)
+                              dispute_loser=dispute_loser, tier_fee=COURT_TIERS[0]["fee"])
 
             return {"outcome": ruling.outcome, "reasoning": ruling.reasoning, "flags": ruling.flags}
 
@@ -1164,8 +1164,9 @@ def create_app(
 
             escrow = _escrow.get(contract_id)
             if escrow and not escrow["resolved"]:
+                tier_fee = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]["fee"]
                 _escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
-                              dispute_loser=dispute_loser)
+                              dispute_loser=dispute_loser, tier_fee=tier_fee)
 
         return {
             "outcome": ruling.outcome,
@@ -1474,7 +1475,7 @@ def create_app(
                 escrow = _escrow.get(contract_id)
                 if escrow and not escrow["resolved"]:
                     _escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
-                                  dispute_loser=dispute_loser)
+                                  dispute_loser=dispute_loser, tier_fee=COURT_TIERS[0]["fee"])
 
             ruling_resp = {
                 "outcome": ruling.outcome,

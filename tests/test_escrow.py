@@ -175,23 +175,39 @@ class TestEscrowResolveVoided(unittest.TestCase):
 
 
 class TestEscrowBondRouting(unittest.TestCase):
-    def test_dispute_loser_bond_to_judge(self):
+    def test_dispute_loser_bond_to_judge_tier_fee_only(self):
+        """Loser pays only the tier fee, not the full bond."""
+        e = Escrow("0.05", TERMS_WITH_JUDGE)
+        e.lock()
+        e.lock_agent_bond()
+        result = e.resolve("fulfilled", dispute_loser="principal", judge_account="judge_abc",
+                          tier_fee=Decimal("0.002"))
+        self.assertEqual(result["bond_loser"], "principal")
+        self.assertEqual(result["bond_to_judge"], "0.002")  # tier fee, not full 0.005
+        self.assertEqual(result["judge_account"], "judge_abc")
+        self.assertEqual(result["bond_returned_to"], "agent")
+        self.assertEqual(result["bond_remainder_returned"], "0.003")  # 0.005 - 0.002
+        self.assertIsNone(result["bond_to_charity"])
+
+    def test_dispute_loser_no_tier_fee_falls_back_to_full_bond(self):
+        """Without tier_fee param, falls back to full judge_fee (backwards compat)."""
         e = Escrow("0.05", TERMS_WITH_JUDGE)
         e.lock()
         e.lock_agent_bond()
         result = e.resolve("fulfilled", dispute_loser="principal", judge_account="judge_abc")
-        self.assertEqual(result["bond_loser"], "principal")
         self.assertEqual(result["bond_to_judge"], "0.005")
-        self.assertEqual(result["judge_account"], "judge_abc")
-        self.assertEqual(result["bond_returned_to"], "agent")
+        self.assertIsNone(result["bond_remainder_returned"])
 
     def test_dispute_agent_loses(self):
         e = Escrow("0.05", TERMS_WITH_JUDGE)
         e.lock()
         e.lock_agent_bond()
-        result = e.resolve("canceled", dispute_loser="agent", judge_account="judge_abc")
+        result = e.resolve("canceled", dispute_loser="agent", judge_account="judge_abc",
+                          tier_fee=Decimal("0.002"))
         self.assertEqual(result["bond_loser"], "agent")
         self.assertEqual(result["bond_returned_to"], "principal")
+        self.assertEqual(result["bond_to_judge"], "0.002")
+        self.assertEqual(result["bond_remainder_returned"], "0.003")
 
     def test_no_dispute_bonds_returned(self):
         e = Escrow("0.05", TERMS_WITH_JUDGE)
@@ -199,6 +215,62 @@ class TestEscrowBondRouting(unittest.TestCase):
         self.assertIsNone(result["bond_loser"])
         self.assertIsNone(result["bond_to_judge"])
         self.assertIsNone(result["bond_returned_to"])
+
+    def test_evil_agent_bond_remainder_to_charity(self):
+        """Evil agent: tier fee to judge, remainder of bond to charity."""
+        e = Escrow("0.05", TERMS_WITH_JUDGE)
+        e.lock()
+        e.lock_agent_bond()
+        result = e.resolve("canceled", flags=["evil_agent"],
+                          dispute_loser="agent", judge_account="judge_abc",
+                          tier_fee=Decimal("0.002"))
+        self.assertEqual(result["bond_to_judge"], "0.002")
+        self.assertEqual(result["bond_to_charity"], "0.003")  # 0.005 - 0.002
+        self.assertIsNone(result["bond_remainder_returned"])
+
+    def test_evil_principal_bond_remainder_to_charity(self):
+        """Evil principal: tier fee to judge, remainder of bond to charity."""
+        e = Escrow("0.05", TERMS_WITH_JUDGE)
+        e.lock()
+        e.lock_agent_bond()
+        result = e.resolve("fulfilled", flags=["evil_principal"],
+                          dispute_loser="principal", judge_account="judge_abc",
+                          tier_fee=Decimal("0.002"))
+        self.assertEqual(result["bond_to_judge"], "0.002")
+        self.assertEqual(result["bond_to_charity"], "0.003")
+        self.assertEqual(result["action"], "send_to_charity")  # bounty to charity too
+
+    def test_evil_both_all_bonds_to_charity(self):
+        """Evil both: both bonds (minus judge fees) to charity."""
+        e = Escrow("0.05", TERMS_WITH_JUDGE)
+        e.lock()
+        e.lock_agent_bond()
+        result = e.resolve("canceled", flags=["evil_agent", "evil_principal"],
+                          dispute_loser="agent", judge_account="judge_abc",
+                          tier_fee=Decimal("0.002"))
+        self.assertEqual(result["bond_to_judge"], "0.002")
+        self.assertEqual(result["bond_to_charity"], "0.003")  # agent's remainder
+        self.assertEqual(result["other_evil_bond_to_charity"], "0.005")  # principal's full bond
+        self.assertIsNone(result["bond_returned_to"])  # nobody gets bond back
+
+    def test_evil_agent_with_high_min_bond(self):
+        """Agent posted 2 XNO bond (min_bond), ruled evil at district (0.002).
+        Judge gets 0.002, charity gets 1.998."""
+        terms = {**TERMS_WITH_JUDGE, "min_bond": "2"}
+        e = Escrow("0.05", terms)
+        e.lock()
+        e.lock_agent_bond(amount=Decimal("2"))
+        result = e.resolve("canceled", flags=["evil_agent"],
+                          dispute_loser="agent", judge_account="judge_abc",
+                          tier_fee=Decimal("0.002"))
+        self.assertEqual(result["bond_to_judge"], "0.002")
+        self.assertEqual(result["bond_to_charity"], "1.998")
+
+    def test_platform_fee_principal_only(self):
+        """Platform fee is 10% of bounty, from principal only (not both sides)."""
+        e = Escrow("1.00", TERMS_WITH_JUDGE)
+        result = e.resolve("fulfilled")
+        self.assertEqual(Decimal(result["platform_fee"]), Decimal("0.1"))  # 10% of 1.00
 
 
 class TestEscrowUnknownRuling(unittest.TestCase):
@@ -325,9 +397,10 @@ class TestEscrowManager(unittest.TestCase):
         self.mgr.lock("c1", "0.05", TERMS_WITH_JUDGE, judge_account="judge_abc", judge_fee="0.005")
         self.mgr.lock_agent_bond("c1")
         _set_stub_accounts(self.mgr, "c1")
-        result = self.mgr.resolve("c1", "fulfilled", dispute_loser="principal")
+        result = self.mgr.resolve("c1", "fulfilled", dispute_loser="principal", tier_fee="0.002")
         self.assertEqual(result["bond_loser"], "principal")
-        self.assertEqual(result["bond_to_judge"], "0.005")
+        self.assertEqual(result["bond_to_judge"], "0.002")
+        self.assertEqual(result["bond_remainder_returned"], "0.003")
 
     def test_resolve_nonexistent_raises(self):
         with self.assertRaises(ValueError):

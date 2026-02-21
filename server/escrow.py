@@ -3,8 +3,9 @@
 Handles payment routing: lock, resolve, persist state in SQLite.
 PaymentBackend (Nano or stub) handles actual fund movement.
 
-Dispute bonds: both sides stake a bond upfront. On dispute, loser's bond
-pays the judge. Winner's bond is returned.
+Dispute bonds: both sides stake a bond upfront. On dispute, the loser's bond
+pays the judge tier fee; the remainder is returned (or sent to charity on evil
+rulings). Winner's bond is always returned in full.
 """
 
 import sqlite3
@@ -26,7 +27,7 @@ class Escrow:
     """Payment routing logic for a single contract.
 
     Tracks lock state and computes where funds go based on rulings/flags.
-    Now includes dispute bond tracking and judge fee routing.
+    Includes dispute bond tracking, judge fee routing, and evil-to-charity.
     """
 
     def __init__(self, bounty: str, terms: dict):
@@ -44,6 +45,7 @@ class Escrow:
         self.resolution: dict | None = None
         self.principal_bond_locked = False
         self.agent_bond_locked = False
+        self.agent_bond_amount: Decimal | None = None  # actual bond (may be > judge_fee if min_bond)
 
     def lock(self) -> dict:
         """Lock escrow (bounty + principal's dispute bond)."""
@@ -51,23 +53,28 @@ class Escrow:
         self.principal_bond_locked = True
         return {"status": "locked", "amount": str(self.bounty), "principal_bond": str(self.judge_fee)}
 
-    def lock_agent_bond(self) -> dict:
+    def lock_agent_bond(self, amount: Decimal | None = None) -> dict:
         """Lock agent's dispute bond when they start investigating."""
         self.agent_bond_locked = True
-        return {"status": "agent_bond_locked", "bond": str(self.judge_fee)}
+        self.agent_bond_amount = amount or self.judge_fee
+        return {"status": "agent_bond_locked", "bond": str(self.agent_bond_amount)}
 
     def release_agent_bond(self) -> dict:
         """Return agent's bond if they decline after investigating."""
         self.agent_bond_locked = False
-        return {"status": "agent_bond_released", "bond": str(self.judge_fee)}
+        return {"status": "agent_bond_released", "bond": str(self.agent_bond_amount or self.judge_fee)}
 
     def resolve(self, ruling: str, flags: list[str] | None = None,
                 in_grace: bool = False, backed_out_by: str | None = None,
-                dispute_loser: str | None = None, judge_account: str | None = None) -> dict:
+                dispute_loser: str | None = None, judge_account: str | None = None,
+                tier_fee: Decimal | None = None) -> dict:
         """Route funds based on ruling. Returns dict describing payment actions.
 
         dispute_loser: "agent" or "principal" -- whose bond pays the judge.
         judge_account: where to send the judge fee.
+        tier_fee: the actual judge fee for the court tier that ruled (e.g. 0.02
+                  for district). Only the tier fee is deducted from the loser's
+                  bond; the remainder is returned (or sent to charity if evil).
         """
         flags = set(flags or [])
 
@@ -79,7 +86,7 @@ class Escrow:
                 result = self._charity(self.bounty, "principal flagged as evil on fulfilled contract")
             else:
                 result = self._release_agent(self.bounty)
-            self._apply_bond_routing(result, dispute_loser, judge_account)
+            self._apply_bond_routing(result, flags, dispute_loser, judge_account, tier_fee)
             return result
 
         elif ruling == "canceled":
@@ -98,7 +105,7 @@ class Escrow:
                     self.bounty, fee_from="agent", fee_amount=fee,
                     details="canceled, agent pays cancellation fee",
                 )
-            self._apply_bond_routing(result, dispute_loser, judge_account)
+            self._apply_bond_routing(result, flags, dispute_loser, judge_account, tier_fee)
             return result
 
         elif ruling == "impossible":
@@ -106,7 +113,7 @@ class Escrow:
                 self.bounty, fee_from=None, fee_amount=None,
                 details="contract ruled impossible, no fees",
             )
-            self._apply_bond_routing(result, dispute_loser, judge_account)
+            self._apply_bond_routing(result, flags, dispute_loser, judge_account, tier_fee)
             return result
 
         elif ruling == "backed_out":
@@ -127,31 +134,71 @@ class Escrow:
                     self.bounty, fee_from="agent", fee_amount=fee,
                     details="agent backed out post-grace, pays cancellation fee",
                 )
-            self._apply_bond_routing(result, dispute_loser, judge_account)
+            self._apply_bond_routing(result, flags, dispute_loser, judge_account, tier_fee)
             return result
 
         else:
             raise ValueError(f"unknown ruling: {ruling}")
 
-    def _apply_bond_routing(self, result: dict, dispute_loser: str | None, judge_account: str | None):
-        """Add bond routing info to result. Loser's bond -> judge, winner's bond returned."""
+    def _apply_bond_routing(self, result: dict, flags: set,
+                            dispute_loser: str | None, judge_account: str | None,
+                            tier_fee: Decimal | None):
+        """Add bond routing info to result.
+
+        Normal dispute: loser pays tier_fee to judge, remainder of bond returned.
+        Evil ruling: loser pays tier_fee to judge, remainder of bond to charity.
+        No dispute: both bonds returned.
+        """
         result["judge_fee"] = str(self.judge_fee)
+        has_evil = bool(flags & {"evil_agent", "evil_principal"})
+
         if dispute_loser and judge_account:
+            actual_tier_fee = tier_fee if tier_fee is not None else self.judge_fee
+            # Loser's bond: determine total bond amount
+            if dispute_loser == "agent":
+                loser_bond = self.agent_bond_amount or self.judge_fee
+            else:
+                loser_bond = self.judge_fee  # principal bond is always judge_fee
+            bond_remainder = max(loser_bond - actual_tier_fee, Decimal("0"))
+
             result["bond_loser"] = dispute_loser
-            result["bond_to_judge"] = str(self.judge_fee)
+            result["bond_to_judge"] = str(actual_tier_fee)
             result["judge_account"] = judge_account
             winner = "principal" if dispute_loser == "agent" else "agent"
             result["bond_returned_to"] = winner
+
+            # Evil: loser's bond remainder goes to charity
+            if has_evil and bond_remainder > 0:
+                result["bond_to_charity"] = str(bond_remainder)
+                result["bond_remainder_returned"] = None
+            else:
+                result["bond_to_charity"] = None
+                result["bond_remainder_returned"] = str(bond_remainder) if bond_remainder > 0 else None
+
+            # evil_both: BOTH bonds get the treatment
+            if "evil_agent" in flags and "evil_principal" in flags:
+                # Winner's bond also: tier_fee to judge (already paid by loser),
+                # but the "winner" is also evil -- their bond goes to charity too
+                if dispute_loser == "agent":
+                    other_bond = self.judge_fee  # principal's bond
+                else:
+                    other_bond = self.agent_bond_amount or self.judge_fee
+                result["other_evil_bond_to_charity"] = str(other_bond)
+                result["bond_returned_to"] = None  # nobody gets their bond back
         else:
             # No dispute -- both bonds returned
             result["bond_loser"] = None
             result["bond_to_judge"] = None
             result["judge_account"] = None
             result["bond_returned_to"] = None
-        # Platform fee: 10% of bounty per side, min 0.005 XNO
+            result["bond_to_charity"] = None
+            result["bond_remainder_returned"] = None
+            result["other_evil_bond_to_charity"] = None
+
+        # Platform fee: 10% of bounty from principal only
         bounty = Decimal(result.get("amount", "0"))
         fee = max(bounty * PLATFORM_FEE_RATE, PLATFORM_FEE_MIN)
-        result["platform_fee_per_side"] = str(fee)
+        result["platform_fee"] = str(fee)
 
     def _void(self) -> dict:
         """Judge didn't show. Everything returned: bounty to principal, both bonds returned."""
@@ -349,11 +396,17 @@ class EscrowManager:
         return self.payment.check_deposit(contract_id, row["bounty"])
 
     def resolve(self, contract_id: str, ruling: str, flags: list[str] | None = None,
-                dispute_loser: str | None = None, **kwargs) -> dict:
+                dispute_loser: str | None = None, tier_fee: str | None = None,
+                **kwargs) -> dict:
         """Resolve escrow for a contract. Moves funds via payment backend.
 
-        For disputes: dispute_loser's bond goes to judge, winner's bond returned.
+        For disputes: loser's bond pays the tier_fee to judge. Remainder of bond
+        is returned (or sent to charity if evil). Winner's bond returned in full.
         For voided: everything returned.
+
+        tier_fee: the per-tier judge fee (e.g. "0.02" for district). Only this
+        amount is deducted from the loser's bond. If None, falls back to full
+        judge_fee (backwards compat).
 
         CRITICAL: If payment fails, escrow is NOT marked resolved -- funds stay
         in escrow for manual recovery. Only marks resolved on successful payment.
@@ -371,31 +424,38 @@ class EscrowManager:
             if not row["locked"]:
                 raise ValueError(f"Escrow for {contract_id} was never locked")
 
-            escrow = Escrow(row["bounty"], json.loads(row["terms"]))
+            terms = json.loads(row["terms"])
+            escrow = Escrow(row["bounty"], terms)
             escrow.locked = bool(row["locked"])
             escrow.principal_bond_locked = bool(row["principal_bond_locked"])
             escrow.agent_bond_locked = bool(row["agent_bond_locked"])
+
+            # Reconstruct actual agent bond amount
+            judge_fee = Decimal(row["judge_fee"] or DEFAULT_JUDGE_FEE)
+            min_bond = Decimal(row["min_bond"] or "0")
+            escrow.agent_bond_amount = max(judge_fee, min_bond)
+
+            tier_fee_dec = Decimal(tier_fee) if tier_fee else None
 
             result = escrow.resolve(
                 ruling, flags=flags,
                 dispute_loser=dispute_loser,
                 judge_account=row["judge_account"],
+                tier_fee=tier_fee_dec,
                 **kwargs,
             )
 
             # Calculate actual payment amounts after fee deductions
             action = result.get("action")
             bounty = Decimal(row["bounty"])
-            platform_fee = Decimal(result.get("platform_fee_per_side", "0"))
-            # Total platform fee from both sides
-            total_platform_fee = platform_fee * 2
+            platform_fee = Decimal(result.get("platform_fee", "0"))
 
             # Deduct fees from the payout
             fee_amount = Decimal(result["fee_amount"]) if result.get("fee_amount") else Decimal("0")
             if action == "release_to_agent":
-                payout = bounty - total_platform_fee
+                payout = bounty - platform_fee
             elif action == "return_to_principal":
-                payout = bounty - fee_amount - total_platform_fee
+                payout = bounty - fee_amount - platform_fee
             elif action == "voided":
                 payout = bounty  # No fees on void
             elif action == "send_to_charity":
@@ -405,7 +465,7 @@ class EscrowManager:
 
             payout = max(payout, Decimal("0"))
             result["actual_payout"] = str(payout)
-            result["total_platform_fee"] = str(total_platform_fee)
+            result["total_platform_fee"] = str(platform_fee)
 
             # Require payout address for non-charity resolutions
             if action == "release_to_agent" and not row["agent_account"]:
@@ -432,11 +492,18 @@ class EscrowManager:
             if result.get("bond_to_judge") and row["judge_account"]:
                 pending_payments.append((row["judge_account"], result["bond_to_judge"], "judge_bond"))
 
-            # Platform fee: send to platform treasury if configured
-            if self.platform_account and total_platform_fee > 0 and action != "voided":
-                pending_payments.append((self.platform_account, str(total_platform_fee), "platform_fee"))
+            # Route evil bond remainder to charity
+            charity_from_bond = Decimal(result.get("bond_to_charity") or "0")
+            other_evil = Decimal(result.get("other_evil_bond_to_charity") or "0")
+            total_charity_bond = charity_from_bond + other_evil
+            if total_charity_bond > 0 and hasattr(self.payment, 'charity_account') and self.payment.charity_account:
+                pending_payments.append((self.payment.charity_account, str(total_charity_bond), "evil_bond_charity"))
 
-            # Execute all payments — if any fail, none are committed as resolved
+            # Platform fee: send to platform treasury if configured (principal only)
+            if self.platform_account and platform_fee > 0 and action != "voided":
+                pending_payments.append((self.platform_account, str(platform_fee), "platform_fee"))
+
+            # Execute all payments -- if any fail, none are committed as resolved
             block_hashes = []
             try:
                 for to_account, amount, label in pending_payments:

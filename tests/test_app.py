@@ -964,14 +964,14 @@ def test_dispute_status_endpoint():
 
 
 def test_platform_fee_in_resolution():
-    """Platform fee is included in every escrow resolution (10% of bounty, min 0.005)."""
+    """Platform fee is 10% of bounty, charged to principal only."""
     from server.escrow import Escrow
     escrow = Escrow("1.0", {"judge_fee": "0.21"})
     escrow.lock()
     result = escrow.resolve("fulfilled")
-    assert "platform_fee_per_side" in result
-    # 10% of 1.0 = 0.100
-    assert Decimal(result["platform_fee_per_side"]) == Decimal("0.1")
+    assert "platform_fee" in result
+    # 10% of 1.0 = 0.100, principal only
+    assert Decimal(result["platform_fee"]) == Decimal("0.1")
 
 
 def test_platform_fee_minimum():
@@ -981,7 +981,7 @@ def test_platform_fee_minimum():
     escrow.lock()
     result = escrow.resolve("fulfilled")
     # 10% of 0.01 = 0.001, but min is 0.002
-    assert Decimal(result["platform_fee_per_side"]) == Decimal("0.002")
+    assert Decimal(result["platform_fee"]) == Decimal("0.002")
 
 
 def test_sse_publish_mechanism(app):
