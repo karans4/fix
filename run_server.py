@@ -22,10 +22,10 @@ MODEL = os.environ.get("FIX_MODEL", "claude-haiku-4-5-20251001")
 AGENT_MODEL = os.environ.get("FIX_AGENT_MODEL", "claude-haiku-4-5-20251001")
 # Free-mode agent: rotate through free OpenRouter models (200 req/day each)
 FREE_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "deepseek/deepseek-r1:free",
-    "google/gemma-3-27b-it:free",
-    "qwen/qwen3-32b:free",
+    "deepseek/deepseek-r1-0528:free",
+    "nvidia/nemotron-nano-9b-v2:free",
+    "stepfun/step-3.5-flash:free",
+    "z-ai/glm-4.5-air:free",
 ]
 DB_PATH = os.environ.get("FIX_DB", "/var/lib/fix/fix.db")
 KIMI_KEY = os.environ.get("KIMI_API_KEY", "")
@@ -152,26 +152,40 @@ def openrouter_llm_call(prompt, model=None):
     use_model = model or _pick_free_model()
     if not use_model:
         return None  # all free models rate-limited, autodecline
-    resp = httpx.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": use_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 1024,
-        },
-        timeout=60,
-    )
+    try:
+        resp = httpx.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": use_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1024,
+            },
+            timeout=90,
+        )
+        data = resp.json()
+    except Exception as e:
+        print(f"[agent] OpenRouter network error ({use_model}): {e}")
+        _free_model_blocked[use_model] = time.time() + 300  # block 5 min
+        return openrouter_llm_call(prompt)
     if resp.status_code == 429:
-        # Rate limited — block this model for 1 hour
         _free_model_blocked[use_model] = time.time() + 3600
         print(f"[agent] Free model {use_model} rate-limited, rotating")
-        # Retry with next model
         return openrouter_llm_call(prompt)
-    return resp.json()["choices"][0]["message"]["content"]
+    if "choices" not in data:
+        err = data.get("error", {}).get("message", str(data))[:120]
+        print(f"[agent] OpenRouter error ({use_model}, {resp.status_code}): {err}")
+        _free_model_blocked[use_model] = time.time() + 300
+        return openrouter_llm_call(prompt)
+    content = data["choices"][0]["message"].get("content", "")
+    if not content or not content.strip():
+        print(f"[agent] OpenRouter empty response ({use_model}), rotating")
+        _free_model_blocked[use_model] = time.time() + 300
+        return openrouter_llm_call(prompt)
+    return content
 
 
 def _parse_llm_json(raw):
@@ -210,26 +224,28 @@ def run_free_agent(store, escrow_mgr):
             for candidate in contracts:
                 contract = candidate.get("contract", {})
                 bounty = Decimal(contract.get("escrow", {}).get("bounty", "0"))
-                min_bounty = Decimal(MINIMUM_BOUNTY)
-                
-                # Reject below minimum
-                if bounty < min_bounty:
-                    print(f"[agent] Rejecting {candidate['id']}: bounty {bounty} < min {min_bounty}")
-                    continue
-                
-                # Estimate complexity from error
-                task = contract.get("task", {})
-                error = task.get("error", "")
-                # Simple heuristic: long errors or segfaults need higher bounty
-                complexity = 1
-                if len(error) > 500:
-                    complexity = 2
-                if any(w in error.lower() for w in ("segfault", "segmentation", "core dump", "memory")):
-                    complexity = 3
-                needed = min_bounty * complexity
-                if bounty < needed:
-                    print(f"[agent] Rejecting {candidate['id']}: bounty {bounty} too low for complexity {complexity} (need {needed})")
-                    continue
+                judge_info = contract.get("judge", {})
+                is_free = not judge_info.get("pubkey", "")
+
+                # Free mode (no judge): accept zero-bounty contracts
+                # Paid mode: enforce minimum bounty and complexity pricing
+                if not is_free:
+                    min_bounty = Decimal(MINIMUM_BOUNTY)
+                    if bounty < min_bounty:
+                        print(f"[agent] Rejecting {candidate['id']}: bounty {bounty} < min {min_bounty}")
+                        continue
+
+                    task = contract.get("task", {})
+                    error = task.get("error", "")
+                    complexity = 1
+                    if len(error) > 500:
+                        complexity = 2
+                    if any(w in error.lower() for w in ("segfault", "segmentation", "core dump", "memory")):
+                        complexity = 3
+                    needed = min_bounty * complexity
+                    if bounty < needed:
+                        print(f"[agent] Rejecting {candidate['id']}: bounty {bounty} too low for complexity {complexity} (need {needed})")
+                        continue
                 
                 # Check age: only pick up if waiting >= AGENT_PICKUP_DELAY
                 created = candidate.get("created_at", 0)
@@ -246,16 +262,11 @@ def run_free_agent(store, escrow_mgr):
                 task = contract.get("task", {})
                 briefing = build_briefing(cid, c)
 
-                # Free-mode: no judge configured → use cheapest LLM (free tier rotation)
+                # Free-mode: no judge configured → use Claude Haiku (cheap, reliable)
                 judge_info = contract.get("judge", {})
                 is_free_mode = not judge_info.get("pubkey", "")
-                llm_fn = openrouter_llm_call if is_free_mode else kimi_llm_call
+                llm_fn = agent_llm_call if is_free_mode else kimi_llm_call
                 mode_label = "free" if is_free_mode else "paid"
-
-                # Free-mode: skip if all free models are exhausted
-                if is_free_mode and _pick_free_model() is None:
-                    print(f"[agent] Skipping {cid}: all free models rate-limited, autodecline")
-                    continue
 
                 print(f"[agent] Picking up {cid} ({mode_label}): {task.get('command', task.get('task', '?'))}")
 

@@ -628,12 +628,13 @@ def create_app(
 
         # Notify SSE subscribers
         task = contract.get("task", {})
+        terms = contract.get("terms", {})
         _sse_publish("contract_posted", {
             "contract_id": contract_id,
             "status": "open",
             "bounty": escrow_data.get("bounty", "0"),
             "command": task.get("command", ""),
-            "min_bond": str(terms.get("min_bond", "0")) if terms else "0",
+            "min_bond": str(terms.get("min_bond", "0")),
         })
 
         return {"contract_id": contract_id, "status": "open", "server_pubkey": _server_pubkey.hex()}
