@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import json
 import pytest
 from decimal import Decimal
-from agent import parse_llm_investigation, build_agent_prompt, capabilities_match, FixAgent
+from agent import parse_llm_investigation, build_agent_prompt, capabilities_match, extract_fix_proposal, FixAgent
 
 
 SAMPLE_CONTRACT = {
@@ -167,33 +167,33 @@ class TestCanHandle:
         assert ok is True
 
 
-# --- FixAgent._extract_fix_proposal ---
+# --- extract_fix_proposal ---
 
 class TestExtractFixProposal:
     def test_json_code_block(self):
         resp = 'Here is the fix:\n```json\n{"fix": "apt install gcc", "explanation": "gcc missing"}\n```'
-        result = FixAgent._extract_fix_proposal(resp)
+        result = extract_fix_proposal(resp)
         assert result is not None
         assert result["fix"] == "apt install gcc"
         assert result["explanation"] == "gcc missing"
 
     def test_bare_json(self):
         resp = 'The fix is {"fix": "make clean && make", "explanation": "stale objects"} done.'
-        result = FixAgent._extract_fix_proposal(resp)
+        result = extract_fix_proposal(resp)
         assert result is not None
         assert result["fix"] == "make clean && make"
 
     def test_no_fix(self):
         resp = "I need more information.\nINVESTIGATE: ls src/"
-        result = FixAgent._extract_fix_proposal(resp)
+        result = extract_fix_proposal(resp)
         assert result is None
 
     def test_invalid_json(self):
         resp = '```json\n{fix: not valid json}\n```'
-        result = FixAgent._extract_fix_proposal(resp)
+        result = extract_fix_proposal(resp)
         assert result is None
 
     def test_missing_fix_key(self):
         resp = '```json\n{"command": "apt install gcc", "explanation": "install it"}\n```'
-        result = FixAgent._extract_fix_proposal(resp)
+        result = extract_fix_proposal(resp)
         assert result is None

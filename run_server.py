@@ -12,14 +12,21 @@ import uvicorn
 from server.app import create_app, build_briefing
 from server.store import ContractStore
 from server.escrow import EscrowManager
-from server.reputation import ReputationManager
 from server.judge import AIJudge, TieredCourt
 from protocol import MINIMUM_BOUNTY, AGENT_PICKUP_DELAY
 from decimal import Decimal
 
 API_KEY = os.environ.get("FIX_API_KEY", "")
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 MODEL = os.environ.get("FIX_MODEL", "claude-haiku-4-5-20251001")
 AGENT_MODEL = os.environ.get("FIX_AGENT_MODEL", "claude-haiku-4-5-20251001")
+# Free-mode agent: rotate through free OpenRouter models (200 req/day each)
+FREE_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "deepseek/deepseek-r1:free",
+    "google/gemma-3-27b-it:free",
+    "qwen/qwen3-32b:free",
+]
 DB_PATH = os.environ.get("FIX_DB", "/var/lib/fix/fix.db")
 KIMI_KEY = os.environ.get("KIMI_API_KEY", "")
 KIMI_BASE = os.environ.get("KIMI_BASE_URL", "https://api.moonshot.ai/v1")
@@ -121,6 +128,52 @@ async def kimi_judge_call(system_prompt, user_prompt, model=None):
         return resp.json()["choices"][0]["message"]["content"]
 
 
+# Track which free models are rate-limited (model -> timestamp when limit expires)
+_free_model_blocked = {}
+_free_model_idx = 0
+
+def _pick_free_model():
+    """Round-robin through free models, skipping rate-limited ones. Returns None if all exhausted."""
+    global _free_model_idx
+    now = time.time()
+    for _ in range(len(FREE_MODELS)):
+        model = FREE_MODELS[_free_model_idx % len(FREE_MODELS)]
+        _free_model_idx += 1
+        blocked_until = _free_model_blocked.get(model, 0)
+        if now > blocked_until:
+            return model
+    return None  # all exhausted
+
+
+def openrouter_llm_call(prompt, model=None):
+    """OpenRouter call with free model rotation. Returns None if all models exhausted."""
+    if not OPENROUTER_KEY:
+        return None  # can't call without key
+    use_model = model or _pick_free_model()
+    if not use_model:
+        return None  # all free models rate-limited, autodecline
+    resp = httpx.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": use_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1024,
+        },
+        timeout=60,
+    )
+    if resp.status_code == 429:
+        # Rate limited — block this model for 1 hour
+        _free_model_blocked[use_model] = time.time() + 3600
+        print(f"[agent] Free model {use_model} rate-limited, rotating")
+        # Retry with next model
+        return openrouter_llm_call(prompt)
+    return resp.json()["choices"][0]["message"]["content"]
+
+
 def _parse_llm_json(raw):
     """Extract JSON from LLM response (strips markdown fences)."""
     text = raw.strip()
@@ -193,7 +246,18 @@ def run_free_agent(store, escrow_mgr):
                 task = contract.get("task", {})
                 briefing = build_briefing(cid, c)
 
-                print(f"[agent] Picking up {cid}: {task.get('command', task.get('task', '?'))}")
+                # Free-mode: no judge configured → use cheapest LLM (free tier rotation)
+                judge_info = contract.get("judge", {})
+                is_free_mode = not judge_info.get("pubkey", "")
+                llm_fn = openrouter_llm_call if is_free_mode else kimi_llm_call
+                mode_label = "free" if is_free_mode else "paid"
+
+                # Free-mode: skip if all free models are exhausted
+                if is_free_mode and _pick_free_model() is None:
+                    print(f"[agent] Skipping {cid}: all free models rate-limited, autodecline")
+                    continue
+
+                print(f"[agent] Picking up {cid} ({mode_label}): {task.get('command', task.get('task', '?'))}")
 
                 # Bond → INVESTIGATING (use store API, not direct DB writes)
                 try:
@@ -224,7 +288,11 @@ Respond with JSON only (no markdown):
 If the error is obvious and you don't need to investigate, respond:
 {{"commands": [], "reasoning": "error is clear, no investigation needed"}}"""
 
-                raw = kimi_llm_call(inv_prompt)
+                raw = llm_fn(inv_prompt)
+                if raw is None:
+                    print(f"[agent] LLM exhausted mid-contract {cid}, backing out")
+                    store.update_status(cid, "open")  # reopen for other agents
+                    continue
                 inv_result = _parse_llm_json(raw)
                 inv_commands = inv_result.get("commands", [])
                 reasoning = inv_result.get("reasoning", "")
@@ -297,7 +365,11 @@ Respond with JSON only (no markdown):
 If you cannot fix it, respond:
 {{"fix": null, "explanation": "why it cannot be fixed"}}"""
 
-                raw = kimi_llm_call(fix_prompt)
+                raw = llm_fn(fix_prompt)
+                if raw is None:
+                    print(f"[agent] LLM exhausted during fix for {cid}, backing out")
+                    store.update_status(cid, "open")
+                    continue
                 result = _parse_llm_json(raw)
                 fix_cmd = result.get("fix", "")
                 explanation = result.get("explanation", "")
@@ -373,8 +445,16 @@ Propose a DIFFERENT fix. Learn from what failed.
 Respond with JSON only (no markdown):
 {{"fix": "shell command(s)", "explanation": "why this is different and better"}}"""
 
+                # Free-mode: use cheapest LLM
+                judge_info = contract.get("judge", {})
+                is_free = not judge_info.get("pubkey", "")
+                retry_llm = openrouter_llm_call if is_free else kimi_llm_call
+
                 print(f"[agent] Retrying {cid} (attempt {len(failures) + 1})")
-                raw = kimi_llm_call(retry_prompt)
+                raw = retry_llm(retry_prompt)
+                if raw is None:
+                    print(f"[agent] LLM exhausted during retry for {cid}, skipping")
+                    continue
                 result = _parse_llm_json(raw)
                 fix_cmd = result.get("fix", "")
                 explanation = result.get("explanation", "")
@@ -396,16 +476,15 @@ os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 store = ContractStore(DB_PATH)
 escrow_mgr = EscrowManager(DB_PATH.replace(".db", "_escrow.db"))
-reputation_mgr = ReputationManager(DB_PATH.replace(".db", "_rep.db"))
 judge = AIJudge(model=MODEL, llm_call=judge_llm_call)
 court = TieredCourt(llm_call=kimi_judge_call if KIMI_KEY else judge_llm_call)
 
-app = create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, judge=judge, court=court)
+app = create_app(store=store, escrow_mgr=escrow_mgr, judge=judge, court=court)
 
 # Start free agent in background
 agent_thread = threading.Thread(target=run_free_agent, args=(store, escrow_mgr), daemon=True)
 agent_thread.start()
-print(f"[server] Free agent running (model: {AGENT_MODEL})")
+print(f"[server] Free agent running (paid: {AGENT_MODEL}, free-mode: {len(FREE_MODELS)} models rotating)")
 if KIMI_KEY:
     print(f"[server] Kimi backend active (model: {KIMI_MODEL}, supreme: claude-opus)")
 print(f"[server] Tiered court active (district/appeals/supreme)")

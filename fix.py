@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 Karan Sharma
 """fix -- AI-powered command fixer.
 
 Usage:
@@ -62,7 +64,7 @@ CONFIG_DIR = os.path.expanduser("~/.fix")
 MAX_FIX_ATTEMPTS = DEFAULT_MAX_ATTEMPTS
 MAX_INVESTIGATE_ROUNDS = 5
 INVESTIGATE_TIMEOUT = 5
-HUMAN_VERIFY_TIMEOUT = 60
+PRINCIPAL_VERIFY_TIMEOUT = 60
 
 # Claude API defaults
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
@@ -178,6 +180,35 @@ def validate_investigate_command(cmd, root=None):
                 if actual not in INVESTIGATE_WHITELIST:
                     return False, f"'{actual}' (via {first_word}) not in investigation whitelist"
 
+    # Block dangerous argument patterns for commands that can execute code
+    EXEC_CAPABLE = {"python3", "python", "node", "ruby", "java", "go"}
+    EXEC_FLAGS = {"-c", "-e", "--eval", "-exec", "--exec"}
+    for subcmd in subcmds:
+        subcmd = subcmd.strip()
+        if not subcmd:
+            continue
+        parts = subcmd.split()
+        first = os.path.basename(parts[0])
+        # Block interpreter execution flags
+        if first in EXEC_CAPABLE:
+            for p in parts[1:]:
+                if p in EXEC_FLAGS:
+                    return False, f"blocked: '{first} {p}' can execute arbitrary code"
+        # Block find -exec
+        if first == "find":
+            for p in parts[1:]:
+                if p in ("-exec", "-execdir", "-ok", "-okdir", "-delete"):
+                    return False, f"blocked: 'find {p}' can modify files"
+        # Block awk/sed system() calls
+        if first in ("awk", "gawk", "mawk", "nawk"):
+            cmd_lower = subcmd.lower()
+            if "system(" in cmd_lower or "getline" in cmd_lower:
+                return False, f"blocked: '{first}' with system()/getline can execute code"
+        if first == "sed":
+            for p in parts[1:]:
+                if p in ("-i", "--in-place"):
+                    return False, f"blocked: 'sed {p}' can modify files"
+
     # Root jail: check that all path arguments resolve inside root
     if root:
         root_abs = os.path.realpath(root)
@@ -263,8 +294,11 @@ DEFAULTS = {
 }
 
 
-def _exec_config(path):
-    """Execute a Python config file and return its namespace as a dict."""
+def _exec_config_trusted(path):
+    """Execute a Python config file and return its namespace as a dict.
+
+    Only use for trusted config files (e.g. user's global ~/.fix/config.py).
+    """
     ns = {"__builtins__": __builtins__}
     try:
         with open(path) as f:
@@ -276,6 +310,49 @@ def _exec_config(path):
         return {}
     # Extract user-defined names (skip dunders and modules)
     return {k: v for k, v in ns.items() if not k.startswith("_")}
+
+
+def _exec_config(path):
+    """Load a Python config file safely \u2014 only simple variable assignments allowed.
+
+    Supports: strings, numbers, booleans, None, lists, dicts, tuples.
+    Does NOT support: function definitions, imports, exec, eval, or any statements.
+    """
+    import ast
+    try:
+        with open(path) as f:
+            source = f.read()
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"  {C_RED}\u2717{C_RESET}  Error reading {path}: {e}", file=sys.stderr)
+        return {}
+
+    try:
+        tree = ast.parse(source, filename=path)
+    except SyntaxError as e:
+        print(f"  {C_RED}\u2717{C_RESET}  Syntax error in {path}: {e}", file=sys.stderr)
+        return {}
+
+    result = {}
+    for node in tree.body:
+        # Only allow simple assignments: name = literal_value
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name):
+                try:
+                    value = ast.literal_eval(node.value)
+                    result[target.id] = value
+                except (ValueError, TypeError):
+                    print(f"  {C_RED}\u2717{C_RESET}  Skipping non-literal assignment \'{target.id}\' in {path}", file=sys.stderr)
+        # Allow comments and docstrings (Expr with Constant string)
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            pass  # docstring, skip
+        # Everything else is rejected
+        else:
+            print(f"  {C_RED}\u2717{C_RESET}  Skipping unsupported statement in {path} (line {node.lineno})", file=sys.stderr)
+
+    return result
 
 
 def _find_project_config():
@@ -304,15 +381,15 @@ def load_config():
     """
     cfg = dict(DEFAULTS)
 
-    # Global config
+    # Global config — user's own file, trusted
     global_path = os.path.join(CONFIG_DIR, "config.py")
-    global_cfg = _exec_config(global_path)
+    global_cfg = _exec_config_trusted(global_path)
     cfg.update(global_cfg)
 
-    # Project-local config (overrides global)
+    # Project-local config — untrusted (could be in a cloned repo)
     project_path = _find_project_config()
     if project_path:
-        project_cfg = _exec_config(project_path)
+        project_cfg = _exec_config(project_path)  # safe loader
         cfg.update(project_cfg)
         cfg["_project_config"] = project_path
 
@@ -605,8 +682,8 @@ class Verifier:
         if self.spec is None:
             # Default: re-run original, exit 0 = success
             return self._verify_rerun()
-        if self.spec == "human":
-            return self._verify_human(fix_result)
+        if self.spec in ("human", "principal"):
+            return self._verify_principal(fix_result)
         if self.spec.startswith("contains "):
             return self._verify_contains(fix_result)
         if self.spec.startswith("not contains "):
@@ -620,7 +697,7 @@ class Verifier:
             return True, "Command succeeded (exit 0)"
         return False, f"Command failed (exit {proc.returncode}): {proc.stderr[:200]}"
 
-    def _verify_human(self, fix_result):
+    def _verify_principal(self, fix_result):
         # Re-run original to show current output (skip for task mode / no-op commands)
         if self.original_cmd and self.original_cmd != "true":
             print(f"\n{C_BLUE}--- Fix Result ---{C_RESET}", file=sys.stderr)
@@ -633,7 +710,7 @@ class Verifier:
         try:
             answer = _input_with_countdown(
                 f"  ?  Contract fulfilled? [Y/n] ({{}}s) ",
-                HUMAN_VERIFY_TIMEOUT,
+                PRINCIPAL_VERIFY_TIMEOUT,
                 default="y",
             )
             if answer.strip().lower() == "n":
@@ -960,11 +1037,11 @@ else:
                 "target": command,
                 "criterion": "exit 0"
             }
-        elif verify_spec == "human":
+        elif verify_spec in ("human", "principal"):
             verification = {
-                "method": "human_judgment",
+                "method": "principal_verification",
                 "target": command,
-                "criterion": "human approves the output"
+                "criterion": "principal verifies the result"
             }
         elif verify_spec.startswith("contains "):
             match = re.match(r"contains\s+['\"](.+?)['\"]", verify_spec)
@@ -1894,9 +1971,9 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
     # Task mode: skip running the dummy "true" command
     is_task = message and command == "true"
 
-    # Task mode defaults to human verification — what else would it be?
+    # Task mode defaults to principal verification — what else would it be?
     if is_task and verify_spec is None:
-        verify_spec = "human"
+        verify_spec = "principal"
 
     print(file=sys.stderr)
     if is_task:
@@ -1921,7 +1998,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         if proc.stderr:
             sys.stderr.write(proc.stderr)
         status(f"{C_GREEN}\u2714{C_RESET}", f"Command succeeded (exit 0). Nothing to fix.")
-        if verify_spec and verify_spec != "human":
+        if verify_spec and verify_spec not in ("human", "principal"):
             status(f"{C_DIM}\u25b8{C_RESET}", f"Tip: fix --verify='{verify_spec}' <cmd>  to verify against a different criterion")
         else:
             status(f"{C_DIM}\u25b8{C_RESET}", f"Tip: fix --verify='contains \"expected\"' <cmd>  or  fix --verify='pytest' <cmd>")

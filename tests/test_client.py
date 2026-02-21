@@ -31,7 +31,8 @@ class MockTransport(Transport):
         if path == "/contracts":
             return {"contracts": []}
         if "/reputation/" in path:
-            return {"as_agent": {}, "as_principal": {}}
+            pubkey = path.split("/reputation/")[1]
+            return {"pubkey": pubkey, "note": "Reputation is determined by on-chain balance. Check the Nano ledger directly for balance/history."}
         if "/ruling" in path:
             return {"outcome": "fulfilled", "reasoning": "test", "flags": []}
         return {"id": "test123", "status": "open", "contract": {}, "transcript": []}
@@ -146,8 +147,8 @@ async def test_dispute(fix_client, mock_transport):
 @pytest.mark.asyncio
 async def test_get_reputation(fix_client, mock_transport):
     result = await fix_client.get_reputation("pk_abc")
-    assert "as_agent" in result
-    assert "as_principal" in result
+    assert result["pubkey"] == "pk_abc"
+    assert "on-chain balance" in result["note"]
     assert mock_transport.calls[-1] == ("GET", "/reputation/pk_abc", None)
 
 

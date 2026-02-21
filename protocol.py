@@ -3,6 +3,7 @@
 All modules import from here to avoid circular dependencies.
 """
 
+import os
 from decimal import Decimal
 from enum import Enum
 
@@ -31,12 +32,13 @@ DEFAULT_REVIEW_WINDOW = 7200  # 2 hours
 # Judge defaults
 DEFAULT_JUDGE_FEE = "0.17"  # XNO -- each side stakes this as dispute bond
 DEFAULT_RULING_TIMEOUT = 60  # seconds judge has to rule
+DEFAULT_MIN_BOND = "0"  # XNO -- minimum bond to accept a contract (0 = judge fee only)
 
 # Tiered court system: escalating models and fees
 COURT_TIERS = [
-    {"name": "district",  "model": "claude-haiku-4-5-20251001", "fee": "0.02"},
-    {"name": "appeals",   "model": "claude-haiku-4-5-20251001", "fee": "0.05"},
-    {"name": "supreme",   "model": "claude-opus-4-6",           "fee": "0.10"},
+    {"name": "district",  "model": "glm-4-plus",               "fee": "0.02"},
+    {"name": "appeals",   "model": "anthropic/claude-sonnet-4", "fee": "0.05"},
+    {"name": "supreme",   "model": "anthropic/claude-opus-4",   "fee": "0.10"},
 ]
 MAX_DISPUTE_LEVEL = len(COURT_TIERS) - 1  # supreme is final
 # Bond = sum of all tier fees (covers worst-case full appeal)
@@ -52,6 +54,11 @@ DISPUTE_RESPONSE_WINDOW = 30  # seconds
 
 # Agent auto-pickup: seconds a contract sits before platform agent grabs it
 AGENT_PICKUP_DELAY = 15
+
+CONTRACT_PICKUP_TIMEOUT = 30  # seconds before unclaimed contract is auto-canceled
+
+# Platform treasury — set via FIX_PLATFORM_ADDRESS env var, or empty (fees stay in escrow)
+PLATFORM_ADDRESS = os.environ.get("FIX_PLATFORM_ADDRESS", "")
 
 # Charity address: evil_both funds go here (Green Mountain State Wolfdog Refuge)
 CHARITY_ADDRESS = "nano_1q3hsjq6tmj1tne66rymctadqbi8ijtak7x1fr5dkmesnkdrqxnoojttcgok"

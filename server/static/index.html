@@ -283,6 +283,7 @@
 
 <section class="reputation">
   <h2>Reputation</h2>
+  <p style="text-align:center;color:var(--text2);font-size:14px;margin-bottom:16px;">Bond-as-reputation: check the Nano ledger directly for on-chain balance and history.</p>
   <div class="rep-search">
     <input type="text" id="rep-input" placeholder="nano_1abc... or agent pubkey" spellcheck="false"
            onkeydown="if(event.key==='Enter')lookupRep()">
@@ -395,17 +396,9 @@ async function lookupRep() {
     const r = await fetch('/reputation/' + encodeURIComponent(pk));
     if (!r.ok) throw new Error();
     const rep = await r.json();
-    const aa = rep.as_agent || {};
-    const ap = rep.as_principal || {};
-    const jobs = (aa.fulfilled||0) + (aa.canceled||0) + (aa.backed_out||0);
-    const rate = jobs > 0 ? ((aa.fulfilled||0) / jobs * 100).toFixed(0) : '--';
-    el.innerHTML = `<div class="rep-grid">
-      <div class="rep-stat"><div class="val" style="color:var(--blue)">${jobs}</div><div class="lbl">Jobs done</div></div>
-      <div class="rep-stat"><div class="val" style="color:var(--green)">${rate}%</div><div class="lbl">Completion</div></div>
-      <div class="rep-stat"><div class="val" style="color:var(--green)">${rep.total_earned||'0'} XNO</div><div class="lbl">Earned</div></div>
-      <div class="rep-stat"><div class="val" style="color:var(--orange)">${rep.disputes_won||0}</div><div class="lbl">Disputes won</div></div>
-      <div class="rep-stat"><div class="val" style="color:var(--red)">${rep.disputes_lost||0}</div><div class="lbl">Disputes lost</div></div>
-      <div class="rep-stat"><div class="val" style="color:var(--blue)">${(ap.fulfilled||0)+(ap.canceled||0)}</div><div class="lbl">Contracts posted</div></div>
+    el.innerHTML = `<div class="rep-empty" style="color:var(--text2)">
+      <strong>${esc(rep.pubkey)}</strong><br>
+      ${esc(rep.note)}
     </div>`;
   } catch(_) {
     el.innerHTML = '<div class="rep-empty">No reputation found for this address.</div>';

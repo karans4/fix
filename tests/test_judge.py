@@ -145,10 +145,11 @@ class TestAIJudgeRule:
         assert "## Contract" in call_args[0][1]
 
     @pytest.mark.asyncio
-    async def test_rule_without_llm_raises(self):
+    async def test_rule_without_llm_or_api_key_raises(self):
+        """Without llm_call and without OPENROUTER_API_KEY, raises about missing key."""
         judge = AIJudge()
         ev = make_evidence()
-        with pytest.raises(RuntimeError, match="requires an llm_call"):
+        with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
             await judge.rule(ev)
 
 

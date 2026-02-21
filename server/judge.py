@@ -1,15 +1,19 @@
 """AI judge system for fix platform.
 
 Provides pluggable judge backends for dispute resolution.
-Three-tier court system: district (Haiku), appeals (Sonnet), supreme (Opus).
+Three-tier court system: district (GLM-4), appeals (Sonnet), supreme (Opus).
 Each tier costs more. Supreme court rulings are final.
+Uses OpenRouter API (OpenAI-compatible chat completions format).
 """
 
 import json
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 from protocol import COURT_TIERS, MAX_DISPUTE_LEVEL
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 @dataclass
@@ -36,9 +40,11 @@ class Evidence:
         parts.append(f"## Hash Chain: {self.hash_chain}")
         if not self.chain_valid:
             parts.append("")
-            parts.append("## WARNING: CHAIN INTEGRITY CHECK FAILED")
+            parts.append("## CRITICAL: CHAIN INTEGRITY CHECK FAILED")
             parts.append("The signed message chain could not be verified. "
-                         "Evidence may have been tampered with. Treat transcript with suspicion.")
+                         "Evidence HAS BEEN TAMPERED WITH or is corrupted. "
+                         "You MUST NOT trust the transcript at face value. "
+                         "Consider ruling 'impossible' unless one side's argument is independently verifiable.")
         parts.append("")
         parts.append("## Arguments")
         for side, text in self.arguments.items():
@@ -102,52 +108,84 @@ class JudgeBackend(ABC):
 class AIJudge(JudgeBackend):
     """LLM-based judge. Sends evidence to an LLM and parses structured ruling."""
 
-    SYSTEM_PROMPT = """You are an impartial judge for a fix-it contract dispute.
-Review the evidence and rule on the outcome.
+    SYSTEM_PROMPT = """You are an impartial judge for a fix-it contract dispute on the fix platform.
 
-Possible rulings:
-- fulfilled: The agent completed the work satisfactorily.
-- canceled: The work was not completed, normal cancellation.
-- impossible: The task was genuinely impossible to complete.
-- evil_agent: The agent acted in bad faith (malicious fix, sabotage, etc.)
-- evil_principal: The principal acted in bad faith (moved goalposts, false rejection, etc.)
-- evil_both: Both parties acted in bad faith.
+A principal posted a contract for an agent to fix a failed command. The agent submitted a fix.
+The parties disagree on whether the work was completed satisfactorily.
+
+Review ALL evidence: the contract terms, the transcript of actions, and both sides' arguments.
+
+Rulings and their consequences:
+- fulfilled: Agent completed the work. Agent receives the bounty.
+- canceled: Work not completed, normal cancellation. Bounty returned to principal minus cancellation fee.
+- impossible: The task was genuinely impossible. Bounty returned, no fees to either side.
+- evil_agent: Agent acted in bad faith (malicious fix, sabotage, fraud). Agent's bond goes to charity.
+- evil_principal: Principal acted in bad faith (moved goalposts, false rejection). Principal's bond goes to charity.
+- evil_both: Both parties acted in bad faith. Both bonds go to charity.
 
 Respond with a JSON object:
 {"outcome": "...", "reasoning": "one paragraph explaining your ruling"}"""
 
-    APPEAL_SYSTEM_PROMPT = """You are a {court} court judge reviewing an appeal of a lower court ruling.
-The losing party is appealing. Review ALL evidence and the lower court's reasoning.
+    APPEAL_SYSTEM_PROMPT = """You are a {court} court judge reviewing an appeal on the fix platform.
+
+A principal posted a contract for an agent to fix a failed command. The agent submitted a fix.
+The principal has already verified (or rejected) the fix. A lower court ruled, and the losing
+party is now appealing. Review ALL evidence, the lower court's reasoning, and both sides' arguments.
 You may affirm or overturn the lower ruling. Give your own independent assessment.
 
 {prior_context}
 
-Possible rulings:
-- fulfilled: The agent completed the work satisfactorily.
-- canceled: The work was not completed, normal cancellation.
-- impossible: The task was genuinely impossible to complete.
-- evil_agent: The agent acted in bad faith (malicious fix, sabotage, etc.)
-- evil_principal: The principal acted in bad faith (moved goalposts, false rejection, etc.)
-- evil_both: Both parties acted in bad faith.
+Rulings and their consequences:
+- fulfilled: Agent completed the work. Agent receives the bounty.
+- canceled: Work not completed, normal cancellation. Bounty returned to principal minus cancellation fee.
+- impossible: The task was genuinely impossible. Bounty returned, no fees to either side.
+- evil_agent: Agent acted in bad faith (malicious fix, sabotage, fraud). Agent's bond goes to charity.
+- evil_principal: Principal acted in bad faith (moved goalposts, false rejection). Principal's bond goes to charity.
+- evil_both: Both parties acted in bad faith. Both bonds go to charity.
 
 Respond with a JSON object:
 {{"outcome": "...", "reasoning": "one paragraph explaining your ruling"}}"""
 
-    def __init__(self, model: str = "claude-haiku-4-5-20251001", llm_call=None):
+    def __init__(self, model: str = "glm-4-plus", llm_call=None):
         """
         Args:
             model: Model identifier (for reference).
             llm_call: Async callable(system_prompt, user_prompt, model=None) -> str.
-                      Must be injected. If model kwarg is supported, tiered courts
+                      If provided, uses this instead of OpenRouter API directly.
+                      Useful for testing. If model kwarg is supported, tiered courts
                       use different models. Otherwise falls back to default.
         """
         self.model = model
         self._llm_call = llm_call
 
-    async def rule(self, evidence: Evidence, level: int = 0) -> JudgeRuling:
-        if not self._llm_call:
-            raise RuntimeError("AIJudge requires an llm_call function")
+    async def _call_openrouter(self, system: str, user: str, model: str) -> str:
+        """Call OpenRouter API (OpenAI-compatible chat completions)."""
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "OPENROUTER_API_KEY environment variable is required. "
+                "Get an API key at https://openrouter.ai/keys"
+            )
 
+        import httpx
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(OPENROUTER_BASE_URL, json=payload, headers=headers, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+
+    async def rule(self, evidence: Evidence, level: int = 0) -> JudgeRuling:
         tier = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]
         model = tier["model"]
         court_name = tier["name"]
@@ -168,11 +206,18 @@ Respond with a JSON object:
                 prior_context=prior_context,
             )
 
-        # Try passing model to llm_call; fall back if it doesn't accept it
-        try:
-            raw = await self._llm_call(system, evidence.summary(), model=model)
-        except TypeError:
-            raw = await self._llm_call(system, evidence.summary())
+        if not evidence.chain_valid:
+            system += "\n\nCRITICAL: The evidence chain has failed integrity verification. The transcript may have been tampered with. Weight this heavily in your ruling."
+
+        if self._llm_call:
+            # Use injected LLM call (for testing or custom backends)
+            try:
+                raw = await self._llm_call(system, evidence.summary(), model=model)
+            except TypeError:
+                raw = await self._llm_call(system, evidence.summary())
+        else:
+            # Use OpenRouter API directly
+            raw = await self._call_openrouter(system, evidence.summary(), model)
 
         ruling = self._parse_ruling(raw)
         ruling.court = court_name

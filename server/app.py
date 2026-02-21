@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 Karan Sharma
 """HTTP API for the fix platform (FastAPI).
 
 Endpoints for contract lifecycle: post, browse, accept, investigate,
@@ -17,16 +19,18 @@ import time
 # Ensure parent directory is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import asyncio
+import json as json_mod
 from decimal import Decimal
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from starlette.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 
 from server.store import ContractStore
 from server.escrow import EscrowManager
-from server.reputation import ReputationManager
 from server.nano import validate_nano_address
 from server.judge import AIJudge, TieredCourt, Evidence, JudgeRuling
 from crypto import (
@@ -40,7 +44,7 @@ from protocol import (
     DEFAULT_REVIEW_WINDOW, DEFAULT_INVESTIGATION_RATE, DEFAULT_RULING_TIMEOUT,
     MODE_SUPERVISED, MODE_AUTONOMOUS, COURT_TIERS, MAX_DISPUTE_LEVEL,
     DISPUTE_RESPONSE_WINDOW, PLATFORM_FEE_RATE, PLATFORM_FEE_MIN, MINIMUM_BOUNTY,
-    SERVER_ENTRY_TYPES,
+    SERVER_ENTRY_TYPES, CONTRACT_PICKUP_TIMEOUT,
 )
 
 
@@ -48,7 +52,7 @@ from protocol import (
 
 class PostContractRequest(BaseModel):
     contract: dict
-    principal_pubkey: str = ""
+    principal_pubkey: str
 
 class AcceptRequest(BaseModel):
     agent_pubkey: str
@@ -112,6 +116,63 @@ class RulingResponse(BaseModel):
 
 
 PLATFORM_URL = "https://fix.notruefireman.org"
+
+
+def _validate_contract(contract: dict):
+    """Validate contract fields. Raises HTTPException(400) on bad values."""
+    escrow = contract.get("escrow", {})
+    if escrow.get("bounty") is not None:
+        try:
+            bounty = Decimal(str(escrow["bounty"]))
+        except Exception:
+            raise HTTPException(400, "Invalid bounty value")
+        if bounty < Decimal(MINIMUM_BOUNTY):
+            raise HTTPException(400, f"Bounty below minimum ({MINIMUM_BOUNTY})")
+
+    execution = contract.get("execution", {})
+    if "max_attempts" in execution:
+        ma = execution["max_attempts"]
+        if not isinstance(ma, int) or ma < 1 or ma > 50:
+            raise HTTPException(400, "max_attempts must be between 1 and 50")
+    if "review_window" in execution:
+        rw = execution["review_window"]
+        if not isinstance(rw, (int, float)) or rw < 60 or rw > 86400:
+            raise HTTPException(400, "review_window must be between 60 and 86400 seconds")
+    if "timeout" in execution:
+        to = execution["timeout"]
+        if not isinstance(to, (int, float)) or to < 30 or to > 3600:
+            raise HTTPException(400, "timeout must be between 30 and 3600 seconds")
+
+
+def _platform_review(contract: dict):
+    """Review a contract at posting time. Reject spam/abuse.
+
+    Returns True if accepted, raises HTTPException(400) to reject.
+    """
+    # Platform policy: extend with content moderation as needed
+
+    # Reject suspiciously high bounties (likely test/spam)
+    escrow = contract.get("escrow", {})
+    if escrow.get("bounty"):
+        try:
+            bounty = Decimal(str(escrow["bounty"]))
+            if bounty > Decimal("100"):
+                raise HTTPException(400, "Bounty exceeds platform maximum (100 XNO)")
+        except Exception as e:
+            if isinstance(e, HTTPException):
+                raise
+            pass  # bounty validation handled elsewhere
+
+    # Reject if task command is empty
+    task = contract.get("task", {})
+    if not task.get("command") or not str(task.get("command", "")).strip():
+        raise HTTPException(400, "Task command cannot be empty")
+
+    # Reject empty task (no description of work)
+    if not task.get("type") and not task.get("error") and not task.get("command"):
+        raise HTTPException(400, "Task is empty — nothing to fix")
+
+    return True
 
 
 def _check_party(data: dict, pubkey: str, role: str):
@@ -189,8 +250,8 @@ def build_briefing(contract_id: str, data: dict) -> str:
         m = v.get("method", "?")
         if m == "exit_code":
             verify_parts.append(f"re-run the original command, exit 0 = success")
-        elif m == "human_judgment":
-            verify_parts.append("human judges the result")
+        elif m == "principal_verification":
+            verify_parts.append("principal verifies the result")
         elif m == "output_match":
             verify_parts.append(f"output must contain \"{v.get('pattern', '')}\"")
         else:
@@ -211,6 +272,7 @@ def build_briefing(contract_id: str, data: dict) -> str:
     agent_cancel_fee = cancel.get("agent_fee", "0") if cancel else "0"
     principal_cancel_fee = cancel.get("principal_fee", "0") if cancel else "0"
     grace_period = cancel.get("grace_period", 30) if cancel else 30
+    min_bond = terms.get("min_bond", "0")
     max_attempts = ex.get("max_attempts", 5)
     inv_rounds = ex.get("investigation_rounds", 5)
     inv_rate = ex.get("investigation_rate", 5)
@@ -260,6 +322,7 @@ PARTIES
      {inv_rounds} read-only commands on the Principal's machine
      to assess the problem before committing.
      Rate limit: one command per {inv_rate} seconds.
+     Bond required: {min_bond} {cur} (or judge fee, whichever is higher).
   c. Decline after investigating. Bond returned in full,
      no penalty. Contract reopens for another agent.
   d. Accept. The Agent commits to fixing the problem.
@@ -391,7 +454,6 @@ EXHIBIT A: PLATFORM API
 def create_app(
     store: ContractStore | None = None,
     escrow_mgr: EscrowManager | None = None,
-    reputation_mgr: ReputationManager | None = None,
     judge: AIJudge | None = None,
     court: TieredCourt | None = None,
     server_privkey: bytes | None = None,
@@ -432,20 +494,38 @@ def create_app(
     # Defaults
     _store = store or ContractStore()
     _escrow = escrow_mgr or EscrowManager()
-    _reputation = reputation_mgr or ReputationManager()
     _judge = judge  # Legacy single-judge (still works for basic disputes)
     _court = court  # Tiered court system (preferred)
+
+    # --- SSE event bus for agent subscriptions ---
+    # Use threading.Queue for cross-thread safety (TestClient uses threads)
+    import queue as _queue_mod
+    _sse_subscribers: list[_queue_mod.Queue] = []
+    _sse_lock = __import__('threading').Lock()
+
+    def _sse_publish(event_type: str, data: dict):
+        """Push an event to all connected SSE subscribers."""
+        payload = {"event": event_type, **data}
+        with _sse_lock:
+            dead = []
+            for q in _sse_subscribers:
+                try:
+                    q.put_nowait(payload)
+                except _queue_mod.Full:
+                    dead.append(q)
+            for q in dead:
+                _sse_subscribers.remove(q)
 
     # Expose for testing
     app.state.replay_guard = _replay_guard
     app.state.store = _store
     app.state.escrow = _escrow
-    app.state.reputation = _reputation
     app.state.judge = _judge
     app.state.court = _court
     app.state.server_privkey = _server_privkey
     app.state.server_pubkey = _server_pubkey
     app.state.server_fix_id = _server_fix_id
+    app.state.sse_publish = _sse_publish
 
     # --- Helpers ---
 
@@ -484,12 +564,6 @@ def create_app(
             escrow = _escrow.get(data["id"])
             if escrow and not escrow["resolved"]:
                 _escrow.resolve(data["id"], "fulfilled")
-            # Reputation
-            bounty = Decimal(data["contract"].get("escrow", {}).get("bounty", "0"))
-            if data.get("agent_pubkey"):
-                _reputation.record(data["agent_pubkey"], "agent", "fulfilled", bounty)
-            if data.get("principal_pubkey"):
-                _reputation.record(data["principal_pubkey"], "principal", "fulfilled", bounty)
             return _store.get(data["id"])
         return None
 
@@ -520,12 +594,12 @@ def create_app(
     @app.post("/contracts")
     async def post_contract(req: PostContractRequest, request: Request):
         """Post a new contract and lock escrow. Principal's bond locked upfront."""
-        # Auth is optional for contract posting (backward compat for anonymous posts)
-        if req.principal_pubkey:
-            authed = await _verify_auth(request, req.principal_pubkey)
-            _require_auth(authed)
+        authenticated = await _verify_auth(request, req.principal_pubkey)
+        _require_auth(authenticated)
 
         contract = req.contract
+        _validate_contract(contract)
+        _platform_review(contract)
 
         # Enforce minimum bounty
         escrow_data = contract.get("escrow", {})
@@ -547,18 +621,106 @@ def create_app(
             judge_fee = str(judge_info.get("fee", ""))
             if judge_fee:
                 terms["judge_fee"] = judge_fee
+            min_bond = str(terms.get("min_bond", "0"))
             _escrow.lock(contract_id, escrow_data["bounty"], terms,
-                        judge_account=judge_account, judge_fee=judge_fee)
+                        judge_account=judge_account, judge_fee=judge_fee,
+                        min_bond=min_bond)
+
+        # Notify SSE subscribers
+        task = contract.get("task", {})
+        _sse_publish("contract_posted", {
+            "contract_id": contract_id,
+            "status": "open",
+            "bounty": escrow_data.get("bounty", "0"),
+            "command": task.get("command", ""),
+            "min_bond": str(terms.get("min_bond", "0")) if terms else "0",
+        })
 
         return {"contract_id": contract_id, "status": "open", "server_pubkey": _server_pubkey.hex()}
 
     @app.get("/contracts")
     async def list_contracts(status: str = "open", limit: int = 50):
-        """List contracts by status (agents browse open ones)."""
+        """List contracts by status (agents browse open ones).
+
+        Lazy timeout: open contracts older than CONTRACT_PICKUP_TIMEOUT with
+        no agent activity are auto-canceled on read.
+        """
         contracts = _store.list_by_status(status, limit)
+        result = []
+        now = time.time()
         for c in contracts:
+            # Auto-cancel stale open contracts (lazy evaluation)
+            if c["status"] == "open" and c.get("created_at"):
+                age = now - c["created_at"]
+                if age > CONTRACT_PICKUP_TIMEOUT:
+                    try:
+                        _store.update_status(c["id"], "canceled")
+                        _server_sign_and_append(c["id"], "auto_fulfill", {
+                            "reason": "No agent accepted within timeout",
+                        })
+                        # Resolve escrow if present
+                        escrow = _escrow.get(c["id"])
+                        if escrow and not escrow["resolved"]:
+                            _escrow.resolve(c["id"], "canceled")
+                        c = _store.get(c["id"])
+                    except (ValueError, Exception):
+                        pass  # already transitioned or other issue
             c["briefing"] = build_briefing(c["id"], c)
-        return {"contracts": contracts}
+            result.append(c)
+        return {"contracts": result}
+
+    @app.get("/contracts/stream")
+    async def stream_contracts(
+        min_bounty: str = "0",
+        status: str = "",
+    ):
+        """SSE stream for agent subscriptions.
+
+        Pushes events when contracts are created, accepted, updated, or resolved.
+        Optional filters: min_bounty (XNO), status (only forward events for this status).
+
+        Usage:
+            curl -N http://localhost:8000/contracts/stream?min_bounty=0.1
+
+        Events:
+            data: {"event": "contract_posted", "contract_id": "...", "bounty": "0.5", ...}
+            data: {"event": "contract_accepted", "contract_id": "...", "agent": "..."}
+            data: {"event": "contract_resolved", "contract_id": "...", "outcome": "fulfilled"}
+        """
+        min_b = Decimal(min_bounty)
+        q = _queue_mod.Queue(maxsize=256)
+        with _sse_lock:
+            _sse_subscribers.append(q)
+
+        async def event_generator():
+            try:
+                while True:
+                    try:
+                        event = q.get(timeout=15.0)
+                        # Apply filters
+                        if min_b > 0:
+                            event_bounty = Decimal(event.get("bounty", "0"))
+                            if event_bounty < min_b:
+                                continue
+                        if status and event.get("status", "") != status:
+                            continue
+                        yield f"data: {json_mod.dumps(event)}\n\n"
+                    except _queue_mod.Empty:
+                        yield ": keepalive\n\n"
+            finally:
+                with _sse_lock:
+                    if q in _sse_subscribers:
+                        _sse_subscribers.remove(q)
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get("/contracts/{contract_id}")
     async def get_contract(contract_id: str):
@@ -584,7 +746,11 @@ def create_app(
 
     @app.post("/contracts/{contract_id}/bond")
     async def post_bond(contract_id: str, req: BondRequest, request: Request):
-        """Agent posts dispute bond to start investigating. OPEN -> INVESTIGATING."""
+        """Agent posts dispute bond to start investigating. OPEN -> INVESTIGATING.
+
+        Bond amount is max(judge_fee, contract.min_bond). min_bond lets principals
+        require agents to have more skin in the game (bond-as-reputation).
+        """
         authed = await _verify_auth(request, req.agent_pubkey)
         _require_auth(authed)
 
@@ -594,7 +760,7 @@ def create_app(
         if data["status"] != "open":
             raise HTTPException(409, "Contract not available")
 
-        # Lock agent bond
+        # Lock agent bond (amount is max of judge_fee and contract min_bond)
         try:
             bond_result = _escrow.lock_agent_bond(contract_id)
         except ValueError:
@@ -641,6 +807,11 @@ def create_app(
 
         _server_sign_and_append(contract_id, "accept", {
             "agent_pubkey": req.agent_pubkey,
+        })
+        _sse_publish("contract_accepted", {
+            "contract_id": contract_id,
+            "status": "in_progress",
+            "agent": req.agent_pubkey,
         })
         return {"status": "in_progress"}
 
@@ -827,15 +998,11 @@ def create_app(
             if escrow and not escrow["resolved"]:
                 _escrow.resolve(contract_id, ruling)
 
-            # Record reputation
-            updated = _store.get(contract_id)
-            if updated:
-                bounty = Decimal(data["contract"].get("escrow", {}).get("bounty", "0"))
-                if updated.get("agent_pubkey"):
-                    _reputation.record(updated["agent_pubkey"], "agent", ruling, bounty)
-                if updated.get("principal_pubkey"):
-                    _reputation.record(updated["principal_pubkey"], "principal", ruling, bounty)
-
+        _sse_publish("contract_resolved", {
+            "contract_id": contract_id,
+            "status": ruling,
+            "bounty": data["contract"].get("escrow", {}).get("bounty", "0"),
+        })
         return {"status": ruling}
 
     @app.post("/contracts/{contract_id}/review")
@@ -864,12 +1031,6 @@ def create_app(
             escrow = _escrow.get(contract_id)
             if escrow and not escrow["resolved"]:
                 _escrow.resolve(contract_id, "fulfilled")
-            # Reputation
-            bounty = Decimal(data["contract"].get("escrow", {}).get("bounty", "0"))
-            if data.get("agent_pubkey"):
-                _reputation.record(data["agent_pubkey"], "agent", "fulfilled", bounty)
-            if data.get("principal_pubkey"):
-                _reputation.record(data["principal_pubkey"], "principal", "fulfilled", bounty)
             return {"status": "fulfilled"}
 
         elif req.action == "dispute":
@@ -1006,19 +1167,6 @@ def create_app(
                 _escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
                               dispute_loser=dispute_loser)
 
-            # Reputation
-            bounty = Decimal(data["contract"].get("escrow", {}).get("bounty", "0"))
-            if data.get("agent_pubkey"):
-                agent_outcome = "fulfilled" if ruling.outcome == "fulfilled" else "canceled"
-                _reputation.record(data["agent_pubkey"], "agent", agent_outcome, bounty)
-                if "evil_agent" in ruling.flags:
-                    _reputation.record(data["agent_pubkey"], "agent", "evil_flag")
-            if data.get("principal_pubkey"):
-                principal_outcome = "fulfilled" if ruling.outcome == "fulfilled" else "canceled"
-                _reputation.record(data["principal_pubkey"], "principal", principal_outcome, bounty)
-                if "evil_principal" in ruling.flags:
-                    _reputation.record(data["principal_pubkey"], "principal", "evil_flag")
-
         return {
             "outcome": ruling.outcome,
             "reasoning": ruling.reasoning,
@@ -1040,6 +1188,15 @@ def create_app(
         data = _store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
+
+        if data["status"] not in ("in_progress", "review", "awaiting_response", "disputed"):
+            raise HTTPException(409, "Cannot dispute in current state")
+
+        # Free-mode check: no judge configured means no disputes
+        judge_info = data.get("contract", {}).get("judge", {})
+        judge_pubkey = judge_info.get("pubkey", "") if judge_info else ""
+        if not judge_pubkey:
+            raise HTTPException(400, "Disputes not available: no judge configured for this contract. This is a free-mode contract.")
 
         # Verify caller matches the side they claim
         _check_party(data, req.pubkey, req.side)
@@ -1224,6 +1381,22 @@ def create_app(
         if data["status"] != "disputed":
             raise HTTPException(409, "Contract not in disputed state")
 
+        # Verify there is a pending dispute that has timed out
+        transcript = data.get("transcript", [])
+        dispute_filed_at = None
+        for msg in reversed(transcript):
+            msg_type = msg.get("type", "")
+            if msg_type == "ruling":
+                break  # a ruling exists after the last dispute — not pending
+            if msg_type == "dispute_filed":
+                msg_data = msg.get("data", msg)
+                dispute_filed_at = msg_data.get("response_deadline", msg.get("timestamp", 0))
+                break
+        if dispute_filed_at is None:
+            raise HTTPException(409, "No pending dispute found")
+        if time.time() - dispute_filed_at < DEFAULT_RULING_TIMEOUT:
+            raise HTTPException(409, "Judge ruling timeout has not elapsed")
+
         _store.update_status(contract_id, "voided")
         _server_sign_and_append(contract_id, "voided", {"reason": "judge_timeout"})
 
@@ -1355,9 +1528,11 @@ def create_app(
 
     @app.get("/reputation/{pubkey}")
     async def get_reputation(pubkey: str):
-        """Get reputation stats for a pubkey."""
-        stats = _reputation.query(pubkey)
-        return stats.to_dict()
+        """Bond-as-reputation: reputation is determined by on-chain Nano balance."""
+        return {
+            "pubkey": pubkey,
+            "note": "Reputation is determined by on-chain balance. Check the Nano ledger directly for balance/history.",
+        }
 
     @app.post("/contracts/{contract_id}/accounts")
     async def set_accounts(contract_id: str, req: SetAccountsRequest, request: Request):

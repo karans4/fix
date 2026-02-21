@@ -81,7 +81,7 @@ fix --verify="pytest tests/" "pip install x"  # custom command
 ## Architecture
 
 - `fix` -- CLI entry point
-- `server/` -- FastAPI platform (contracts, escrow, reputation, judge)
+- `server/` -- FastAPI platform (contracts, escrow, judge; reputation via on-chain Nano balance)
 - `protocol.py` -- state machine, constants
 - `scrubber.py` -- redacts secrets from error output before sending to LLM
 - `contract.py` -- builds structured contracts

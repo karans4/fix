@@ -218,3 +218,32 @@ class FixClient:
     async def get_reputation(self, pubkey: str) -> dict:
         """Get reputation stats."""
         return await self.transport.get(f"/reputation/{pubkey}")
+
+    async def stream_contracts(self, min_bounty: str = "0",
+                               callback=None):
+        """Subscribe to SSE contract events.
+
+        Args:
+            min_bounty: Only receive events for contracts >= this bounty
+            callback: async callable(event_dict) called for each event
+
+        Usage:
+            async def on_event(event):
+                if event["event"] == "contract_posted":
+                    print(f"New contract: {event['contract_id']}")
+
+            await client.stream_contracts(min_bounty="0.1", callback=on_event)
+        """
+        import httpx
+
+        base = self.transport.base_url if hasattr(self.transport, 'base_url') else "http://localhost:8000"
+        url = f"{base}/contracts/stream?min_bounty={min_bounty}"
+
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", url, timeout=None) as resp:
+                async for line in resp.aiter_lines():
+                    if line.startswith("data: "):
+                        import json
+                        event = json.loads(line[6:])
+                        if callback:
+                            await callback(event)

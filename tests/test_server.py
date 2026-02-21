@@ -9,7 +9,6 @@ from starlette.testclient import TestClient
 from server.app import create_app
 from server.store import ContractStore
 from server.escrow import EscrowManager
-from server.reputation import ReputationManager
 from crypto import generate_ed25519_keypair, pubkey_to_fix_id
 from conftest import (
     signed_post, PRINCIPAL_PUBKEY, AGENT_PUBKEY,
@@ -25,6 +24,15 @@ AGENT2_PRIV = _a2_priv
 _x_priv, _x_pub = generate_ed25519_keypair()
 X_PUBKEY = pubkey_to_fix_id(_x_pub)
 X_PRIV = _x_priv
+
+
+def _set_test_accounts(app, cid):
+    """Set test payout accounts directly in escrow DB."""
+    app.state.escrow.db.execute(
+        "UPDATE escrows SET principal_account = ?, agent_account = ? WHERE contract_id = ?",
+        ("stub_principal", "stub_agent", cid),
+    )
+    app.state.escrow.db.commit()
 
 
 SAMPLE_CONTRACT = {
@@ -44,8 +52,7 @@ def app():
     """Fresh app with in-memory stores for each test."""
     store = ContractStore(":memory:")
     escrow_mgr = EscrowManager(":memory:")
-    reputation_mgr = ReputationManager(":memory:")
-    return create_app(store=store, escrow_mgr=escrow_mgr, reputation_mgr=reputation_mgr, server_privkey=SERVER_PRIV)
+    return create_app(store=store, escrow_mgr=escrow_mgr, server_privkey=SERVER_PRIV)
 
 
 @pytest.fixture
@@ -238,7 +245,7 @@ def test_submit_fix_wrong_status_409(client):
 
 # --- POST /contracts/{id}/verify ---
 
-def test_verify_success_fulfills(client):
+def test_verify_success_fulfills(app, client):
     data = _create_contract(client)
     cid = data["contract_id"]
     _accept_contract(client, cid)
@@ -246,6 +253,7 @@ def test_verify_success_fulfills(client):
         "fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY,
     }, AGENT_PUBKEY, AGENT_PRIV)
 
+    _set_test_accounts(app, cid)
     path = f"/contracts/{cid}/verify"
     resp = signed_post(client, path, {
         "success": True,
@@ -282,10 +290,11 @@ def test_verify_failure_retries(client):
     assert contract["status"] == "in_progress"
 
 
-def test_verify_failure_cancels_after_max_attempts(client):
+def test_verify_failure_cancels_after_max_attempts(app, client):
     data = _create_contract(client)
     cid = data["contract_id"]
     _accept_contract(client, cid)
+    _set_test_accounts(app, cid)
 
     # Exhaust all 5 attempts
     for i in range(5):
@@ -310,6 +319,7 @@ def test_verify_resolves_escrow(app, client):
     signed_post(client, f"/contracts/{cid}/fix", {
         "fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY,
     }, AGENT_PUBKEY, AGENT_PRIV)
+    _set_test_accounts(app, cid)
     signed_post(client, f"/contracts/{cid}/verify", {
         "success": True, "principal_pubkey": PRINCIPAL_PUBKEY,
     }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
@@ -318,32 +328,14 @@ def test_verify_resolves_escrow(app, client):
     assert escrow["resolved"] is True
 
 
-# --- GET /reputation/{pubkey} ---
+# --- GET /reputation/{pubkey} (bond-as-reputation) ---
 
-def test_get_reputation_empty(client):
+def test_get_reputation_returns_bond_note(client):
     resp = client.get("/reputation/unknown_key")
     assert resp.status_code == 200
     body = resp.json()
-    assert "as_agent" in body
-    assert "as_principal" in body
-
-
-def test_reputation_after_fulfillment(client):
-    data = _create_contract(client)
-    cid = data["contract_id"]
-    _accept_contract(client, cid)
-    signed_post(client, f"/contracts/{cid}/fix", {
-        "fix": "apt install gcc", "agent_pubkey": AGENT_PUBKEY,
-    }, AGENT_PUBKEY, AGENT_PRIV)
-    signed_post(client, f"/contracts/{cid}/verify", {
-        "success": True, "principal_pubkey": PRINCIPAL_PUBKEY,
-    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
-
-    agent_rep = client.get(f"/reputation/{AGENT_PUBKEY}").json()
-    assert agent_rep["as_agent"]["fulfilled"] == 1
-
-    principal_rep = client.get(f"/reputation/{PRINCIPAL_PUBKEY}").json()
-    assert principal_rep["as_principal"]["fulfilled"] == 1
+    assert body["pubkey"] == "unknown_key"
+    assert "on-chain balance" in body["note"]
 
 
 # --- 404 on nonexistent contract for various endpoints ---

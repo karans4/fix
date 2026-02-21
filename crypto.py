@@ -12,6 +12,7 @@ Dependencies: hashlib, hmac, json, os, cryptography
 import hashlib
 import hmac as hmac_mod
 import json
+import math
 import os
 import time as _time
 
@@ -38,7 +39,7 @@ def hash_chain_init() -> str:
 
 def hash_chain_append(chain: str, message: str) -> str:
     """Extend chain by one link: SHA256(chain || message)."""
-    combined = (chain + message).encode("utf-8")
+    combined = (chain + "\x00" + message).encode("utf-8")
     return sha256_hash(combined)
 
 
@@ -47,7 +48,7 @@ def hash_chain_verify(chain: str, messages: list[str]) -> bool:
     current = hash_chain_init()
     for msg in messages:
         current = hash_chain_append(current, msg)
-    return current == chain
+    return hmac_mod.compare_digest(current, chain)
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +154,22 @@ def fix_id_to_pubkey(fix_id: str) -> bytes:
 # Canonical JSON -- deterministic serialization for signing
 # ---------------------------------------------------------------------------
 
+def _reject_nan_inf(obj):
+    """Recursively check for NaN/Inf floats in a structure."""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            raise ValueError(f"Cannot serialize {obj} to canonical JSON")
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _reject_nan_inf(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _reject_nan_inf(v)
+
+
 def canonical_json(obj: dict) -> bytes:
     """Canonical JSON: sorted keys, no extra whitespace, UTF-8."""
+    _reject_nan_inf(obj)
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -199,6 +214,11 @@ def verify_chain_entry(entry: dict) -> tuple[bool, str]:
 
     Returns (ok, error_message).
     """
+    KNOWN_CHAIN_FIELDS = {"type", "data", "seq", "author", "prev_hash", "timestamp", "signature"}
+    extra = set(entry.keys()) - KNOWN_CHAIN_FIELDS
+    if extra:
+        return False, f"Unknown fields in chain entry: {extra}"
+
     try:
         author = entry.get("author", "")
         pubkey_bytes = fix_id_to_pubkey(author)

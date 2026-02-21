@@ -15,6 +15,15 @@ TERMS = {"cancellation": {"agent_fee": "0.002", "principal_fee": "0.003", "grace
 TERMS_WITH_JUDGE = {**TERMS, "judge_fee": "0.005"}
 
 
+def _set_stub_accounts(mgr, cid, principal="stub_principal", agent="stub_agent"):
+    """Set test accounts directly, bypassing nano address validation."""
+    mgr.db.execute(
+        "UPDATE escrows SET principal_account = ?, agent_account = ? WHERE contract_id = ?",
+        (principal, agent, cid),
+    )
+    mgr.db.commit()
+
+
 class TestCalculateFee(unittest.TestCase):
     def test_normal_fee(self):
         self.assertEqual(calculate_fee(Decimal("1.0"), Decimal("0.002")), Decimal("0.002"))
@@ -296,6 +305,7 @@ class TestEscrowManager(unittest.TestCase):
 
     def test_resolve(self):
         self.mgr.lock("c1", "0.05", TERMS)
+        _set_stub_accounts(self.mgr, "c1")
         result = self.mgr.resolve("c1", "fulfilled")
         self.assertEqual(result["action"], "release_to_agent")
         state = self.mgr.get("c1")
@@ -305,6 +315,7 @@ class TestEscrowManager(unittest.TestCase):
     def test_resolve_voided(self):
         self.mgr.lock("c1", "0.05", TERMS_WITH_JUDGE, judge_account="judge_abc")
         self.mgr.lock_agent_bond("c1")
+        _set_stub_accounts(self.mgr, "c1")
         result = self.mgr.resolve("c1", "voided")
         self.assertEqual(result["action"], "voided")
         state = self.mgr.get("c1")
@@ -313,6 +324,7 @@ class TestEscrowManager(unittest.TestCase):
     def test_resolve_with_dispute_loser(self):
         self.mgr.lock("c1", "0.05", TERMS_WITH_JUDGE, judge_account="judge_abc", judge_fee="0.005")
         self.mgr.lock_agent_bond("c1")
+        _set_stub_accounts(self.mgr, "c1")
         result = self.mgr.resolve("c1", "fulfilled", dispute_loser="principal")
         self.assertEqual(result["bond_loser"], "principal")
         self.assertEqual(result["bond_to_judge"], "0.005")
@@ -326,12 +338,14 @@ class TestEscrowManager(unittest.TestCase):
 
     def test_resolve_with_flags(self):
         self.mgr.lock("c2", "0.10", TERMS)
+        _set_stub_accounts(self.mgr, "c2")
         result = self.mgr.resolve("c2", "canceled", flags=["evil_agent"])
         self.assertEqual(result["action"], "return_to_principal")
         self.assertIn("forfeits", result["details"])
 
     def test_persistence_across_queries(self):
         self.mgr.lock("c1", "0.05", TERMS)
+        _set_stub_accounts(self.mgr, "c1")
         self.mgr.resolve("c1", "fulfilled")
         state = self.mgr.get("c1")
         self.assertTrue(state["resolved"])

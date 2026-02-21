@@ -56,7 +56,8 @@ def _parse_verify_spec(spec):
     """Turn a verify_spec into a verification list.
 
     None          -> [{"method": "exit_code", "expected": 0}]
-    "human"       -> [{"method": "human_judgment"}]
+    "human"       -> [{"method": "principal_verification"}]  (backward compat)
+    "principal"   -> [{"method": "principal_verification"}]
     "contains 'X'" -> [{"method": "output_match", "pattern": "X"}]
     list          -> recurse each element
     dict          -> pass through as-is
@@ -74,8 +75,8 @@ def _parse_verify_spec(spec):
         return [spec]
 
     if isinstance(spec, str):
-        if spec == "human":
-            return [{"method": "human_judgment"}]
+        if spec in ("human", "principal"):
+            return [{"method": "principal_verification"}]
         m = re.match(r"^contains\s+['\"](.+)['\"]$", spec)
         if m:
             return [{"method": "output_match", "pattern": m.group(1)}]

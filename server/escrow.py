@@ -212,9 +212,11 @@ class Escrow:
 class EscrowManager:
     """SQLite-backed escrow manager with pluggable payment backend."""
 
-    def __init__(self, db_path: str = ":memory:", payment_backend=None):
+    def __init__(self, db_path: str = ":memory:", payment_backend=None, platform_account: str = ""):
         from server.nano import StubBackend
+        from protocol import PLATFORM_ADDRESS
         self.payment = payment_backend or StubBackend()
+        self.platform_account = platform_account or PLATFORM_ADDRESS
         self.db = sqlite3.connect(db_path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self._lock = threading.Lock()
@@ -236,14 +238,18 @@ class EscrowManager:
                 judge_account TEXT,
                 judge_fee TEXT,
                 principal_bond_locked INTEGER DEFAULT 0,
-                agent_bond_locked INTEGER DEFAULT 0
+                agent_bond_locked INTEGER DEFAULT 0,
+                min_bond TEXT DEFAULT '0'
             )
         """)
         self.db.commit()
 
-    def lock(self, contract_id: str, bounty: str, terms: dict, judge_account: str = "", judge_fee: str = "") -> dict:
+    def lock(self, contract_id: str, bounty: str, terms: dict, judge_account: str = "",
+             judge_fee: str = "", min_bond: str = "0") -> dict:
         """Lock escrow for a contract. Creates escrow account via payment backend.
-        Also locks principal's dispute bond upfront."""
+        Also locks principal's dispute bond upfront.
+        min_bond: minimum bond agents must post (bond-as-reputation). Actual bond = max(judge_fee, min_bond).
+        """
         escrow = Escrow(bounty, terms)
         result = escrow.lock()
 
@@ -254,8 +260,8 @@ class EscrowManager:
         actual_judge_fee = judge_fee or str(escrow.judge_fee)
 
         self.db.execute(
-            "INSERT INTO escrows (contract_id, bounty, terms, locked, escrow_account, judge_account, judge_fee, principal_bond_locked) VALUES (?, ?, ?, 1, ?, ?, ?, 1)",
-            (contract_id, bounty, json.dumps(terms), escrow_account, judge_account, actual_judge_fee),
+            "INSERT INTO escrows (contract_id, bounty, terms, locked, escrow_account, judge_account, judge_fee, principal_bond_locked, min_bond) VALUES (?, ?, ?, 1, ?, ?, ?, 1, ?)",
+            (contract_id, bounty, json.dumps(terms), escrow_account, judge_account, actual_judge_fee, min_bond),
         )
         self.db.commit()
 
@@ -263,16 +269,21 @@ class EscrowManager:
         return result
 
     def lock_agent_bond(self, contract_id: str) -> dict:
-        """Lock agent's dispute bond when they start investigating."""
-        row = self.db.execute("SELECT judge_fee FROM escrows WHERE contract_id = ?", (contract_id,)).fetchone()
+        """Lock agent's dispute bond when they start investigating.
+        Bond amount = max(judge_fee, min_bond). min_bond is the principal's
+        trust requirement (bond-as-reputation)."""
+        row = self.db.execute("SELECT judge_fee, min_bond FROM escrows WHERE contract_id = ?", (contract_id,)).fetchone()
         if not row:
             raise ValueError(f"No escrow for contract {contract_id}")
+        judge_fee = Decimal(row["judge_fee"] or DEFAULT_JUDGE_FEE)
+        min_bond = Decimal(row["min_bond"] or "0")
+        actual_bond = max(judge_fee, min_bond)
         self.db.execute(
             "UPDATE escrows SET agent_bond_locked = 1 WHERE contract_id = ?",
             (contract_id,),
         )
         self.db.commit()
-        return {"status": "agent_bond_locked", "bond": row["judge_fee"] or DEFAULT_JUDGE_FEE}
+        return {"status": "agent_bond_locked", "bond": str(actual_bond), "judge_fee": str(judge_fee), "min_bond": str(min_bond)}
 
     def release_agent_bond(self, contract_id: str) -> dict:
         """Return agent's bond if they decline after investigating."""
@@ -396,29 +407,45 @@ class EscrowManager:
             result["actual_payout"] = str(payout)
             result["total_platform_fee"] = str(total_platform_fee)
 
-            # Move funds via payment backend
-            block_hash = None
+            # Require payout address for non-charity resolutions
+            if action == "release_to_agent" and not row["agent_account"]:
+                raise ValueError(f"Cannot resolve: agent has not set a payout address")
+            if action == "return_to_principal" and not row["principal_account"]:
+                raise ValueError(f"Cannot resolve: principal has not set a payout address")
+            if action == "voided" and not row["principal_account"]:
+                raise ValueError(f"Cannot resolve (void): principal has not set a payout address")
+
+            # Collect all pending payments
+            pending_payments = []
+            payout_str = str(payout)
+            if action == "release_to_agent" and row["agent_account"]:
+                pending_payments.append((row["agent_account"], payout_str, "main_payout"))
+            elif action == "return_to_principal" and row["principal_account"]:
+                pending_payments.append((row["principal_account"], payout_str, "main_payout"))
+            elif action == "voided" and row["principal_account"]:
+                pending_payments.append((row["principal_account"], payout_str, "main_payout"))
+            elif action == "send_to_charity":
+                if hasattr(self.payment, 'charity_account') and self.payment.charity_account:
+                    pending_payments.append((self.payment.charity_account, payout_str, "charity"))
+
+            # Route dispute bond to judge if applicable
+            if result.get("bond_to_judge") and row["judge_account"]:
+                pending_payments.append((row["judge_account"], result["bond_to_judge"], "judge_bond"))
+
+            # Platform fee: send to platform treasury if configured
+            if self.platform_account and total_platform_fee > 0 and action != "voided":
+                pending_payments.append((self.platform_account, str(total_platform_fee), "platform_fee"))
+
+            # Execute all payments — if any fail, none are committed as resolved
+            block_hashes = []
             try:
-                payout_str = str(payout)
-                if action == "release_to_agent" and row["agent_account"]:
-                    block_hash = self.payment.send(contract_id, row["agent_account"], payout_str)
-                elif action == "return_to_principal" and row["principal_account"]:
-                    block_hash = self.payment.send(contract_id, row["principal_account"], payout_str)
-                elif action == "voided" and row["principal_account"]:
-                    block_hash = self.payment.send(contract_id, row["principal_account"], payout_str)
-                elif action == "send_to_charity":
-                    if hasattr(self.payment, 'charity_account') and self.payment.charity_account:
-                        block_hash = self.payment.send(contract_id, self.payment.charity_account, payout_str)
-
-                # Route dispute bond to judge if applicable
-                if result.get("bond_to_judge") and row["judge_account"]:
-                    self.payment.send(contract_id, row["judge_account"], result["bond_to_judge"])
-
+                for to_account, amount, label in pending_payments:
+                    bh = self.payment.send(contract_id, to_account, amount)
+                    block_hashes.append((label, bh))
             except Exception as e:
-                # CRITICAL: Do NOT mark as resolved if payment fails.
-                # Funds stay in escrow for manual recovery.
                 result["payment_error"] = str(e)
                 result["payment_failed"] = True
+                result["completed_payments"] = block_hashes  # for manual recovery
                 self.db.execute(
                     "UPDATE escrows SET resolution = ? WHERE contract_id = ?",
                     (json.dumps(result), contract_id),
@@ -426,8 +453,8 @@ class EscrowManager:
                 self.db.commit()
                 return result
 
-            if block_hash:
-                result["block_hash"] = block_hash
+            if block_hashes:
+                result["block_hashes"] = {label: bh for label, bh in block_hashes}
 
             # Payment succeeded -- now mark as resolved
             self.db.execute(
