@@ -13,7 +13,8 @@ from server.app import create_app, build_briefing
 from server.store import ContractStore
 from server.escrow import EscrowManager
 from server.judge import AIJudge, TieredCourt
-from protocol import MINIMUM_BOUNTY, AGENT_PICKUP_DELAY
+from server.nano import NanoBackend
+from protocol import MINIMUM_BOUNTY, AGENT_PICKUP_DELAY, CHARITY_ADDRESS
 from decimal import Decimal
 
 API_KEY = os.environ.get("FIX_API_KEY", "")
@@ -27,7 +28,7 @@ FREE_MODELS = [
     "stepfun/step-3.5-flash:free",
     "z-ai/glm-4.5-air:free",
 ]
-DB_PATH = os.environ.get("FIX_DB", "/var/lib/fix/fix.db")
+DB_PATH = os.environ.get("FIX_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "fix.db"))
 KIMI_KEY = os.environ.get("KIMI_API_KEY", "")
 KIMI_BASE = os.environ.get("KIMI_BASE_URL", "https://api.moonshot.ai/v1")
 KIMI_MODEL = os.environ.get("KIMI_MODEL", "kimi-k2.5")
@@ -486,7 +487,12 @@ Respond with JSON only (no markdown):
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 store = ContractStore(DB_PATH)
-escrow_mgr = EscrowManager(DB_PATH.replace(".db", "_escrow.db"))
+nano = NanoBackend(
+    node_url=os.environ.get("FIX_NANO_NODE", "http://localhost:17076"),
+    charity_account=CHARITY_ADDRESS,
+    db_path=DB_PATH.replace(".db", "_nano.db"),
+)
+escrow_mgr = EscrowManager(DB_PATH.replace(".db", "_escrow.db"), payment_backend=nano)
 judge = AIJudge(model=MODEL, llm_call=judge_llm_call)
 court = TieredCourt(llm_call=kimi_judge_call if KIMI_KEY else judge_llm_call)
 

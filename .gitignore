@@ -12,3 +12,4 @@ sandbox/cow.c
 sandbox/*.so
 .fix.py
 config.py
+data/
