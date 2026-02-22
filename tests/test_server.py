@@ -40,8 +40,8 @@ SAMPLE_CONTRACT = {
     "capabilities": {},
     "verification": [{"method": "exit_code", "expected": 0}],
     "execution": {"sandbox": False, "root": None, "max_attempts": 5, "investigation_rounds": 5, "timeout": 300},
-    "escrow": {"bounty": "0.05", "currency": "XNO", "chain": "nano"},
-    "terms": {"cancellation": {"agent_fee": "0.002", "principal_fee": "0.002", "grace_period": 30}},
+    "escrow": {"bounty": "0.50", "currency": "XNO", "chain": "nano"},
+    "terms": {"cancellation": {"grace_period": 30}},
 }
 
 
@@ -90,7 +90,7 @@ def test_post_contract_locks_escrow(app, client):
     escrow = app.state.escrow.get(data["contract_id"])
     assert escrow is not None
     assert escrow["locked"] is True
-    assert escrow["bounty"] == "0.05"
+    assert escrow["bounty"] == "0.50"
 
 
 # --- GET /contracts ---

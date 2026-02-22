@@ -410,12 +410,6 @@ class FixAgent:
                 return False, f"bounty {bounty} below minimum {self.min_bounty}"
             if bounty > self.max_bounty:
                 return False, f"bounty {bounty} above maximum {self.max_bounty}"
-        # Check min_bond requirement against our capabilities
-        terms = contract.get("terms", {})
-        min_bond = terms.get("min_bond", "0")
-        if min_bond and Decimal(min_bond) > Decimal("0"):
-            pass  # Agent can check their own balance here if needed
-
         match, reason = capabilities_match(self.capabilities, contract)
         if not match:
             return False, reason

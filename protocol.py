@@ -11,11 +11,10 @@ from enum import Enum
 
 PROTOCOL_VERSION = 2
 
-DEFAULT_BOUNTY = "0.05"
+DEFAULT_BOUNTY = "0.19"
 DEFAULT_CURRENCY = "XNO"
 DEFAULT_CHAIN = "nano"
-DEFAULT_CANCEL_FEE = "0.005"
-MINIMUM_BOUNTY = "0.05"
+MINIMUM_BOUNTY = "0.19"
 GRACE_PERIOD_SECONDS = 30
 ABANDONMENT_TIMEOUT = 120
 MAX_INVESTIGATION_ROUNDS = 5
@@ -32,7 +31,9 @@ DEFAULT_REVIEW_WINDOW = 7200  # 2 hours
 # Judge defaults
 DEFAULT_JUDGE_FEE = "0.17"  # XNO -- each side stakes this as dispute bond
 DEFAULT_RULING_TIMEOUT = 60  # seconds judge has to rule
-DEFAULT_MIN_BOND = "0"  # XNO -- minimum bond to accept a contract (0 = judge fee only)
+# Inclusive bond: bounty + judge_fee. Both sides pay the same.
+MIN_BOUNTY_EXCESS = Decimal("0.02")  # Minimum bounty above judge_fee
+CANCEL_FEE_RATE = Decimal("0.20")    # 20% of excess bond (bounty) on cancellation
 
 # Tiered court system: escalating models and fees
 COURT_TIERS = [

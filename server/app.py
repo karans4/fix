@@ -45,6 +45,7 @@ from protocol import (
     MODE_SUPERVISED, MODE_AUTONOMOUS, COURT_TIERS, MAX_DISPUTE_LEVEL,
     DISPUTE_RESPONSE_WINDOW, PLATFORM_FEE_RATE, PLATFORM_FEE_MIN, MINIMUM_BOUNTY,
     SERVER_ENTRY_TYPES, CONTRACT_PICKUP_TIMEOUT, DISPUTE_BOND,
+    MIN_BOUNTY_EXCESS, CANCEL_FEE_RATE, DEFAULT_JUDGE_FEE,
 )
 
 
@@ -119,7 +120,10 @@ PLATFORM_URL = "https://fix.notruefireman.org"
 
 
 def _validate_contract(contract: dict):
-    """Validate contract fields. Raises HTTPException(400) on bad values."""
+    """Validate contract fields. Raises HTTPException(400) on bad values.
+
+    Inclusive bond model: bounty >= judge_fee + MIN_BOUNTY_EXCESS (0.19 XNO).
+    """
     escrow = contract.get("escrow", {})
     if escrow.get("bounty") is not None:
         try:
@@ -127,7 +131,7 @@ def _validate_contract(contract: dict):
         except Exception:
             raise HTTPException(400, "Invalid bounty value")
         if bounty < Decimal(MINIMUM_BOUNTY):
-            raise HTTPException(400, f"Bounty below minimum ({MINIMUM_BOUNTY})")
+            raise HTTPException(400, f"Bounty below minimum ({MINIMUM_BOUNTY} XNO = judge_fee + {MIN_BOUNTY_EXCESS})")
 
     # Validate judge fee covers court costs
     judge_info = contract.get("judge", {})
@@ -278,17 +282,20 @@ def build_briefing(contract_id: str, data: dict) -> str:
     cur = escrow.get("currency", "XNO") if escrow else "XNO"
     judge_info = terms.get("judge", {})
     judge_name = judge_info.get("pubkey", "") or "platform AI judge"
-    judge_fee = judge_info.get("fee", "0") if judge_info else "0"
+    judge_fee = judge_info.get("fee", DEFAULT_JUDGE_FEE) if judge_info else DEFAULT_JUDGE_FEE
     cancel = terms.get("cancellation", {})
-    agent_cancel_fee = cancel.get("agent_fee", "0") if cancel else "0"
-    principal_cancel_fee = cancel.get("principal_fee", "0") if cancel else "0"
     grace_period = cancel.get("grace_period", 30) if cancel else 30
-    min_bond = terms.get("min_bond", "0")
     max_attempts = ex.get("max_attempts", 5)
     inv_rounds = ex.get("investigation_rounds", 5)
     inv_rate = ex.get("investigation_rate", 5)
     timeout_s = ex.get("timeout", 300)
     sandbox = "Yes (OverlayFS). Changes only committed if verification passes." if ex.get("sandbox") else "No."
+
+    # Inclusive bond model
+    try:
+        inclusive_bond = str(Decimal(bounty) + Decimal(judge_fee))
+    except Exception:
+        inclusive_bond = bounty
 
     return f"""SERVICE CONTRACT
 ================
@@ -319,21 +326,28 @@ PARTIES
   The Agent shall cause the above command to succeed on the
   Principal's machine.
 
-2. CONSIDERATION
+2. CONSIDERATION (INCLUSIVE BOND MODEL)
 
-  Upon successful completion, the Principal shall pay the Agent
-  {bounty} {cur}.
+  Bounty (contract value): {bounty} {cur}
+  Judge fee (dispute insurance): {judge_fee} {cur}
+  Inclusive bond (per side): {inclusive_bond} {cur}
+
+  Both parties deposit the same amount ({inclusive_bond} {cur}).
+  Total in escrow: {inclusive_bond} x 2 = {str(Decimal(inclusive_bond) * 2)} {cur}.
+
+  Platform fee: 10% of bounty on all completed contracts.
+  Cancellation fee: 20% of bounty if either side backs out
+  post-grace (split 10% reimbursement + 10% platform).
 
 3. AGENT OPTIONS
 
   Upon receiving this contract, the Agent may:
 
   a. Decline immediately. No bond required, no penalty.
-  b. Post bond and investigate. The Agent may run up to
-     {inv_rounds} read-only commands on the Principal's machine
-     to assess the problem before committing.
+  b. Post inclusive bond ({inclusive_bond} {cur}) and investigate.
+     The Agent may run up to {inv_rounds} read-only commands on
+     the Principal's machine to assess the problem.
      Rate limit: one command per {inv_rate} seconds.
-     Bond required: {min_bond} {cur} (or judge fee, whichever is higher).
   c. Decline after investigating. Bond returned in full,
      no penalty. Contract reopens for another agent.
   d. Accept. The Agent commits to fixing the problem.
@@ -385,31 +399,26 @@ PARTIES
 
 7. REMEDIES
 
-  a. Success: bounty ({bounty} {cur}) released to Agent.
+  a. Success: bounty ({bounty} {cur}) released to Agent minus
+     10% platform fee. Agent's bond returned. Principal's
+     judge fee returned.
   b. Failure (all {max_attempts} attempts exhausted): contract
-     canceled, bounty returned to Principal. Agent's
-     cancellation fee of {agent_cancel_fee} {cur} deducted
-     from Agent's bond.
-  c. Dispute: three-tier court system. The losing party
-     may appeal to the next court. Each tier uses a more
-     capable (and expensive) judge:
+     canceled, bounty returned to Principal minus platform fee.
+  c. Cancellation within {grace_period}s: no penalty, both
+     sides get everything back.
+  d. Late cancellation: 20% of bounty deducted from canceler.
+     10% reimburses counterparty, 10% to platform.
+  e. Dispute: three-tier court system. Loser pays tier fee
+     from their judge fee portion:
 
-       District court:  {COURT_TIERS[0]['fee']} {cur}  (fast, first pass)
-       Appeals court:   {COURT_TIERS[1]['fee']} {cur}  (thorough review)
-       Supreme court:   {COURT_TIERS[2]['fee']} {cur}  (FINAL, no appeal)
+       District court:  {COURT_TIERS[0]['fee']} {cur}
+       Appeals court:   {COURT_TIERS[1]['fee']} {cur}
+       Supreme court:   {COURT_TIERS[2]['fee']} {cur}  (FINAL)
 
-     Platform fee: 10% of bounty per side (min 0.005 {cur}).
-     Deducted from both parties on every resolution.
-
-     Fee paid by the losing party from their dispute bond.
-     The prevailing party's bond is returned in full.
-     Only the loser of the previous ruling may appeal.
-  d. Judge timeout: contract voided, all funds (bounty,
-     both bonds) returned to both parties.
-  e. Cancellation within {grace_period}s of acceptance:
-     no penalty, bond returned. Late cancellation:
-     Agent fee {agent_cancel_fee} {cur},
-     Principal fee {principal_cancel_fee} {cur}.
+     Winner's bond and judge fee returned in full.
+     Loser gets (judge_fee - tier_fee) back.
+     Evil ruling: loser's bounty portion goes to charity.
+  f. Judge timeout: contract voided, everything returned.
 
 8. COMMUNICATION
 
@@ -635,16 +644,13 @@ def create_app(
         if escrow_data.get("bounty"):
             terms = contract.get("terms", {})
             terms["cancellation"] = terms.get("cancellation", {})
-            # Pass judge info
+            # Pass judge fee if specified
             judge_info = contract.get("judge", {})
-            judge_account = judge_info.get("pubkey", "")
             judge_fee = str(judge_info.get("fee", ""))
             if judge_fee:
                 terms["judge_fee"] = judge_fee
-            min_bond = str(terms.get("min_bond", "0"))
             _escrow.lock(contract_id, escrow_data["bounty"], terms,
-                        judge_account=judge_account, judge_fee=judge_fee,
-                        min_bond=min_bond)
+                        judge_fee=judge_fee)
 
         # Notify SSE subscribers
         task = contract.get("task", {})
@@ -654,7 +660,6 @@ def create_app(
             "status": "open",
             "bounty": escrow_data.get("bounty", "0"),
             "command": task.get("command", ""),
-            "min_bond": str(terms.get("min_bond", "0")),
         })
 
         return {"contract_id": contract_id, "status": "open", "server_pubkey": _server_pubkey.hex()}
@@ -776,10 +781,9 @@ def create_app(
 
     @app.post("/contracts/{contract_id}/bond")
     async def post_bond(contract_id: str, req: BondRequest, request: Request):
-        """Agent posts dispute bond to start investigating. OPEN -> INVESTIGATING.
+        """Agent deposits inclusive bond to start investigating. OPEN -> INVESTIGATING.
 
-        Bond amount is max(judge_fee, contract.min_bond). min_bond lets principals
-        require agents to have more skin in the game (bond-as-reputation).
+        Inclusive bond = bounty + judge_fee. Both sides pay the same amount.
         """
         authed = await _verify_auth(request, req.agent_pubkey)
         _require_auth(authed)
@@ -790,9 +794,9 @@ def create_app(
         if data["status"] != "open":
             raise HTTPException(409, "Contract not available")
 
-        # Lock agent bond (amount is max of judge_fee and contract min_bond)
+        # Lock agent's inclusive bond
         try:
-            bond_result = _escrow.lock_agent_bond(contract_id)
+            bond_result = _escrow.lock_agent(contract_id)
         except ValueError:
             bond_result = {"status": "no_escrow"}
 
@@ -807,7 +811,7 @@ def create_app(
             if cursor.rowcount == 0:
                 # Race condition: another agent got it first, undo escrow lock
                 try:
-                    _escrow.release_agent_bond(contract_id)
+                    _escrow.release_agent(contract_id)
                 except ValueError:
                     pass
                 raise HTTPException(409, "Contract already taken by another agent")
@@ -870,9 +874,9 @@ def create_app(
         # Verify the caller is the investigating agent
         _check_party(data, req.agent_pubkey, "agent")
 
-        # Release agent bond
+        # Release agent's inclusive bond
         try:
-            _escrow.release_agent_bond(contract_id)
+            _escrow.release_agent(contract_id)
         except ValueError:
             pass
 
@@ -1651,7 +1655,7 @@ def create_app(
         if not authenticated:
             # Unauthenticated: strip sensitive fields
             data = {k: v for k, v in data.items()
-                    if k not in ("principal_account", "agent_account", "judge_account", "escrow_account")}
+                    if k not in ("principal_account", "agent_account", "escrow_account")}
             return data
 
         # Authenticated: verify party membership
@@ -1673,6 +1677,23 @@ def create_app(
             "in_progress": in_progress,
             "fulfilled": fulfilled,
             "total": open_contracts + in_progress + fulfilled,
+        }
+
+    @app.get("/platform_info")
+    async def platform_info():
+        """Advertised platform rates and minimums."""
+        return {
+            "model": "inclusive_bond",
+            "min_bounty": MINIMUM_BOUNTY,
+            "judge_fee": DEFAULT_JUDGE_FEE,
+            "min_inclusive_bond": str(Decimal(MINIMUM_BOUNTY) + Decimal(DEFAULT_JUDGE_FEE)),
+            "platform_fee_rate": str(PLATFORM_FEE_RATE),
+            "platform_fee_min": str(PLATFORM_FEE_MIN),
+            "cancel_fee_rate": str(CANCEL_FEE_RATE),
+            "court_tiers": [
+                {"name": t["name"], "fee": t["fee"]} for t in COURT_TIERS
+            ],
+            "currency": "XNO",
         }
 
     return app

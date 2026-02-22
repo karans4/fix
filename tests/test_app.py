@@ -43,8 +43,8 @@ SAMPLE_CONTRACT = {
     "capabilities": {},
     "verification": [{"method": "exit_code", "expected": 0}],
     "execution": {"sandbox": False, "root": None, "max_attempts": 5, "investigation_rounds": 5, "timeout": 300},
-    "escrow": {"bounty": "0.5", "currency": "XNO", "chain": "nano"},
-    "terms": {"cancellation": {"agent_fee": "0.002", "principal_fee": "0.002", "grace_period": 30}},
+    "escrow": {"bounty": "0.50", "currency": "XNO", "chain": "nano"},
+    "terms": {"cancellation": {"grace_period": 30}},
 }
 
 AUTONOMOUS_CONTRACT = {
@@ -126,8 +126,7 @@ def test_judge_fee_in_escrow(app, client):
     escrow = app.state.escrow.get(data["contract_id"])
     assert escrow is not None
     assert escrow["judge_fee"] == "0.17"
-    assert escrow["judge_account"] == TEST_AGENT_ADDR
-    assert escrow["principal_bond_locked"] is True
+    assert escrow["principal_locked"] is True
 
 
 # --- Bond lifecycle (OPEN -> INVESTIGATING -> IN_PROGRESS or OPEN) ---
@@ -174,7 +173,7 @@ def test_bond_then_decline(client, app):
 
     # Agent bond should be released
     escrow = app.state.escrow.get(cid)
-    assert escrow["agent_bond_locked"] is False
+    assert escrow["agent_locked"] is False
 
 
 def test_decline_wrong_status_409(client):
@@ -541,7 +540,7 @@ def test_halt_not_found(client):
 def test_principal_bond_locked_on_create(app, client):
     data = _create_contract(client, JUDGE_CONTRACT)
     escrow = app.state.escrow.get(data["contract_id"])
-    assert escrow["principal_bond_locked"] is True
+    assert escrow["principal_locked"] is True
 
 
 def test_agent_bond_locked_on_bond(app, client):
@@ -549,7 +548,7 @@ def test_agent_bond_locked_on_bond(app, client):
     cid = data["contract_id"]
     signed_post(client, f"/contracts/{cid}/bond", {"agent_pubkey": AGENT_PUBKEY}, AGENT_PUBKEY, AGENT_PRIV)
     escrow = app.state.escrow.get(cid)
-    assert escrow["agent_bond_locked"] is True
+    assert escrow["agent_locked"] is True
 
 
 # --- Review dispute with judge ---
@@ -598,7 +597,7 @@ def test_review_dispute_with_judge(app):
     # Escrow resolved with bond routing
     escrow = escrow_mgr.get(cid)
     assert escrow["resolved"] is True
-    assert escrow["resolution"]["bond_loser"] == "principal"  # principal lost
+    assert escrow["resolution"]["dispute_loser"] == "principal"  # principal lost
 
 
 def test_dispute_with_judge_agent_loses():
@@ -618,7 +617,7 @@ def test_dispute_with_judge_agent_loses():
     assert body["outcome"] == "canceled"
 
     escrow = escrow_mgr.get(cid)
-    assert escrow["resolution"]["bond_loser"] == "agent"
+    assert escrow["resolution"]["dispute_loser"] == "agent"
 
 
 def test_review_dispute_requires_argument(client):
@@ -964,13 +963,12 @@ def test_dispute_status_endpoint():
 
 
 def test_platform_fee_in_resolution():
-    """Platform fee is 10% of bounty, charged to principal only."""
+    """Platform fee is 10% of bounty."""
     from server.escrow import Escrow
-    escrow = Escrow("1.0", {"judge_fee": "0.21"})
+    escrow = Escrow("1.0", {"judge_fee": "0.17"})
     escrow.lock()
     result = escrow.resolve("fulfilled")
     assert "platform_fee" in result
-    # 10% of 1.0 = 0.100, principal only
     assert Decimal(result["platform_fee"]) == Decimal("0.1")
 
 
@@ -980,7 +978,6 @@ def test_platform_fee_minimum():
     escrow = Escrow("0.01", {"judge_fee": "0.17"})
     escrow.lock()
     result = escrow.resolve("fulfilled")
-    # 10% of 0.01 = 0.001, but min is 0.002
     assert Decimal(result["platform_fee"]) == Decimal("0.002")
 
 
@@ -1317,3 +1314,20 @@ def test_chat_msg_type_role_validation(client):
         "pubkey": PRINCIPAL_PUBKEY,
     }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 400
+
+
+# --- Platform info endpoint ---
+
+def test_platform_info(client):
+    """GET /platform_info returns advertised rates."""
+    resp = client.get("/platform_info")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["model"] == "inclusive_bond"
+    assert body["min_bounty"] == "0.19"
+    assert body["judge_fee"] == "0.17"
+    assert body["currency"] == "XNO"
+    assert body["cancel_fee_rate"] == "0.20"
+    assert body["platform_fee_rate"] == "0.10"
+    assert len(body["court_tiers"]) == 3
+    assert body["court_tiers"][0]["name"] == "district"

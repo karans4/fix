@@ -169,7 +169,7 @@ def build_contract(command, stderr, env_info, **kwargs):
 
     # Market mode: add escrow + terms
     if market:
-        bounty_str = str(bounty) if bounty else "0.05"
+        bounty_str = str(bounty) if bounty else "0.19"
         contract["escrow"] = {
             "bounty": bounty_str,
             "currency": "XNO",
@@ -178,8 +178,6 @@ def build_contract(command, stderr, env_info, **kwargs):
         }
         contract["terms"] = {
             "cancellation": {
-                "agent_fee": "0.002",
-                "principal_fee": "0.002",
                 "grace_period": 30,
             },
             "abandonment": {

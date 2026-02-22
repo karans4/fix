@@ -331,8 +331,9 @@ def test_escrow_fulfilled():
     principal_info = principal_nano.create_escrow_account("principal_wallet")
     principal_addr = principal_info["account"]
 
-    fund_escrow(mgr, cid)
-    assert nano.check_deposit(cid, "0.5") is True
+    # Inclusive bond model: fund with 2 * inclusive_bond (both sides' deposits)
+    # bounty=0.5 + judge_fee=0.17 = 0.67 per side, 1.34 total
+    fund_escrow(mgr, cid, "1.34")
 
     mgr.set_accounts(cid, principal_account=principal_addr, agent_account=agent_addr)
 
@@ -361,7 +362,7 @@ def test_escrow_canceled():
     agent_info = agent_nano.create_escrow_account("agent_wallet")
     agent_addr = agent_info["account"]
 
-    fund_escrow(mgr, cid)
+    fund_escrow(mgr, cid, "1.34")
 
     mgr.set_accounts(cid, principal_account=principal_addr, agent_account=agent_addr)
 
@@ -382,7 +383,7 @@ def test_escrow_double_resolve_blocked():
     cid = f"test_dbl_{secrets.token_hex(4)}"
     mgr.lock(cid, "0.5", {})
 
-    fund_escrow(mgr, cid)
+    fund_escrow(mgr, cid, "1.34")
 
     agent_nano = make_nano_backend(seed="ff" * 32)
     agent_info = agent_nano.create_escrow_account("agent_wallet")
@@ -414,10 +415,9 @@ def test_seed_deleted_after_derive():
     b = make_nano_backend()
     assert not hasattr(b, 'seed')
 
-def test_escrow_lock_validates_judge_address():
-    """1.4: EscrowManager.lock() validates judge_account."""
+def test_escrow_requires_valid_platform_account():
+    """Platform account validated at EscrowManager init."""
     import pytest
     nano = make_nano_backend()
-    mgr = EscrowManager(payment_backend=nano)
-    with pytest.raises(ValueError, match="Invalid judge Nano address"):
-        mgr.lock("test_judge_addr", "0.5", {}, judge_account="bad_address")
+    with pytest.raises(ValueError, match="Invalid platform Nano address"):
+        EscrowManager(payment_backend=nano, platform_account="bad_address")
