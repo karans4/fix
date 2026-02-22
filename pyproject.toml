@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fix-cli"
-version = "0.6.2"
+version = "0.6.3"
 description = "AI-powered command fixer with contract-based dispute resolution"
 readme = "README.md"
 license = {text = "AGPL-3.0-or-later"}
