@@ -2646,23 +2646,22 @@ def apply_fix(fix_cmd, original_cmd, verify_spec, safe_mode, cfg, contract=None)
             msg += " System unchanged."
         status(f"{C_YELLOW}\u2718{C_RESET}", msg)
         if contract and contract.get("escrow"):
-            cancel_fee = contract.get("terms", {}).get("cancellation", {}).get("agent_fee", "0.002")
             bounty = contract["escrow"]["bounty"]
             both_evil = "evil_agent" in judge_flags and "evil_principal" in judge_flags
             agent_evil = "evil_agent" in judge_flags
             principal_evil = "evil_principal" in judge_flags
             if both_evil:
                 status(f"{C_RED}${C_RESET}",
-                       f"Escrow: {bounty} + fees donated to charity (both parties flagged)")
+                       f"Escrow: {bounty} + bonds donated to charity (both parties flagged)")
             elif agent_evil:
                 status(f"{C_RED}${C_RESET}",
-                       f"Escrow: {bounty} returned to principal (agent flagged, forfeits cancellation fee)")
+                       f"Escrow: {bounty} returned to principal (agent flagged, bond to charity)")
             elif principal_evil:
                 status(f"{C_RED}${C_RESET}",
                        f"Escrow: {bounty} donated to charity (principal flagged)")
             else:
                 status(f"{C_DIM}${C_RESET}",
-                       f"Escrow: {bounty} returned to principal (agent pays {cancel_fee} cancellation fee)")
+                       f"Escrow: {bounty} returned to principal (minus platform fee)")
 
     return 0 if success else 1
 
