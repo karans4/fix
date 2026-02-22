@@ -44,7 +44,7 @@ from protocol import (
     DEFAULT_REVIEW_WINDOW, DEFAULT_INVESTIGATION_RATE, DEFAULT_RULING_TIMEOUT,
     MODE_SUPERVISED, MODE_AUTONOMOUS, COURT_TIERS, MAX_DISPUTE_LEVEL,
     DISPUTE_RESPONSE_WINDOW, PLATFORM_FEE_RATE, PLATFORM_FEE_MIN, MINIMUM_BOUNTY,
-    SERVER_ENTRY_TYPES, CONTRACT_PICKUP_TIMEOUT,
+    SERVER_ENTRY_TYPES, CONTRACT_PICKUP_TIMEOUT, DISPUTE_BOND,
 )
 
 
@@ -128,6 +128,17 @@ def _validate_contract(contract: dict):
             raise HTTPException(400, "Invalid bounty value")
         if bounty < Decimal(MINIMUM_BOUNTY):
             raise HTTPException(400, f"Bounty below minimum ({MINIMUM_BOUNTY})")
+
+    # Validate judge fee covers court costs
+    judge_info = contract.get("judge", {})
+    if judge_info and judge_info.get("fee") is not None:
+        try:
+            jfee = Decimal(str(judge_info["fee"]))
+            min_required = Decimal(DISPUTE_BOND)
+            if jfee < min_required:
+                raise HTTPException(400, f"Judge fee {jfee} below minimum required ({DISPUTE_BOND} XNO = sum of all court tier fees)")
+        except (ValueError, TypeError):
+            raise HTTPException(400, "Invalid judge fee value")
 
     execution = contract.get("execution", {})
     if "max_attempts" in execution:

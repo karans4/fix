@@ -54,12 +54,12 @@ AUTONOMOUS_CONTRACT = {
 
 JUDGE_CONTRACT = {
     **SAMPLE_CONTRACT,
-    "judge": {"pubkey": TEST_AGENT_ADDR, "fee": "0.005", "ruling_timeout": 60},
+    "judge": {"pubkey": TEST_AGENT_ADDR, "fee": "0.17", "ruling_timeout": 60},
 }
 
 AUTONOMOUS_JUDGE_CONTRACT = {
     **AUTONOMOUS_CONTRACT,
-    "judge": {"pubkey": TEST_AGENT_ADDR, "fee": "0.005", "ruling_timeout": 60},
+    "judge": {"pubkey": TEST_AGENT_ADDR, "fee": "0.17", "ruling_timeout": 60},
 }
 
 
@@ -125,7 +125,7 @@ def test_judge_fee_in_escrow(app, client):
     data = _create_contract(client, JUDGE_CONTRACT)
     escrow = app.state.escrow.get(data["contract_id"])
     assert escrow is not None
-    assert escrow["judge_fee"] == "0.005"
+    assert escrow["judge_fee"] == "0.17"
     assert escrow["judge_account"] == TEST_AGENT_ADDR
     assert escrow["principal_bond_locked"] is True
 

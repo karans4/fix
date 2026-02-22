@@ -173,8 +173,8 @@ class TestPanelJudge:
         assert "2/3" in ruling.reasoning
 
     @pytest.mark.asyncio
-    async def test_all_judges_fail_returns_canceled(self):
-        """If every judge raises, return canceled."""
+    async def test_all_judges_fail_returns_impossible(self):
+        """If every judge raises, return impossible (no penalty to either side)."""
         class FailJudge(AIJudge):
             async def rule(self, evidence):
                 raise RuntimeError("kaboom")
@@ -182,7 +182,7 @@ class TestPanelJudge:
         panel = PanelJudge([FailJudge(), FailJudge()])
         ev = make_evidence()
         ruling = await panel.rule(ev)
-        assert ruling.outcome == "canceled"
+        assert ruling.outcome == "impossible"
         assert "All judges failed" in ruling.reasoning
 
     def test_requires_at_least_two_judges(self):

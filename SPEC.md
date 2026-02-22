@@ -557,7 +557,7 @@ server/
   store.py          SQLite contract storage + chain validation
   escrow.py         Payment routing logic
   judge.py          AI judge + tiered courts
-  nano.py           Nano payment backend (NanoBackend, SimBackend, StubBackend)
+  nano.py           Nano payment backend (NanoBackend)
   static/           Frontend SPA
 
 tests/

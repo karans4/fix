@@ -13,7 +13,8 @@ from crypto import generate_ed25519_keypair, pubkey_to_fix_id
 from conftest import (
     signed_post, PRINCIPAL_PUBKEY, AGENT_PUBKEY,
     PRINCIPAL_PRIV, AGENT_PRIV, AGENT_PUB_HEX, PRINCIPAL_PUB_HEX,
-    SERVER_PRIV,
+    SERVER_PRIV, make_nano_backend, set_funded_accounts, fund_escrow,
+    TEST_PRINCIPAL_ADDR, TEST_AGENT_ADDR,
 )
 
 # Ad-hoc keypairs for tests that need extra identities
@@ -27,12 +28,9 @@ X_PRIV = _x_priv
 
 
 def _set_test_accounts(app, cid):
-    """Set test payout accounts directly in escrow DB."""
-    app.state.escrow.db.execute(
-        "UPDATE escrows SET principal_account = ?, agent_account = ? WHERE contract_id = ?",
-        ("stub_principal", "stub_agent", cid),
-    )
-    app.state.escrow.db.commit()
+    """Set real nano payout addresses in escrow DB and fund the escrow."""
+    set_funded_accounts(app.state.escrow, cid, TEST_PRINCIPAL_ADDR, TEST_AGENT_ADDR)
+    fund_escrow(app.state.escrow, cid)
 
 
 SAMPLE_CONTRACT = {
@@ -51,7 +49,7 @@ SAMPLE_CONTRACT = {
 def app():
     """Fresh app with in-memory stores for each test."""
     store = ContractStore(":memory:")
-    escrow_mgr = EscrowManager(":memory:")
+    escrow_mgr = EscrowManager(":memory:", payment_backend=make_nano_backend())
     return create_app(store=store, escrow_mgr=escrow_mgr, server_privkey=SERVER_PRIV)
 
 
