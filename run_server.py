@@ -281,7 +281,7 @@ def run_free_agent(store, escrow_mgr):
                         (AGENT_KEY, time.time(), cid),
                     )
                     store.db.commit()
-                store.append_message(cid, {"type": "bond", "agent_pubkey": AGENT_KEY, "from": "agent"})
+                store._append_message(cid, {"type": "bond", "agent_pubkey": AGENT_KEY, "from": "agent"})
 
                 # Ask LLM what to investigate
                 inv_prompt = f"""You are a contract agent. Read this contract and decide what
@@ -315,7 +315,7 @@ If the error is obvious and you don't need to investigate, respond:
                 inv_results = {}
                 max_rounds = contract.get("execution", {}).get("investigation_rounds", 5)
                 for cmd in inv_commands[:max_rounds]:
-                    store.append_message(cid, {
+                    store._append_message(cid, {
                         "type": "investigate",
                         "command": cmd,
                         "from": "agent",
@@ -350,7 +350,7 @@ If the error is obvious and you don't need to investigate, respond:
                 if not data or data["status"] != "investigating":
                     continue
                 store.update_status(cid, "in_progress")
-                store.append_message(cid, {"type": "accept", "agent_pubkey": AGENT_KEY})
+                store._append_message(cid, {"type": "accept", "agent_pubkey": AGENT_KEY})
 
                 # Build fix prompt with investigation context
                 fix_prompt = f"""You are a contract agent. You investigated the problem and
@@ -385,7 +385,7 @@ If you cannot fix it, respond:
                 fix_cmd = result.get("fix", "")
                 explanation = result.get("explanation", "")
 
-                store.append_message(cid, {
+                store._append_message(cid, {
                     "type": "fix",
                     "fix": fix_cmd,
                     "explanation": explanation,
@@ -470,7 +470,7 @@ Respond with JSON only (no markdown):
                 fix_cmd = result.get("fix", "")
                 explanation = result.get("explanation", "")
 
-                store.append_message(cid, {
+                store._append_message(cid, {
                     "type": "fix",
                     "fix": fix_cmd,
                     "explanation": explanation,

@@ -211,7 +211,7 @@ class Escrow:
             "charity_amount": None,
             "details": "judge timeout, contract voided, all funds returned",
             "principal_bond_returned": str(self.judge_fee) if self.principal_bond_locked else None,
-            "agent_bond_returned": str(self.judge_fee) if self.agent_bond_locked else None,
+            "agent_bond_returned": str(self.agent_bond_amount or self.judge_fee) if self.agent_bond_locked else None,
         }
         self.resolution = result
         return result
@@ -260,10 +260,15 @@ class EscrowManager:
     """SQLite-backed escrow manager with pluggable payment backend."""
 
     def __init__(self, db_path: str = ":memory:", payment_backend=None, platform_account: str = ""):
-        from server.nano import StubBackend
         from protocol import PLATFORM_ADDRESS
-        self.payment = payment_backend or StubBackend()
+        if payment_backend is None:
+            raise ValueError("payment_backend is required (use NanoBackend)")
+        self.payment = payment_backend
         self.platform_account = platform_account or PLATFORM_ADDRESS
+        if self.platform_account:
+            valid, err = validate_nano_address(self.platform_account)
+            if not valid:
+                raise ValueError(f"Invalid platform Nano address: {err}")
         self.db = sqlite3.connect(db_path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self._lock = threading.Lock()
@@ -297,6 +302,10 @@ class EscrowManager:
         Also locks principal's dispute bond upfront.
         min_bond: minimum bond agents must post (bond-as-reputation). Actual bond = max(judge_fee, min_bond).
         """
+        if judge_account:
+            valid, err = validate_nano_address(judge_account)
+            if not valid:
+                raise ValueError(f"Invalid judge Nano address: {err}")
         escrow = Escrow(bounty, terms)
         result = escrow.lock()
 
@@ -499,22 +508,58 @@ class EscrowManager:
             if total_charity_bond > 0 and hasattr(self.payment, 'charity_account') and self.payment.charity_account:
                 pending_payments.append((self.payment.charity_account, str(total_charity_bond), "evil_bond_charity"))
 
+            # Return bonds when there's no dispute (bonds silently vanish otherwise)
+            if not result.get("bond_loser"):
+                # No dispute -- both bonds should be returned
+                if row["principal_bond_locked"] and row["principal_account"]:
+                    p_bond = Decimal(row["judge_fee"] or DEFAULT_JUDGE_FEE)
+                    if p_bond > 0:
+                        pending_payments.append((row["principal_account"], str(p_bond), "principal_bond_return"))
+                if row["agent_bond_locked"] and row["agent_account"]:
+                    a_bond = escrow.agent_bond_amount or judge_fee
+                    if a_bond > 0:
+                        pending_payments.append((row["agent_account"], str(a_bond), "agent_bond_return"))
+            else:
+                # Dispute -- return loser's remainder (if not evil) and winner's bond
+                if result.get("bond_remainder_returned"):
+                    loser = result["bond_loser"]
+                    loser_acct = row["agent_account"] if loser == "agent" else row["principal_account"]
+                    if loser_acct:
+                        pending_payments.append((loser_acct, result["bond_remainder_returned"], "loser_bond_remainder"))
+                winner = result.get("bond_returned_to")
+                if winner:
+                    winner_acct = row["principal_account"] if winner == "principal" else row["agent_account"]
+                    winner_bond = judge_fee if winner == "principal" else (escrow.agent_bond_amount or judge_fee)
+                    if winner_acct and winner_bond > 0:
+                        pending_payments.append((winner_acct, str(winner_bond), "winner_bond_return"))
+
             # Platform fee: send to platform treasury if configured (principal only)
             if self.platform_account and platform_fee > 0 and action != "voided":
                 pending_payments.append((self.platform_account, str(platform_fee), "platform_fee"))
 
-            # Execute all payments -- if any fail, none are committed as resolved
-            block_hashes = []
+            # Execute payments, skipping any that already succeeded (retry safety).
+            # On retry after partial failure, prior completed payments are preserved.
+            prior_resolution = json.loads(row["resolution"]) if row["resolution"] else {}
+            completed_labels = set()
+            if prior_resolution.get("completed_payments"):
+                completed_labels = {p[0] if isinstance(p, (list, tuple)) else p
+                                    for p in prior_resolution["completed_payments"]}
+
+            block_hashes = list(prior_resolution.get("completed_payments", []))
             try:
                 for to_account, amount, label in pending_payments:
+                    if label in completed_labels:
+                        continue  # already sent in a prior attempt
                     bh = self.payment.send(contract_id, to_account, amount)
                     block_hashes.append((label, bh))
             except Exception as e:
                 result["payment_error"] = str(e)
                 result["payment_failed"] = True
-                result["completed_payments"] = block_hashes  # for manual recovery
+                result["completed_payments"] = block_hashes
+                # Mark as resolved even on partial failure so we don't retry sends
+                # that may have actually gone through. Manual recovery needed.
                 self.db.execute(
-                    "UPDATE escrows SET resolution = ? WHERE contract_id = ?",
+                    "UPDATE escrows SET resolved = 1, resolution = ? WHERE contract_id = ?",
                     (json.dumps(result), contract_id),
                 )
                 self.db.commit()

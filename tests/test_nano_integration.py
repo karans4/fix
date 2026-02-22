@@ -82,6 +82,7 @@ def _make_backend(test_name: str):
         seed=seed,
         node_url=DEV_NODE_URL,
         charity_account=GENESIS_ACCOUNT,  # use genesis as charity placeholder
+        db_path=":memory:",
     )
 
 

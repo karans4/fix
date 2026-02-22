@@ -17,7 +17,10 @@ from server.app import create_app
 from server.store import ContractStore
 from server.escrow import EscrowManager
 from server.judge import AIJudge, TieredCourt, Evidence, JudgeRuling
-from conftest import signed_post, PRINCIPAL_PUBKEY, AGENT_PUBKEY, PRINCIPAL_PRIV, AGENT_PRIV, SERVER_PRIV
+from conftest import (
+    signed_post, PRINCIPAL_PUBKEY, AGENT_PUBKEY, PRINCIPAL_PRIV, AGENT_PRIV, SERVER_PRIV,
+    make_nano_backend, set_funded_accounts, fund_escrow, TEST_PRINCIPAL_ADDR, TEST_AGENT_ADDR,
+)
 from crypto import generate_ed25519_keypair, pubkey_to_fix_id
 from protocol import DEFAULT_RULING_TIMEOUT
 
@@ -28,12 +31,9 @@ AGENT2_PRIV = _a2_priv
 
 
 def _set_test_accounts(app, cid):
-    """Set test payout accounts directly in escrow DB."""
-    app.state.escrow.db.execute(
-        "UPDATE escrows SET principal_account = ?, agent_account = ? WHERE contract_id = ?",
-        ("stub_principal", "stub_agent", cid),
-    )
-    app.state.escrow.db.commit()
+    """Set real nano payout addresses in escrow DB and fund the escrow."""
+    set_funded_accounts(app.state.escrow, cid, TEST_PRINCIPAL_ADDR, TEST_AGENT_ADDR)
+    fund_escrow(app.state.escrow, cid)
 
 
 SAMPLE_CONTRACT = {
@@ -54,19 +54,19 @@ AUTONOMOUS_CONTRACT = {
 
 JUDGE_CONTRACT = {
     **SAMPLE_CONTRACT,
-    "judge": {"pubkey": "judge_abc", "fee": "0.005", "ruling_timeout": 60},
+    "judge": {"pubkey": TEST_AGENT_ADDR, "fee": "0.005", "ruling_timeout": 60},
 }
 
 AUTONOMOUS_JUDGE_CONTRACT = {
     **AUTONOMOUS_CONTRACT,
-    "judge": {"pubkey": "judge_abc", "fee": "0.005", "ruling_timeout": 60},
+    "judge": {"pubkey": TEST_AGENT_ADDR, "fee": "0.005", "ruling_timeout": 60},
 }
 
 
 @pytest.fixture
 def app():
     store = ContractStore(":memory:")
-    escrow_mgr = EscrowManager(":memory:")
+    escrow_mgr = EscrowManager(":memory:", payment_backend=make_nano_backend())
     return create_app(store=store, escrow_mgr=escrow_mgr, server_privkey=SERVER_PRIV)
 
 
@@ -118,7 +118,7 @@ def test_autonomous_mode_stored(client):
 def test_judge_pubkey_stored(client):
     data = _create_contract(client, JUDGE_CONTRACT)
     contract = client.get(f"/contracts/{data['contract_id']}").json()
-    assert contract["judge_pubkey"] == "judge_abc"
+    assert contract["judge_pubkey"] == TEST_AGENT_ADDR
 
 
 def test_judge_fee_in_escrow(app, client):
@@ -126,7 +126,7 @@ def test_judge_fee_in_escrow(app, client):
     escrow = app.state.escrow.get(data["contract_id"])
     assert escrow is not None
     assert escrow["judge_fee"] == "0.005"
-    assert escrow["judge_account"] == "judge_abc"
+    assert escrow["judge_account"] == TEST_AGENT_ADDR
     assert escrow["principal_bond_locked"] is True
 
 
@@ -572,7 +572,7 @@ def test_review_dispute_with_judge(app):
     """Dispute during review window triggers judge, routes bonds."""
     judge = FakeJudge(outcome="fulfilled")
     store = ContractStore(":memory:")
-    escrow_mgr = EscrowManager(":memory:")
+    escrow_mgr = EscrowManager(":memory:", payment_backend=make_nano_backend())
     app = create_app(store=store, escrow_mgr=escrow_mgr, judge=judge, server_privkey=SERVER_PRIV)
     client = TestClient(app)
 
@@ -605,7 +605,7 @@ def test_dispute_with_judge_agent_loses():
     """When judge rules canceled, agent loses bond."""
     judge = FakeJudge(outcome="canceled")
     store = ContractStore(":memory:")
-    escrow_mgr = EscrowManager(":memory:")
+    escrow_mgr = EscrowManager(":memory:", payment_backend=make_nano_backend())
     app = create_app(store=store, escrow_mgr=escrow_mgr, judge=judge, server_privkey=SERVER_PRIV)
     client = TestClient(app)
 
@@ -706,7 +706,7 @@ class FakeTieredCourt:
 def _make_tiered_app(rulings=None):
     court = FakeTieredCourt(rulings)
     store = ContractStore(":memory:")
-    escrow_mgr = EscrowManager(":memory:")
+    escrow_mgr = EscrowManager(":memory:", payment_backend=make_nano_backend())
     app = create_app(store=store, escrow_mgr=escrow_mgr, court=court, server_privkey=SERVER_PRIV)
     return app, store, escrow_mgr, court
 
@@ -1260,3 +1260,60 @@ def test_dispute_after_resolved_409(app, client):
         "pubkey": PRINCIPAL_PUBKEY,
     }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
     assert resp.status_code == 409
+
+
+# --- Security audit tests ---
+
+def test_concurrent_bond_only_one_wins(app):
+    """2.1: Second bond attempt on same contract gets 409."""
+    client = TestClient(app)
+    data = _create_contract(client)
+    cid = data["contract_id"]
+
+    # First agent bonds
+    resp = signed_post(client, f"/contracts/{cid}/bond", {
+        "agent_pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
+    assert resp.status_code == 200
+
+    # Second agent tries to bond -- should get 409
+    resp2 = signed_post(client, f"/contracts/{cid}/bond", {
+        "agent_pubkey": AGENT2_PUBKEY,
+    }, AGENT2_PUBKEY, AGENT2_PRIV)
+    assert resp2.status_code == 409
+
+
+def test_escrow_endpoint_unauthenticated_strips_addresses(app):
+    """2.2: Unauthenticated escrow GET strips wallet addresses."""
+    client = TestClient(app)
+    data = _create_contract(client)
+    cid = data["contract_id"]
+
+    resp = client.get(f"/contracts/{cid}/escrow")
+    assert resp.status_code == 200
+    body = resp.json()
+    # Should NOT contain wallet addresses
+    assert "escrow_account" not in body
+    assert "principal_account" not in body
+    assert "agent_account" not in body
+
+
+def test_chat_msg_type_role_validation(client):
+    """5.1: Agent cannot send 'answer' msg_type, principal cannot send 'ask'."""
+    data = _create_contract(client)
+    cid = data["contract_id"]
+    _accept_contract(client, cid)
+
+    # Agent tries to send 'answer' (not allowed)
+    resp = signed_post(client, f"/contracts/{cid}/chat", {
+        "message": "test", "from_side": "agent", "msg_type": "answer",
+        "pubkey": AGENT_PUBKEY,
+    }, AGENT_PUBKEY, AGENT_PRIV)
+    assert resp.status_code == 400
+
+    # Principal tries to send 'ask' (not allowed)
+    resp = signed_post(client, f"/contracts/{cid}/chat", {
+        "message": "test", "from_side": "principal", "msg_type": "ask",
+        "pubkey": PRINCIPAL_PUBKEY,
+    }, PRINCIPAL_PUBKEY, PRINCIPAL_PRIV)
+    assert resp.status_code == 400

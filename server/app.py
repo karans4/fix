@@ -338,22 +338,22 @@ PARTIES
     File inspection:  cat, head, tail, less, file, wc, stat,
                       md5sum, sha256sum
     Directory:        ls, find, tree, du
-    Search:           grep, rg, ag, awk, sed
+    Search:           grep, rg, ag
     Versions/info:    which, whereis, type, uname, arch,
                       lsb_release, hostnamectl
     Package queries:  dpkg, apt, apt-cache, rpm, pacman, pip,
                       pip3, npm, gem, cargo, rustc
-    Runtimes:         python3, python, node, gcc, g++, make,
-                      cmake, java, go, ruby, clang, clang++
-    Environment:      env, printenv, echo, id, whoami, pwd
+    Runtimes:         gcc, g++, make, cmake, clang, clang++
+    Environment:      echo, id, whoami, pwd
     System info:      lscpu, free, df, mount, ps
     Misc:             readlink, realpath, basename, dirname,
                       diff, cmp, strings, nm, ldd, objdump,
                       pkg-config, test, timeout
 
-  Blocked: write redirects (>), append (>>), tee, and any
-  command not on the whitelist. If a root directory is set,
-  all paths must resolve inside it.
+  Blocked: shell metacharacters (| ; & $ ` ( )), write
+  redirects (>), append (>>), tee, and any command not on
+  the whitelist. If a root directory is set, all paths must
+  resolve inside it.
 
 5. PERFORMANCE
 
@@ -475,7 +475,7 @@ def create_app(
     async def index():
         return FileResponse(os.path.join(static_dir, "index.html"))
 
-    # Server identity
+    # Server identity -- persistent key required for chain verification across restarts
     if server_privkey:
         _server_privkey = server_privkey
     else:
@@ -483,13 +483,21 @@ def create_app(
         if key_path and os.path.exists(key_path):
             _server_privkey = load_ed25519_key(key_path)
         else:
+            # Auto-generate and persist so chain entries remain verifiable
             _server_privkey, _ = generate_ed25519_keypair()
+            default_key_path = os.path.expanduser("~/.fix/server.key")
+            try:
+                os.makedirs(os.path.dirname(default_key_path), exist_ok=True)
+                save_ed25519_key(default_key_path, _server_privkey)
+            except OSError:
+                pass  # best effort -- test environments may not have writable home
 
     _server_pubkey = ed25519_privkey_to_pubkey(_server_privkey)
     _server_fix_id = pubkey_to_fix_id(_server_pubkey)
 
-    # Replay protection
-    _replay_guard = ReplayGuard()
+    # Replay protection -- SQLite-backed for persistence across restarts
+    _replay_db = os.environ.get("FIX_REPLAY_DB", "")
+    _replay_guard = ReplayGuard(db_path=_replay_db)
 
     # Defaults
     _store = store or ContractStore()
@@ -500,6 +508,7 @@ def create_app(
     # --- SSE event bus for agent subscriptions ---
     # Use threading.Queue for cross-thread safety (TestClient uses threads)
     import queue as _queue_mod
+    MAX_SSE_SUBSCRIBERS = 1000
     _sse_subscribers: list[_queue_mod.Queue] = []
     _sse_lock = __import__('threading').Lock()
 
@@ -641,6 +650,7 @@ def create_app(
 
     @app.get("/contracts")
     async def list_contracts(status: str = "open", limit: int = 50):
+        limit = min(limit, 200)  # cap to prevent DB dump
         """List contracts by status (agents browse open ones).
 
         Lazy timeout: open contracts older than CONTRACT_PICKUP_TIMEOUT with
@@ -649,11 +659,15 @@ def create_app(
         contracts = _store.list_by_status(status, limit)
         result = []
         now = time.time()
+        canceled_count = 0
+        MAX_AUTO_CANCEL = 10
         for c in contracts:
             # Auto-cancel stale open contracts (lazy evaluation)
             if c["status"] == "open" and c.get("created_at"):
                 age = now - c["created_at"]
                 if age > CONTRACT_PICKUP_TIMEOUT:
+                    if canceled_count >= MAX_AUTO_CANCEL:
+                        continue  # skip, will be caught on next request
                     try:
                         _store.update_status(c["id"], "canceled")
                         _server_sign_and_append(c["id"], "auto_fulfill", {
@@ -664,6 +678,7 @@ def create_app(
                         if escrow and not escrow["resolved"]:
                             _escrow.resolve(c["id"], "canceled")
                         c = _store.get(c["id"])
+                        canceled_count += 1
                     except (ValueError, Exception):
                         pass  # already transitioned or other issue
             c["briefing"] = build_briefing(c["id"], c)
@@ -691,6 +706,8 @@ def create_app(
         min_b = Decimal(min_bounty)
         q = _queue_mod.Queue(maxsize=256)
         with _sse_lock:
+            if len(_sse_subscribers) >= MAX_SSE_SUBSCRIBERS:
+                raise HTTPException(503, "Too many SSE subscribers")
             _sse_subscribers.append(q)
 
         async def event_generator():
@@ -733,6 +750,7 @@ def create_app(
         updated = _check_review_expiry(data)
         result = updated or data
         result["briefing"] = build_briefing(contract_id, result)
+
         return result
 
     @app.get("/contracts/{contract_id}/chain_head")
@@ -770,11 +788,18 @@ def create_app(
         # Assign agent (without transitioning to in_progress yet)
         with _store._lock:
             now = time.time()
-            _store.db.execute(
+            cursor = _store.db.execute(
                 "UPDATE contracts SET agent_pubkey = ?, status = 'investigating', updated_at = ? WHERE id = ? AND status = 'open'",
                 (req.agent_pubkey, now, contract_id),
             )
             _store.db.commit()
+            if cursor.rowcount == 0:
+                # Race condition: another agent got it first, undo escrow lock
+                try:
+                    _escrow.release_agent_bond(contract_id)
+                except ValueError:
+                    pass
+                raise HTTPException(409, "Contract already taken by another agent")
 
         _server_sign_and_append(contract_id, "bond", {
             "agent_pubkey": req.agent_pubkey,
@@ -915,6 +940,15 @@ def create_app(
             raise HTTPException(409, "Chat not available")
         if req.msg_type not in ("ask", "answer", "message"):
             raise HTTPException(400, "Invalid msg_type")
+
+        # Validate msg_type against role
+        ALLOWED_MSG_TYPES = {
+            "principal": {"message", "answer"},
+            "agent": {"message", "ask"},
+        }
+        allowed = ALLOWED_MSG_TYPES.get(req.from_side, set())
+        if req.msg_type not in allowed:
+            raise HTTPException(400, f"msg_type '{req.msg_type}' not allowed for {req.from_side}")
 
         # Verify caller matches the side they claim
         _check_party(data, req.pubkey, req.from_side)
@@ -1401,7 +1435,7 @@ def create_app(
                 break  # a ruling exists after the last dispute — not pending
             if msg_type == "dispute_filed":
                 msg_data = msg.get("data", msg)
-                dispute_filed_at = msg_data.get("response_deadline", msg.get("timestamp", 0))
+                dispute_filed_at = msg_data.get("timestamp", msg.get("timestamp", 0))
                 break
         if dispute_filed_at is None:
             raise HTTPException(409, "No pending dispute found")
@@ -1586,10 +1620,36 @@ def create_app(
         return {"status": "ok"}
 
     @app.get("/contracts/{contract_id}/escrow")
-    async def get_escrow(contract_id: str):
+    async def get_escrow(contract_id: str, request: Request):
+        """Get escrow state. Requires auth -- only contract parties can see full data."""
         data = _escrow.get(contract_id)
         if not data:
             raise HTTPException(404, "No escrow for this contract")
+
+        contract_data = _store.get(contract_id)
+        # Try to authenticate
+        pubkey_hex = request.headers.get("X-Fix-Pubkey", "")
+        caller_id = "fix_" + pubkey_hex if pubkey_hex else ""
+        authenticated = False
+        if caller_id:
+            try:
+                authenticated = await _verify_auth(request, caller_id)
+            except HTTPException:
+                authenticated = False
+
+        if not authenticated:
+            # Unauthenticated: strip sensitive fields
+            data = {k: v for k, v in data.items()
+                    if k not in ("principal_account", "agent_account", "judge_account", "escrow_account")}
+            return data
+
+        # Authenticated: verify party membership
+        if contract_data:
+            principal = contract_data.get("principal_pubkey", "")
+            agent = contract_data.get("agent_pubkey", "")
+            if caller_id not in (principal, agent):
+                raise HTTPException(403, "Not a party to this contract")
+
         return data
 
     @app.get("/stats")

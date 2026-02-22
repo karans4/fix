@@ -53,7 +53,9 @@ def build_agent_prompt(contract: dict, investigation_results: list[dict],
     parts.append("You are a fix agent. Your job is to diagnose and fix the problem described in this contract.")
     parts.append("You may decline (\"accepted\": false) before or after investigation, as long as you haven't accepted yet.\n")
     parts.append("## Contract\n")
+    parts.append('<user-content type="contract">')
     parts.append(json.dumps(contract, indent=2))
+    parts.append('</user-content>')
     parts.append("")
 
     if agent_memory:
@@ -75,7 +77,9 @@ def build_agent_prompt(contract: dict, investigation_results: list[dict],
         parts.append("## Investigation Results So Far\n")
         for i, r in enumerate(investigation_results, 1):
             parts.append(f"### Round {i}: `{r['command']}`")
+            parts.append(f'<user-content type="investigation_result">')
             parts.append(f"```\n{r['output']}\n```")
+            parts.append('</user-content>')
             parts.append("")
 
     parts.append("## Instructions\n")
@@ -492,13 +496,11 @@ async def _main():
         with open(key_path, "rb") as f:
             privkey = f.read(32)
     else:
-        from crypto import generate_ed25519_keypair, pubkey_to_fix_id
+        from crypto import generate_ed25519_keypair, pubkey_to_fix_id, save_ed25519_key
         privkey, pubkey = generate_ed25519_keypair()
         os.makedirs(os.path.dirname(key_path), exist_ok=True)
-        with open(key_path, "wb") as f:
-            f.write(privkey)
+        save_ed25519_key(key_path, privkey)
         print(f"Generated new agent identity: {pubkey_to_fix_id(pubkey)}")
-        print(f"Key saved to {key_path}")
 
     from crypto import ed25519_privkey_to_pubkey, pubkey_to_fix_id
     pubkey = ed25519_privkey_to_pubkey(privkey)

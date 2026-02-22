@@ -85,21 +85,20 @@ INVESTIGATE_WHITELIST = {
     # Directory listing
     "ls", "find", "tree", "du",
     # Search
-    "grep", "rg", "ag", "awk", "sed",
+    "grep", "rg", "ag",
     # Versions/info
     "which", "whereis", "type", "command", "uname", "arch", "lsb_release", "hostnamectl",
     # Package queries
     "dpkg", "apt", "apt-cache", "apt-file", "apt-list", "rpm", "pacman",
     "pip", "pip3", "npm", "gem", "cargo", "rustc",
     # Runtime versions
-    "python3", "python", "node", "gcc", "g++", "make", "cmake", "java", "go", "ruby",
+    "gcc", "g++", "make", "cmake",
     "clang", "clang++", "ld", "as", "nasm",
     # Environment
-    "env", "printenv", "echo", "id", "whoami", "pwd", "hostname",
+    "echo", "id", "whoami", "pwd", "hostname",
     # System info
     "lsmod", "lscpu", "free", "df", "mount", "ip", "ss", "ps",
-    # Logs (read-only)
-    "journalctl", "dmesg",
+    # (logs removed — system info leakage)
     # Misc
     "readlink", "realpath", "basename", "dirname", "diff", "cmp",
     "strings", "nm", "ldd", "objdump", "pkg-config", "test", "timeout",
@@ -133,6 +132,13 @@ def validate_investigate_command(cmd, root=None):
     cmd = cmd.strip()
     if not cmd:
         return False, "empty command"
+
+    # Block ALL shell metacharacters — eliminates pipe injection, redirects,
+    # command chaining, and code execution via subshells in one check
+    SHELL_METACHARS = set('|;&$`()')
+    for ch in cmd:
+        if ch in SHELL_METACHARS:
+            return False, f"blocked: contains shell metacharacter '{ch}'"
 
     # Block command substitution: $(...), `...`, <(...)
     if re.search(r'\$\(', cmd):
@@ -169,7 +175,7 @@ def validate_investigate_command(cmd, root=None):
         if first_word not in INVESTIGATE_WHITELIST:
             return False, f"'{first_word}' not in investigation whitelist"
         # Commands that run other commands — check their argument too
-        if first_word in ("timeout", "time", "nice", "ionice", "strace"):
+        if first_word in ("timeout", "time", "nice", "ionice"):
             parts = subcmd.split()
             # Skip flags and the timeout value to find the actual command
             i = 1
@@ -180,34 +186,18 @@ def validate_investigate_command(cmd, root=None):
                 if actual not in INVESTIGATE_WHITELIST:
                     return False, f"'{actual}' (via {first_word}) not in investigation whitelist"
 
-    # Block dangerous argument patterns for commands that can execute code
-    EXEC_CAPABLE = {"python3", "python", "node", "ruby", "java", "go"}
-    EXEC_FLAGS = {"-c", "-e", "--eval", "-exec", "--exec"}
+    # Block dangerous argument patterns for remaining whitelisted commands
     for subcmd in subcmds:
         subcmd = subcmd.strip()
         if not subcmd:
             continue
         parts = subcmd.split()
         first = os.path.basename(parts[0])
-        # Block interpreter execution flags
-        if first in EXEC_CAPABLE:
-            for p in parts[1:]:
-                if p in EXEC_FLAGS:
-                    return False, f"blocked: '{first} {p}' can execute arbitrary code"
         # Block find -exec
         if first == "find":
             for p in parts[1:]:
                 if p in ("-exec", "-execdir", "-ok", "-okdir", "-delete"):
                     return False, f"blocked: 'find {p}' can modify files"
-        # Block awk/sed system() calls
-        if first in ("awk", "gawk", "mawk", "nawk"):
-            cmd_lower = subcmd.lower()
-            if "system(" in cmd_lower or "getline" in cmd_lower:
-                return False, f"blocked: '{first}' with system()/getline can execute code"
-        if first == "sed":
-            for p in parts[1:]:
-                if p in ("-i", "--in-place"):
-                    return False, f"blocked: 'sed {p}' can modify files"
 
     # Root jail: check that all path arguments resolve inside root
     if root:
@@ -913,9 +903,11 @@ def _first_run_setup():
             backend_line = 'backend = "auto"'
             print(f"  {C_DIM}Unrecognized key prefix, saved as custom.{C_RESET}")
             print(f"  {C_DIM}Set FIX_API_URL and FIX_MODEL env vars for custom endpoints.{C_RESET}")
-        with open(keyfile, "w") as f:
-            f.write(key)
-        os.chmod(keyfile, 0o600)
+        fd = os.open(keyfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, key.encode())
+        finally:
+            os.close(fd)
         with open(config_path, "w") as f:
             f.write(f'# fix global config -- {provider} API\n')
             f.write(f'{backend_line}\n')

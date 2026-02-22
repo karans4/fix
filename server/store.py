@@ -59,11 +59,12 @@ class ContractStore:
         # Genesis chain head
         chain_head = hash_chain_init()
 
-        self.db.execute(
-            "INSERT INTO contracts (id, status, contract, principal_pubkey, judge_pubkey, execution_mode, chain_head, server_pubkey, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (contract_id, "open", json.dumps(contract), principal_pubkey, judge_pubkey, execution_mode, chain_head, server_pubkey, now, now),
-        )
-        self.db.commit()
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO contracts (id, status, contract, principal_pubkey, judge_pubkey, execution_mode, chain_head, server_pubkey, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (contract_id, "open", json.dumps(contract), principal_pubkey, judge_pubkey, execution_mode, chain_head, server_pubkey, now, now),
+            )
+            self.db.commit()
         return contract_id
 
     def get(self, contract_id: str) -> dict | None:
@@ -121,24 +122,26 @@ class ContractStore:
 
     def set_review_expires(self, contract_id: str, expires_at: float) -> bool:
         """Set review window expiry for autonomous mode."""
-        now = time.time()
-        cursor = self.db.execute(
-            "UPDATE contracts SET review_expires_at = ?, updated_at = ? WHERE id = ?",
-            (expires_at, now, contract_id),
-        )
-        self.db.commit()
-        return cursor.rowcount > 0
+        with self._lock:
+            now = time.time()
+            cursor = self.db.execute(
+                "UPDATE contracts SET review_expires_at = ?, updated_at = ? WHERE id = ?",
+                (expires_at, now, contract_id),
+            )
+            self.db.commit()
+            return cursor.rowcount > 0
 
     def set_last_investigation(self, contract_id: str, ts: float) -> bool:
         """Record timestamp of last investigation command (rate limiting)."""
-        cursor = self.db.execute(
-            "UPDATE contracts SET last_investigation_at = ? WHERE id = ?",
-            (ts, contract_id),
-        )
-        self.db.commit()
-        return cursor.rowcount > 0
+        with self._lock:
+            cursor = self.db.execute(
+                "UPDATE contracts SET last_investigation_at = ? WHERE id = ?",
+                (ts, contract_id),
+            )
+            self.db.commit()
+            return cursor.rowcount > 0
 
-    def append_message(self, contract_id: str, message: dict) -> bool:
+    def _append_message(self, contract_id: str, message: dict) -> bool:
         """Append a raw message to the transcript (for server-signed entries).
 
         For chain entries with signatures, use append_chain_entry instead.
@@ -228,13 +231,14 @@ class ContractStore:
 
     def update_contract_data(self, contract_id: str, contract: dict) -> bool:
         """Update the contract data."""
-        now = time.time()
-        cursor = self.db.execute(
-            "UPDATE contracts SET contract = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(contract), now, contract_id),
-        )
-        self.db.commit()
-        return cursor.rowcount > 0
+        with self._lock:
+            now = time.time()
+            cursor = self.db.execute(
+                "UPDATE contracts SET contract = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(contract), now, contract_id),
+            )
+            self.db.commit()
+            return cursor.rowcount > 0
 
     def _row_to_dict(self, row) -> dict:
         return {

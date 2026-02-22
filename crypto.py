@@ -14,6 +14,7 @@ import hmac as hmac_mod
 import json
 import math
 import os
+import sqlite3
 import time as _time
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -96,8 +97,17 @@ def load_ed25519_key(path: str) -> bytes:
 
 
 def save_ed25519_key(path: str, key: bytes) -> None:
-    """Save a 32-byte raw Ed25519 private key to file (mode 0600)."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Save a 32-byte raw Ed25519 private key to file (mode 0600).
+    Uses O_EXCL for new files to prevent symlink attacks.
+    Falls back to O_TRUNC for overwrites (existing file must be a regular file)."""
+    if os.path.exists(path):
+        # Overwrite: verify it's a regular file, not a symlink
+        if os.path.islink(path):
+            raise ValueError(f"Refusing to overwrite symlink: {path}")
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC, 0o600)
+    else:
+        # New file: O_EXCL prevents race conditions
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         os.write(fd, key)
     finally:
@@ -283,30 +293,69 @@ REQUEST_MAX_AGE = 300  # 5 minutes
 
 
 class ReplayGuard:
-    """Track seen signatures to prevent replay attacks. TTL matches REQUEST_MAX_AGE."""
+    """Track seen signatures to prevent replay attacks.
 
-    def __init__(self, ttl: int = REQUEST_MAX_AGE):
-        self._seen: dict[str, float] = {}  # sig_hex -> expiry_timestamp
+    Uses SQLite for persistence across restarts and multi-process safety.
+    Falls back to in-memory dict if no db_path provided.
+    """
+
+    def __init__(self, ttl: int = REQUEST_MAX_AGE + 30, db_path: str = ""):
         self._ttl = ttl
+        self._db = None
+        if db_path:
+            import sqlite3
+            self._db = sqlite3.connect(db_path, check_same_thread=False)
+            self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS replay_guard "
+                "(sig TEXT PRIMARY KEY, expires_at REAL)"
+            )
+            self._db.commit()
+        self._seen: dict[str, float] = {}
         self._check_count = 0
 
     def check_and_record(self, sig_hex: str) -> bool:
         """Return False if sig was already seen, True if new (and record it)."""
-        self._check_count += 1
-        if self._check_count % 100 == 0:
-            self._prune()
-
         now = _time.time()
-        if sig_hex in self._seen:
-            if now < self._seen[sig_hex]:
-                return False  # still valid, replay detected
-            # expired entry, treat as new
-        self._seen[sig_hex] = now + self._ttl
-        return True
+        expires = now + self._ttl
 
-    def _prune(self):
-        now = _time.time()
-        self._seen = {k: v for k, v in self._seen.items() if v > now}
+        if self._db:
+            # Periodic prune
+            self._check_count += 1
+            if self._check_count % 100 == 0:
+                self._db.execute("DELETE FROM replay_guard WHERE expires_at <= ?", (now,))
+                self._db.commit()
+            # Atomic check-and-insert
+            try:
+                self._db.execute(
+                    "INSERT INTO replay_guard (sig, expires_at) VALUES (?, ?)",
+                    (sig_hex, expires),
+                )
+                self._db.commit()
+                return True  # new signature
+            except sqlite3.IntegrityError:
+                # Unique constraint violation = already seen, or expired
+                row = self._db.execute(
+                    "SELECT expires_at FROM replay_guard WHERE sig = ?", (sig_hex,)
+                ).fetchone()
+                if row and row[0] > now:
+                    return False  # still valid, replay
+                # Expired, update
+                self._db.execute(
+                    "UPDATE replay_guard SET expires_at = ? WHERE sig = ?",
+                    (expires, sig_hex),
+                )
+                self._db.commit()
+                return True
+        else:
+            # In-memory fallback
+            self._check_count += 1
+            if self._check_count % 100 == 0:
+                self._seen = {k: v for k, v in self._seen.items() if v > now}
+            if sig_hex in self._seen and now < self._seen[sig_hex]:
+                return False
+            self._seen[sig_hex] = expires
+            return True
 
 
 def sign_request_ed25519(
@@ -352,9 +401,9 @@ def verify_request_ed25519(
     now = _time.time()
     age = now - ts
     if age < -30:  # allow 30s clock skew for future timestamps
-        return False, f"request timestamp is in the future (skew={int(-age)}s)"
+        return False, "request timestamp is in the future"
     if age > REQUEST_MAX_AGE:
-        return False, f"request expired (age={int(age)}s, max={REQUEST_MAX_AGE}s)"
+        return False, "request expired"
 
     # Decode pubkey
     try:

@@ -26,7 +26,7 @@ from decimal import Decimal
 try:
     import ed25519_blake2b
 except ImportError:
-    ed25519_blake2b = None  # StubBackend works without it
+    ed25519_blake2b = None
 
 
 # 1 XNO = 10^30 raw
@@ -200,14 +200,24 @@ if ed25519_blake2b is not None:
             if len(self.seed) != 64 or not all(c in '0123456789abcdefABCDEF' for c in self.seed):
                 raise ValueError("Nano seed must be 64 hex characters")
             self._seed_bytes = bytes.fromhex(self.seed)
+            del self.seed  # Don't keep seed string in memory
             self.node_url = node_url or os.environ.get("FIX_NANO_NODE", self.DEFAULT_NODE)
             from protocol import CHARITY_ADDRESS
             self.charity_account = charity_account if charity_account is not None else CHARITY_ADDRESS
 
             # Nonce DB: random 256-bit nonce per contract
-            nonce_db_path = db_path or os.environ.get("FIX_NANO_DB", ":memory:")
+            import logging
+            nonce_db_path = db_path or os.environ.get("FIX_NANO_DB", "")
+            if not nonce_db_path:
+                raise ValueError(
+                    "Nano nonce DB path required: set FIX_NANO_DB env var or pass db_path=. "
+                    "Use ':memory:' explicitly for testing only."
+                )
+            if nonce_db_path == ":memory:":
+                logging.warning("NANO NONCE DB IS IN-MEMORY — all escrow keys will be LOST on restart!")
             self._db = sqlite3.connect(nonce_db_path, check_same_thread=False)
             self._lock = threading.Lock()
+            self._send_locks: dict[str, threading.Lock] = {}
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("""
                 CREATE TABLE IF NOT EXISTS nano_nonces (
@@ -264,8 +274,11 @@ if ed25519_blake2b is not None:
             # Receive pending blocks first
             self._receive_all(contract_id)
             account = self._get_account(contract_id)
-            balance_info = self._rpc("account_balance", account=account)
-            balance_raw = int(balance_info.get("balance", "0"))
+            try:
+                info = self._rpc("account_info", account=account)
+                balance_raw = int(info.get("balance", "0"))
+            except RuntimeError:
+                balance_raw = 0  # Account not opened yet
             expected_raw = xno_to_raw(expected_xno)
             return balance_raw >= expected_raw
 
@@ -276,7 +289,8 @@ if ed25519_blake2b is not None:
             pubkey = vk.to_bytes()
 
             try:
-                receivable = self._rpc("receivable", account=account, count="50")
+                receivable = self._rpc("receivable", account=account, count="50",
+                                       include_only_confirmed="false" if os.environ.get("FIX_NANO_DEV") == "1" else "true")
                 blocks = receivable.get("blocks", {})
                 if isinstance(blocks, str):  # empty string means none
                     return
@@ -338,318 +352,66 @@ if ed25519_blake2b is not None:
             if raw == 0:
                 return "noop_zero_amount"
 
-            # Receive pending blocks first
-            self._receive_all(contract_id)
+            valid, err = validate_nano_address(to_account)
+            if not valid:
+                raise ValueError(f"Invalid destination address: {err}")
 
-            sk, vk = self._derive_keypair(contract_id)
-            pubkey = vk.to_bytes()
-            account = self._get_account(contract_id)
+            # Per-contract lock to prevent double-spend from concurrent sends
+            if contract_id not in self._send_locks:
+                with self._lock:
+                    if contract_id not in self._send_locks:
+                        self._send_locks[contract_id] = threading.Lock()
+            send_lock = self._send_locks[contract_id]
+            with send_lock:
+                # Receive pending blocks first
+                self._receive_all(contract_id)
 
-            # Get account state
-            info = self._rpc("account_info", account=account, representative="true")
-            previous = bytes.fromhex(info["frontier"])
-            rep = _address_to_pubkey(info.get("representative", account))
-            balance = int(info["balance"])
+                sk, vk = self._derive_keypair(contract_id)
+                pubkey = vk.to_bytes()
+                account = self._get_account(contract_id)
 
-            if balance < raw:
-                raise ValueError(
-                    f"Insufficient balance: have {raw_to_xno(balance)} XNO, "
-                    f"need {amount_xno} XNO (contract {contract_id})"
-                )
+                # Get account state
+                info = self._rpc("account_info", account=account, representative="true")
+                previous = bytes.fromhex(info["frontier"])
+                rep = _address_to_pubkey(info.get("representative", account))
+                balance = int(info["balance"])
 
-            new_balance = balance - raw
-            dest_pubkey = _address_to_pubkey(to_account)
-            block_hash = _compute_block_hash(pubkey, previous, rep, new_balance, dest_pubkey)
-            sig = sk.sign(block_hash)
+                if balance < raw:
+                    raise ValueError(
+                        f"Insufficient balance: have {raw_to_xno(balance)} XNO, "
+                        f"need {amount_xno} XNO (contract {contract_id})"
+                    )
 
-            # Get work
-            work_resp = self._rpc("work_generate", hash=previous.hex())
+                new_balance = balance - raw
+                dest_pubkey = _address_to_pubkey(to_account)
+                block_hash = _compute_block_hash(pubkey, previous, rep, new_balance, dest_pubkey)
+                sig = sk.sign(block_hash)
 
-            block = {
-                "type": "state",
-                "account": account,
-                "previous": previous.hex().upper(),
-                "representative": _pubkey_to_address(rep),
-                "balance": str(new_balance),
-                "link": dest_pubkey.hex().upper(),
-                "signature": sig.hex().upper(),
-                "work": work_resp["work"],
-            }
-            result = self._rpc("process", json_block="true", subtype="send",
-                                block=block)
-            return result.get("hash", str(result))
+                # Get work
+                work_resp = self._rpc("work_generate", hash=previous.hex())
+
+                block = {
+                    "type": "state",
+                    "account": account,
+                    "previous": previous.hex().upper(),
+                    "representative": _pubkey_to_address(rep),
+                    "balance": str(new_balance),
+                    "link": dest_pubkey.hex().upper(),
+                    "signature": sig.hex().upper(),
+                    "work": work_resp["work"],
+                }
+                result = self._rpc("process", json_block="true", subtype="send",
+                                    block=block)
+                return result.get("hash", str(result))
 
         def get_balance(self, contract_id: str) -> str:
             account = self._get_account(contract_id)
             try:
-                balance_info = self._rpc("account_balance", account=account)
-                balance_raw = int(balance_info.get("balance", "0"))
+                info = self._rpc("account_info", account=account)
+                balance_raw = int(info.get("balance", "0"))
                 return str(raw_to_xno(balance_raw))
             except Exception:
                 return "0"
 
 
-class StubBackend(PaymentBackend):
-    """No-op backend for testing. All operations succeed immediately."""
 
-    def __init__(self):
-        self.accounts: dict[str, dict] = {}
-        self.sends: list[dict] = []  # log of sends for test assertions
-
-    def create_escrow_account(self, contract_id: str) -> dict:
-        account = f"nano_stub_{contract_id[:16]}"
-        self.accounts[contract_id] = {"account": account, "balance": "0"}
-        return {"account": account}
-
-    def check_deposit(self, contract_id: str, expected_xno: str) -> bool:
-        return True  # Always pretend deposit arrived
-
-    def send(self, contract_id: str, to_account: str, amount_xno: str) -> str:
-        self.sends.append({
-            "contract_id": contract_id,
-            "to": to_account,
-            "amount": amount_xno,
-        })
-        return f"stub_hash_{len(self.sends)}"
-
-    def get_balance(self, contract_id: str) -> str:
-        return self.accounts.get(contract_id, {}).get("balance", "0")
-
-
-class SimBackend(PaymentBackend):
-    """Simulated payment backend for development/integration testing.
-
-    Tracks real balances in SQLite. Enforces:
-    - No zero-amount sends (matches Nano protocol)
-    - Insufficient balance errors
-    - Deposit verification against actual received funds
-    - Full transaction log with deterministic hashes
-
-    Uses real ed25519-blake2b key derivation (if available) so escrow
-    addresses are valid nano_ addresses. Falls back to deterministic
-    fake addresses if ed25519_blake2b is not installed.
-
-    Usage:
-        sim = SimBackend(seed="aa" * 32)
-        sim.fund("nano_...", "10.0")  # fund an external account
-        sim.create_escrow_account("contract1")
-        sim.deposit("contract1", "0.5")  # simulate principal's deposit
-        sim.send("contract1", "nano_...", "0.5")  # pay the agent
-    """
-
-    def __init__(self, seed: str | None = None, db_path: str = ":memory:",
-                 charity_account: str | None = None,
-                 allow_zero_sends: bool = False):
-        self._seed_bytes = bytes.fromhex(seed or "aa" * 32)
-        self.allow_zero_sends = allow_zero_sends
-        from protocol import CHARITY_ADDRESS
-        self.charity_account = charity_account if charity_account is not None else CHARITY_ADDRESS
-
-        self._db = sqlite3.connect(db_path, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
-        self._lock = threading.Lock()
-        self._init_db()
-
-        # Track nonces for key derivation (same as NanoBackend)
-        self._nonces: dict[str, bytes] = {}
-        self._tx_counter = 0
-
-    def _init_db(self):
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("""
-            CREATE TABLE IF NOT EXISTS sim_accounts (
-                address TEXT PRIMARY KEY,
-                balance_raw TEXT NOT NULL DEFAULT '0'
-            )
-        """)
-        self._db.execute("""
-            CREATE TABLE IF NOT EXISTS sim_transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                hash TEXT NOT NULL UNIQUE,
-                from_account TEXT NOT NULL,
-                to_account TEXT NOT NULL,
-                amount_raw TEXT NOT NULL,
-                amount_xno TEXT NOT NULL,
-                contract_id TEXT,
-                tx_type TEXT NOT NULL,
-                timestamp REAL NOT NULL
-            )
-        """)
-        # Contract -> escrow account mapping
-        self._db.execute("""
-            CREATE TABLE IF NOT EXISTS sim_escrows (
-                contract_id TEXT PRIMARY KEY,
-                account TEXT NOT NULL,
-                nonce BLOB NOT NULL
-            )
-        """)
-        self._db.commit()
-
-    def _get_balance_raw(self, address: str) -> int:
-        """Get balance in raw for an address."""
-        row = self._db.execute(
-            "SELECT balance_raw FROM sim_accounts WHERE address = ?",
-            (address,),
-        ).fetchone()
-        return int(row["balance_raw"]) if row else 0
-
-    def _set_balance_raw(self, address: str, raw: int):
-        """Set balance in raw, creating account if needed."""
-        self._db.execute(
-            "INSERT INTO sim_accounts (address, balance_raw) VALUES (?, ?) "
-            "ON CONFLICT(address) DO UPDATE SET balance_raw = ?",
-            (address, str(raw), str(raw)),
-        )
-
-    def _record_tx(self, from_acc: str, to_acc: str, raw: int,
-                   xno: str, contract_id: str, tx_type: str) -> str:
-        """Record a transaction and return its hash."""
-        import time as _t
-        self._tx_counter += 1
-        tx_hash = hashlib.blake2b(
-            f"{self._tx_counter}:{from_acc}:{to_acc}:{raw}".encode(),
-            digest_size=32,
-        ).hexdigest().upper()
-        self._db.execute(
-            "INSERT INTO sim_transactions (hash, from_account, to_account, "
-            "amount_raw, amount_xno, contract_id, tx_type, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (tx_hash, from_acc, to_acc, str(raw), xno, contract_id, tx_type, _t.time()),
-        )
-        return tx_hash
-
-    def _derive_account(self, contract_id: str) -> str:
-        """Derive a nano address for a contract (same scheme as NanoBackend)."""
-        if contract_id in self._nonces:
-            nonce = self._nonces[contract_id]
-        else:
-            nonce = secrets.token_bytes(32)
-            self._nonces[contract_id] = nonce
-
-        priv_bytes = hashlib.blake2b(self._seed_bytes + nonce, digest_size=32).digest()
-
-        if ed25519_blake2b is not None:
-            sk = ed25519_blake2b.SigningKey(priv_bytes)
-            pub_bytes = sk.get_verifying_key().to_bytes()
-        else:
-            # Deterministic fake: hash the private key to get a "pubkey"
-            pub_bytes = hashlib.blake2b(priv_bytes, digest_size=32).digest()
-
-        return _pubkey_to_address(pub_bytes)
-
-    # --- PaymentBackend interface ---
-
-    def create_escrow_account(self, contract_id: str) -> dict:
-        with self._lock:
-            address = self._derive_account(contract_id)
-            self._set_balance_raw(address, 0)
-            self._db.execute(
-                "INSERT OR IGNORE INTO sim_escrows (contract_id, account, nonce) VALUES (?, ?, ?)",
-                (contract_id, address, self._nonces[contract_id]),
-            )
-            self._db.commit()
-            return {"account": address}
-
-    def check_deposit(self, contract_id: str, expected_xno: str) -> bool:
-        with self._lock:
-            row = self._db.execute(
-                "SELECT account FROM sim_escrows WHERE contract_id = ?",
-                (contract_id,),
-            ).fetchone()
-            if not row:
-                return False
-            balance = self._get_balance_raw(row["account"])
-            expected = xno_to_raw(expected_xno)
-            return balance >= expected
-
-    def send(self, contract_id: str, to_account: str, amount_xno: str) -> str:
-        raw = xno_to_raw(amount_xno)
-        if raw == 0:
-            if self.allow_zero_sends:
-                return "sim_noop_zero"
-            return "noop_zero_amount"
-
-        with self._lock:
-            row = self._db.execute(
-                "SELECT account FROM sim_escrows WHERE contract_id = ?",
-                (contract_id,),
-            ).fetchone()
-            if not row:
-                raise ValueError(f"No escrow account for contract {contract_id}")
-
-            from_account = row["account"]
-            balance = self._get_balance_raw(from_account)
-
-            if balance < raw:
-                raise ValueError(
-                    f"Insufficient balance: have {raw_to_xno(balance)} XNO, "
-                    f"need {amount_xno} XNO (contract {contract_id})"
-                )
-
-            # Atomic transfer
-            self._set_balance_raw(from_account, balance - raw)
-            to_balance = self._get_balance_raw(to_account)
-            self._set_balance_raw(to_account, to_balance + raw)
-            tx_hash = self._record_tx(from_account, to_account, raw,
-                                       amount_xno, contract_id, "send")
-            self._db.commit()
-            return tx_hash
-
-    def get_balance(self, contract_id: str) -> str:
-        with self._lock:
-            row = self._db.execute(
-                "SELECT account FROM sim_escrows WHERE contract_id = ?",
-                (contract_id,),
-            ).fetchone()
-            if not row:
-                return "0"
-            raw = self._get_balance_raw(row["account"])
-            return str(raw_to_xno(raw))
-
-    # --- SimBackend-only methods (for test setup) ---
-
-    def fund(self, address: str, amount_xno: str):
-        """Credit an account with funds (simulates external deposit)."""
-        raw = xno_to_raw(amount_xno)
-        with self._lock:
-            balance = self._get_balance_raw(address)
-            self._set_balance_raw(address, balance + raw)
-            self._record_tx("faucet", address, raw, amount_xno, "", "fund")
-            self._db.commit()
-
-    def deposit(self, contract_id: str, amount_xno: str):
-        """Simulate a principal depositing into escrow."""
-        raw = xno_to_raw(amount_xno)
-        with self._lock:
-            row = self._db.execute(
-                "SELECT account FROM sim_escrows WHERE contract_id = ?",
-                (contract_id,),
-            ).fetchone()
-            if not row:
-                raise ValueError(f"No escrow account for contract {contract_id}")
-            address = row["account"]
-            balance = self._get_balance_raw(address)
-            self._set_balance_raw(address, balance + raw)
-            self._record_tx("principal", address, raw, amount_xno,
-                           contract_id, "deposit")
-            self._db.commit()
-
-    def get_account_balance(self, address: str) -> str:
-        """Get balance of any address (not just escrow)."""
-        with self._lock:
-            raw = self._get_balance_raw(address)
-            return str(raw_to_xno(raw))
-
-    def get_transactions(self, contract_id: str = "") -> list[dict]:
-        """Get transaction log, optionally filtered by contract."""
-        with self._lock:
-            if contract_id:
-                rows = self._db.execute(
-                    "SELECT * FROM sim_transactions WHERE contract_id = ? ORDER BY id",
-                    (contract_id,),
-                ).fetchall()
-            else:
-                rows = self._db.execute(
-                    "SELECT * FROM sim_transactions ORDER BY id"
-                ).fetchall()
-            return [dict(r) for r in rows]
