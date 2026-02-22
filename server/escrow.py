@@ -292,8 +292,6 @@ class EscrowManager:
 
     def __init__(self, db_path: str = ":memory:", payment_backend=None, platform_account: str = ""):
         from protocol import PLATFORM_ADDRESS
-        if payment_backend is None:
-            raise ValueError("payment_backend is required (use NanoBackend)")
         self.payment = payment_backend
         self.platform_account = platform_account or PLATFORM_ADDRESS
         if self.platform_account:

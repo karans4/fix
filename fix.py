@@ -489,8 +489,7 @@ fix() {
     command fix "$@"
   fi
 }""",
-    "fish": """\
-function fix --wraps=fix --description 'AI command fixer'
+    "fish": r"""function fix --wraps=fix --description 'AI command fixer'
     if test (count $argv) -gt 0; and test "$argv[1]" = "it" -o "$argv[1]" = "!!"
         set -lx FIX_LAST_COMMAND (builtin history search --max 1 --prefix "" | string match -rv '^\s*fix |^\s*fix\$|^\s*claude')
         command fix $argv
@@ -685,7 +684,7 @@ class Verifier:
         proc = subprocess.run(self.original_cmd, shell=True, capture_output=True, text=True)
         if proc.returncode == 0:
             return True, "Command succeeded (exit 0)"
-        return False, f"Command failed (exit {proc.returncode}): {proc.stderr[:200]}"
+        return False, f"Command failed (exit {proc.returncode}): {proc.stderr[:2000]}"
 
     def _verify_principal(self, fix_result):
         # Re-run original to show current output (skip for task mode / no-op commands)
@@ -2017,13 +2016,15 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
         import asyncio as _asyncio
         status(f"{C_YELLOW}\u25cb{C_RESET}", f"Dispatching to fix market...")
 
+        from protocol import DEFAULT_BOUNTY, DEFAULT_JUDGE_FEE
         contract = build_contract(
             command, scrubbed_stderr, env_info,
             verify_spec=verify_spec, safe_mode=safe_mode,
             backend_name="market", attempt=0,
             root=cfg.get("root"),
-            bounty=cfg.get("bounty", "0.01"),
+            bounty=cfg.get("bounty", DEFAULT_BOUNTY),
             judge=cfg.get("judge"),
+            market=True,
         )
 
         if is_task:
@@ -2035,9 +2036,9 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
             import select as _select
 
             platform_url = cfg.get("platform_url", "https://fix.notruefireman.org")
-            fix_client = FixClient(base_url=platform_url)
-
             my_pubkey = get_pubkey()
+            privkey = _get_signing_key()
+            fix_client = FixClient(base_url=platform_url, privkey_bytes=privkey)
             contract_id = await fix_client.post_contract(contract, principal_pubkey=my_pubkey)
             status(f"{C_GREEN}\u2714{C_RESET}", f"Contract posted ({contract_id})")
             status(f"{C_DIM}\u25b8{C_RESET}", "Waiting for agent...")
@@ -2222,10 +2223,16 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                             if answer.strip().lower() == "n":
                                 return proc.returncode
 
-                        rc = apply_fix(fix_cmd, command, verify_spec, safe_mode, cfg, contract)
+                        rc, fix_output = apply_fix(fix_cmd, command, verify_spec, safe_mode, cfg, contract)
                         success = (rc == 0)
-                        await fix_client.verify(contract_id, success,
-                                                "fulfilled" if success else f"fix failed verification (attempt {attempt_num})",
+                        if success:
+                            verify_explanation = "fulfilled"
+                        else:
+                            # Include captured output (capped) so agent sees what went wrong
+                            verify_explanation = f"fix failed verification (attempt {attempt_num})"
+                            if fix_output:
+                                verify_explanation += "\n--- output ---\n" + fix_output[:2000]
+                        await fix_client.verify(contract_id, success, verify_explanation,
                                                 principal_pubkey=my_pubkey)
 
                         if success:
@@ -2487,7 +2494,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
                 return proc.returncode
 
         # Apply fix
-        rc = apply_fix(fix_cmd, command, verify_spec, safe_mode, cfg, contract)
+        rc, _fix_output = apply_fix(fix_cmd, command, verify_spec, safe_mode, cfg, contract)
 
         if rc == 0:
             return 0
@@ -2512,7 +2519,7 @@ def run_fix(command, cfg, verify_spec=None, explain_only=False, dry_run=False,
 
 
 def apply_fix(fix_cmd, original_cmd, verify_spec, safe_mode, cfg, contract=None):
-    """Apply a fix and verify it. Returns exit code."""
+    """Apply a fix and verify it. Returns (exit_code, captured_output)."""
 
     if safe_mode:
         status(f"{C_BLUE}\u25b8{C_RESET}", "Executing in sandbox...")
@@ -2520,8 +2527,9 @@ def apply_fix(fix_cmd, original_cmd, verify_spec, safe_mode, cfg, contract=None)
             fix_cmd, original_cmd, verify_spec, cfg, status)
         print(file=sys.stderr)
         explanation = verify_out or ("Changes committed" if success else "System unchanged")
+        captured_output = fix_out or ""
     else:
-        # Direct execution
+        # Direct execution — capture output while still printing to terminal
         needs_sudo = bool(re.search(r'\bsudo\b', fix_cmd))
 
         # Block sudo if not allowed by contract capabilities
@@ -2542,7 +2550,7 @@ def apply_fix(fix_cmd, original_cmd, verify_spec, safe_mode, cfg, contract=None)
                 )
                 if answer.strip().lower() == "n":
                     status(f"{C_RED}\u2717{C_RESET}", "sudo denied by user")
-                    return 1
+                    return 1, ""
 
             # Authenticate sudo first (caches credential), then run the real command
             SUDO_AUTH_TIMEOUT = 30
@@ -2554,33 +2562,35 @@ def apply_fix(fix_cmd, original_cmd, verify_spec, safe_mode, cfg, contract=None)
                 )
                 if auth.returncode != 0:
                     status(f"{C_RED}\u2717{C_RESET}", "sudo authentication failed")
-                    return 1
+                    return 1, ""
             except subprocess.TimeoutExpired:
                 status(f"{C_RED}\u2717{C_RESET}", f"No password entered ({SUDO_AUTH_TIMEOUT}s) — aborted")
-                return 1
+                return 1, ""
 
-            # Credential cached — run the actual command with no timeout
+            # Credential cached — run the actual command, capturing output
             status(f"{C_BLUE}\u25b8{C_RESET}", f"Running: {fix_cmd}")
             fix_proc = subprocess.run(
                 fix_cmd, shell=True, executable="/bin/bash",
-                stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr,
+                capture_output=True, text=True,
             )
-            class _R:
-                def __init__(self, rc): self.returncode, self.stdout, self.stderr = rc, "", ""
-            fix_proc = _R(fix_proc.returncode)
         else:
             status(f"{C_BLUE}\u25b8{C_RESET}", f"Running: {fix_cmd}")
             fix_proc = subprocess.run(fix_cmd, shell=True, executable="/bin/bash",
-                                      stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
-            class _R:
-                def __init__(self, rc): self.returncode, self.stdout, self.stderr = rc, "", ""
-            fix_proc = _R(fix_proc.returncode)
+                                      capture_output=True, text=True)
+
+        # Print captured output to terminal for the principal
+        if fix_proc.stdout:
+            sys.stdout.write(fix_proc.stdout)
+        if fix_proc.stderr:
+            sys.stderr.write(fix_proc.stderr)
+
+        captured_output = (fix_proc.stdout or "") + (fix_proc.stderr or "")
 
         if fix_proc.returncode != 0:
-            err_msg = getattr(fix_proc, 'stderr', '')
+            err_msg = fix_proc.stderr or ""
             status(f"{C_RED}\u2717{C_RESET}", f"Fix command failed (exit {fix_proc.returncode})" +
                    (f": {err_msg[:100]}" if err_msg else ""))
-            return fix_proc.returncode
+            return fix_proc.returncode, captured_output
 
         # Verify
         verifier = Verifier(verify_spec, original_cmd)
@@ -2663,7 +2673,7 @@ def apply_fix(fix_cmd, original_cmd, verify_spec, safe_mode, cfg, contract=None)
                 status(f"{C_DIM}${C_RESET}",
                        f"Escrow: {bounty} returned to principal (minus platform fee)")
 
-    return 0 if success else 1
+    return (0 if success else 1), captured_output
 
 
 # --- CLI ---
@@ -2696,16 +2706,66 @@ def main():
             sys.exit(1)
         import asyncio as _asyncio
         platform_url = cfg.get("platform_url", "https://fix.notruefireman.org")
+
+        # Agent identity: Ed25519 key (separate from principal key)
+        agent_keyfile = os.path.join(CONFIG_DIR, "agent.key")
+        from crypto import generate_ed25519_keypair, load_ed25519_key, save_ed25519_key
+        from crypto import ed25519_privkey_to_pubkey, pubkey_to_fix_id
+        if os.path.exists(agent_keyfile):
+            agent_privkey = load_ed25519_key(agent_keyfile)
+        else:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            agent_privkey, _ = generate_ed25519_keypair()
+            save_ed25519_key(agent_keyfile, agent_privkey)
+        agent_pub = ed25519_privkey_to_pubkey(agent_privkey)
+        agent_id = pubkey_to_fix_id(agent_pub)
+
+        # LLM backend: OpenRouter (preferred) or Anthropic
+        llm_call = None
+        openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if openrouter_key:
+            from agent import _default_openrouter_llm
+            model = cfg.get("agent_model", "anthropic/claude-sonnet-4")
+            llm_call = _default_openrouter_llm(model)
+            status(f"{C_DIM}\u25b8{C_RESET}", f"LLM: OpenRouter ({model})")
+        elif anthropic_key:
+            import httpx as _httpx
+            model = cfg.get("agent_model", "claude-haiku-4-5-20251001")
+            async def _anthropic_llm(prompt, _model=model, _key=anthropic_key):
+                async with _httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers={
+                            "x-api-key": _key,
+                            "anthropic-version": "2023-06-01",
+                            "content-type": "application/json",
+                        },
+                        json={"model": _model, "max_tokens": 4096,
+                              "messages": [{"role": "user", "content": prompt}]},
+                        timeout=120.0,
+                    )
+                    resp.raise_for_status()
+                    return resp.json()["content"][0]["text"]
+            llm_call = _anthropic_llm
+            status(f"{C_DIM}\u25b8{C_RESET}", f"LLM: Anthropic ({model})")
+        else:
+            status(f"{C_RED}!{C_RESET}",
+                   "No LLM key found. Set OPENROUTER_API_KEY or ANTHROPIC_API_KEY.")
+            sys.exit(1)
+
         agent_config = {
             "platform_url": platform_url,
-            "api_key": cfg.get("api_key", ""),
-            "pubkey": cfg.get("pubkey", "agent-default"),
+            "privkey_bytes": agent_privkey,
+            "pubkey": agent_id,
             "min_bounty": str(cfg.get("min_bounty", "0")),
             "capabilities": detect_capabilities() if _HAS_V2 else {},
+            "llm_call": llm_call,
         }
         fix_agent = FixAgent(agent_config)
         status(f"{C_GREEN}\u25b8{C_RESET}", f"Starting fix agent (serve mode)...")
         status(f"{C_DIM}\u25b8{C_RESET}", f"Platform: {platform_url}")
+        status(f"{C_DIM}\u25b8{C_RESET}", f"Identity: {agent_id[:20]}...")
         try:
             _asyncio.run(fix_agent.serve())
         except KeyboardInterrupt:

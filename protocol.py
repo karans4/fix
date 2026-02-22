@@ -95,7 +95,7 @@ _validate_charity()
 del _validate_charity
 
 # Investigation rate limiting
-DEFAULT_INVESTIGATION_RATE = 5  # seconds between commands
+DEFAULT_INVESTIGATION_RATE = 1  # seconds between commands
 
 
 # --- State Machine ---
@@ -197,8 +197,21 @@ CHAIN_ENTRY_TYPES = {
     "chat", "ask", "answer", "message",
     "halt", "review_accept",
     # Server-only types
-    "ruling", "auto_fulfill", "voided",
+    "ruling", "auto_fulfill", "voided", "dispute_metadata",
 }
 
 # Only the server can sign these types
-SERVER_ENTRY_TYPES = {"ruling", "auto_fulfill", "voided"}
+SERVER_ENTRY_TYPES = {"ruling", "auto_fulfill", "voided", "dispute_metadata"}
+
+# Role-based entry type map: who is allowed to sign each entry type
+# "agent" = only agent, "principal" = only principal, "either" = either party
+ENTRY_TYPE_ROLES = {
+    "bond": "agent", "accept": "agent", "decline": "agent",
+    "investigate": "agent", "fix": "agent",
+    "ask": "agent",
+    "result": "principal", "verify": "principal",
+    "review_accept": "principal", "halt": "principal",
+    "answer": "principal",
+    "chat": "either", "message": "either",
+    "dispute_filed": "either", "dispute_response": "either",
+}

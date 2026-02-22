@@ -198,19 +198,28 @@ def build_chain_entry(
 ) -> dict:
     """Build and sign a chain entry.
 
+    The signature covers {type, data, seq, author, prev_hash} — NOT timestamp.
+    Timestamp is set by the server on append (server is the time authority).
+    The client-provided timestamp is a hint; the server overwrites it.
+
     Returns the full entry dict including signature.
     """
-    entry = {
+    # Signed payload: everything the client asserts
+    signed_fields = {
         "type": entry_type,
         "data": data,
         "seq": seq,
         "author": author,
         "prev_hash": prev_hash,
-        "timestamp": int(_time.time()) if timestamp is None else int(timestamp),
     }
-    # Sign the canonical JSON of the entry (without signature field)
-    payload = canonical_json(entry)
-    entry["signature"] = ed25519_sign(privkey_bytes, payload)
+    payload = canonical_json(signed_fields)
+    signature = ed25519_sign(privkey_bytes, payload)
+
+    entry = {
+        **signed_fields,
+        "timestamp": int(_time.time()) if timestamp is None else int(timestamp),
+        "signature": signature,
+    }
     return entry
 
 
@@ -239,14 +248,13 @@ def verify_chain_entry(entry: dict) -> tuple[bool, str]:
     if not sig:
         return False, "Missing signature"
 
-    # Reconstruct the signing payload (everything except signature)
+    # Reconstruct the signing payload (timestamp excluded — server is time authority)
     payload_dict = {
         "type": entry["type"],
         "data": entry["data"],
         "seq": entry["seq"],
         "author": entry["author"],
         "prev_hash": entry["prev_hash"],
-        "timestamp": entry["timestamp"],
     }
     payload = canonical_json(payload_dict)
 

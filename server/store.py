@@ -161,10 +161,12 @@ class ContractStore:
             self.db.commit()
             return True
 
-    def append_chain_entry(self, contract_id: str, entry: dict) -> tuple[bool, str]:
+    def append_chain_entry(self, contract_id: str, entry: dict,
+                           caller_pubkey: str = "") -> tuple[bool, str]:
         """Append a signed chain entry to the transcript.
 
         Validates: seq == len(transcript), prev_hash matches chain_head, valid signature.
+        If caller_pubkey is provided, also validates entry.author == caller_pubkey.
         Updates chain_head after append.
 
         Returns (ok, error_message).
@@ -200,10 +202,19 @@ class ContractStore:
                 if not server_pub or author_hex != server_pub:
                     return False, f"Entry type '{entry_type}' is server-only but author is not the server"
 
+            # Verify author matches caller (when caller_pubkey provided)
+            if caller_pubkey:
+                author = entry.get("author", "")
+                if author != caller_pubkey:
+                    return False, f"Author mismatch: entry author {author} != caller {caller_pubkey}"
+
             # Verify signature
             ok, err = verify_chain_entry(entry)
             if not ok:
                 return False, f"Signature verification failed: {err}"
+
+            # Server is the time authority — stamp the entry now
+            entry["timestamp"] = int(time.time())
 
             # Append and update chain head
             transcript.append(entry)

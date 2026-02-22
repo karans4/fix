@@ -307,12 +307,6 @@ def test_escrow_set_accounts_accepts_valid():
     ok = mgr.set_accounts("c1", principal_account=TEST_PRINCIPAL_ADDR)
     assert ok
 
-def test_escrow_requires_payment_backend():
-    from server.escrow import EscrowManager
-    with pytest.raises(ValueError, match="payment_backend is required"):
-        EscrowManager()
-
-
 # --- Integration: EscrowManager with real NanoBackend ---
 
 def test_escrow_fulfilled():

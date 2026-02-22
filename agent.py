@@ -335,8 +335,19 @@ class FixAgent:
         # 1. Post bond to investigate
         await self.client.bond(contract_id, self.pubkey)
 
-        # 2. Investigation loop
+        # 2. Investigation loop — seed with prior agents' results from transcript
         investigation_results = []
+        data = await self.client.get_contract(contract_id)
+        if data:
+            transcript = data.get("transcript", [])
+            # Extract prior investigate/result pairs
+            for entry in transcript:
+                etype = entry.get("type", "")
+                if etype == "result":
+                    cmd = entry.get("command", "") or entry.get("data", {}).get("command", "")
+                    output = entry.get("output", "") or entry.get("data", {}).get("output", "")
+                    if cmd:
+                        investigation_results.append({"command": cmd, "output": output})
         prompt_contract = contract_for_prompt(contract)
         max_rounds = contract.get("execution", {}).get(
             "investigation_rounds", MAX_INVESTIGATION_ROUNDS
@@ -383,12 +394,13 @@ class FixAgent:
 
         # 3. Decide: accept or decline
         if fix_data and fix_data.get("accepted") is False:
-            await self.client.decline(contract_id, self.pubkey)
+            reason = fix_data.get("explanation", "agent declined after investigation")
+            await self.client.decline(contract_id, self.pubkey, reason=reason)
             return
 
         if not fix_data or not fix_data.get("fix"):
             # No fix found — decline
-            await self.client.decline(contract_id, self.pubkey)
+            await self.client.decline(contract_id, self.pubkey, reason="no fix found after investigation")
             return
 
         # 4. Accept and submit fix

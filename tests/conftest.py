@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from crypto import (
     generate_ed25519_keypair, ed25519_privkey_to_pubkey, pubkey_to_fix_id,
-    sign_request_ed25519,
+    sign_request_ed25519, build_chain_entry, chain_entry_hash, hash_chain_init,
 )
 from server.nano import NanoBackend, xno_to_raw
 
@@ -139,3 +139,47 @@ def signed_headers(pubkey, privkey_bytes, method, path, body=""):
     """Generate Ed25519 auth headers for a request."""
     pub_hex = pubkey[4:] if pubkey.startswith("fix_") else pubkey
     return sign_request_ed25519(privkey_bytes, pub_hex, method, path, body)
+
+
+def build_client_chain_entry(app_or_client, contract_id, entry_type, entry_data,
+                              pubkey, privkey_bytes):
+    """Build a client-signed chain entry for test requests.
+
+    Reads chain_head and seq from the app's store, builds and signs the entry.
+    Returns the signed entry dict ready to include as 'chain_entry' in request body.
+    """
+    # Get store from app (TestClient wraps app)
+    if hasattr(app_or_client, 'app'):
+        store = app_or_client.app.state.store
+    elif hasattr(app_or_client, 'state'):
+        store = app_or_client.state.store
+    else:
+        raise ValueError("Need app or TestClient to read chain state")
+
+    data = store.get(contract_id)
+    if not data:
+        raise ValueError(f"Contract {contract_id} not found")
+
+    head = data["chain_head"]
+    seq = len(data["transcript"])
+
+    return build_chain_entry(
+        entry_type=entry_type,
+        data=entry_data,
+        seq=seq,
+        author=pubkey,
+        prev_hash=head,
+        privkey_bytes=privkey_bytes,
+    )
+
+
+def signed_post_with_entry(client, path, data, pubkey, privkey_bytes,
+                            contract_id, entry_type, entry_data):
+    """Make a signed POST that includes a client-signed chain entry.
+
+    Combines signed_post() with build_client_chain_entry() for convenience.
+    """
+    entry = build_client_chain_entry(client, contract_id, entry_type, entry_data,
+                                      pubkey, privkey_bytes)
+    data_with_entry = {**data, "chain_entry": entry}
+    return signed_post(client, path, data_with_entry, pubkey, privkey_bytes)

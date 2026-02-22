@@ -918,10 +918,10 @@ def test_dispute_in_absentia():
     # Manually expire the deadline by patching the transcript
     transcript = store.get(cid)["transcript"]
     for msg in transcript:
-        if msg.get("type") == "dispute_filed":
-            # Chain entries store data in msg["data"]
+        if msg.get("type") in ("dispute_metadata", "dispute_filed"):
             msg_data = msg.get("data", msg)
-            msg_data["response_deadline"] = time.time() - 1  # expired
+            if "response_deadline" in msg_data:
+                msg_data["response_deadline"] = time.time() - 1  # expired
     store.db.execute(
         "UPDATE contracts SET transcript = ? WHERE id = ?",
         (__import__("json").dumps(transcript), cid),
