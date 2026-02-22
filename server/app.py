@@ -335,8 +335,9 @@ PARTIES
   Both parties deposit the same amount ({inclusive_bond} {cur}).
   Total in escrow: {inclusive_bond} x 2 = {str(Decimal(inclusive_bond) * 2)} {cur}.
 
-  Platform fee: 10% of bounty on all completed contracts.
-  Cancellation fee: 20% of bounty if either side backs out
+  Platform fee: 10% of excess bond (bounty - judge fee) on all
+  completed contracts.
+  Cancellation fee: 20% of excess bond if either side backs out
   post-grace (split 10% reimbursement + 10% platform).
 
 3. AGENT OPTIONS
@@ -400,14 +401,14 @@ PARTIES
 7. REMEDIES
 
   a. Success: bounty ({bounty} {cur}) released to Agent minus
-     10% platform fee. Agent's bond returned. Principal's
-     judge fee returned.
+     platform fee (10% of excess bond). Agent's bond returned.
+     Principal's judge fee returned.
   b. Failure (all {max_attempts} attempts exhausted): contract
      canceled, bounty returned to Principal minus platform fee.
   c. Cancellation within {grace_period}s: no penalty, both
      sides get everything back.
-  d. Late cancellation: 20% of bounty deducted from canceler.
-     10% reimburses counterparty, 10% to platform.
+  d. Late cancellation: 20% of excess bond deducted from
+     canceler. 10% reimburses counterparty, 10% to platform.
   e. Dispute: three-tier court system. Loser pays tier fee
      from their judge fee portion:
 

@@ -105,9 +105,10 @@ class Escrow:
         # --- Judge fee routing ---
         self._route_judge_fees(result, flags, dispute_loser, tier_fee)
 
-        # --- Platform fee: 10% of bounty ---
+        # --- Platform fee: 10% of excess bond (bounty - judge_fee) ---
         if result.get("action") != "grace_return":
-            fee = max(bounty * PLATFORM_FEE_RATE, PLATFORM_FEE_MIN) if bounty > 0 else Decimal("0")
+            excess = max(bounty - judge_fee, Decimal("0"))
+            fee = max(excess * PLATFORM_FEE_RATE, PLATFORM_FEE_MIN) if excess > 0 else Decimal("0")
             result["platform_fee"] = str(fee)
         else:
             result["platform_fee"] = "0"
@@ -175,7 +176,8 @@ class Escrow:
                 "details": "backed out during grace period, no fees",
             }
 
-        cancel_fee = bounty * CANCEL_FEE_RATE  # 20% of bounty
+        excess = max(bounty - self.judge_fee, Decimal("0"))
+        cancel_fee = excess * CANCEL_FEE_RATE   # 20% of excess bond
         reimburse = cancel_fee / 2              # 10% to counterparty
         platform_cancel = cancel_fee / 2        # 10% to platform
 
@@ -186,7 +188,7 @@ class Escrow:
                 "principal_gets_reimburse": str(reimburse),
                 "agent_gets_back": str(bounty - cancel_fee),
                 "cancel_fee_to_platform": str(platform_cancel),
-                "details": "agent backed out post-grace, 20% cancel fee",
+                "details": "agent backed out post-grace, 20% cancel fee on excess bond",
             }
         else:  # principal backed out
             return {
@@ -195,7 +197,7 @@ class Escrow:
                 "agent_gets_bounty_back": str(bounty),
                 "agent_gets_reimburse": str(reimburse),
                 "cancel_fee_to_platform": str(platform_cancel),
-                "details": "principal backed out post-grace, 20% cancel fee",
+                "details": "principal backed out post-grace, 20% cancel fee on excess bond",
             }
 
     def _void(self) -> dict:
@@ -507,7 +509,8 @@ class EscrowManager:
 
             elif action == "agent_canceled":
                 # Agent backed out post-grace
-                cancel_fee = bounty * CANCEL_FEE_RATE
+                excess = max(bounty - judge_fee, Decimal("0"))
+                cancel_fee = excess * CANCEL_FEE_RATE
                 reimburse = cancel_fee / 2
                 platform_cancel = cancel_fee / 2
                 total_platform = platform_fee + platform_cancel
@@ -526,7 +529,8 @@ class EscrowManager:
 
             elif action == "principal_canceled":
                 # Principal backed out post-grace
-                cancel_fee = bounty * CANCEL_FEE_RATE
+                excess = max(bounty - judge_fee, Decimal("0"))
+                cancel_fee = excess * CANCEL_FEE_RATE
                 reimburse = cancel_fee / 2
                 platform_cancel = cancel_fee / 2
                 total_platform = platform_fee + platform_cancel

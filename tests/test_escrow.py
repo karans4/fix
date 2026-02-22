@@ -65,9 +65,11 @@ class TestEscrowFulfilled(unittest.TestCase):
         self.assertTrue(e.resolved)
 
     def test_fulfilled_platform_fee(self):
+        # Platform fee is 10% of excess bond (bounty - judge_fee)
+        # bounty=1.00, judge_fee=0.17, excess=0.83, fee=0.083
         e = Escrow("1.00", TERMS)
         result = e.resolve("fulfilled")
-        self.assertEqual(Decimal(result["platform_fee"]), Decimal("0.10"))
+        self.assertEqual(Decimal(result["platform_fee"]), Decimal("0.083"))
 
     def test_fulfilled_no_dispute_judge_fees_returned(self):
         e = Escrow("0.50", TERMS)
@@ -129,20 +131,22 @@ class TestEscrowBackedOut(unittest.TestCase):
         e = Escrow("1.00", TERMS)
         result = e.resolve("backed_out", backed_out_by="agent")
         self.assertEqual(result["action"], "agent_canceled")
-        # 20% cancel fee = 0.20. 10% reimburse = 0.10, 10% platform = 0.10
+        # excess = 1.00 - 0.17 = 0.83. cancel_fee = 20% of 0.83 = 0.166
+        # reimburse = 0.083, platform_cancel = 0.083
         self.assertEqual(Decimal(result["principal_gets_bounty"]), Decimal("1.00"))
-        self.assertEqual(Decimal(result["principal_gets_reimburse"]), Decimal("0.10"))
-        self.assertEqual(Decimal(result["agent_gets_back"]), Decimal("0.80"))
-        self.assertEqual(Decimal(result["cancel_fee_to_platform"]), Decimal("0.10"))
+        self.assertEqual(Decimal(result["principal_gets_reimburse"]), Decimal("0.083"))
+        self.assertEqual(Decimal(result["agent_gets_back"]), Decimal("0.834"))
+        self.assertEqual(Decimal(result["cancel_fee_to_platform"]), Decimal("0.083"))
 
     def test_principal_backs_out_post_grace(self):
         e = Escrow("1.00", TERMS)
         result = e.resolve("backed_out", backed_out_by="principal")
         self.assertEqual(result["action"], "principal_canceled")
-        self.assertEqual(Decimal(result["principal_gets_back"]), Decimal("0.80"))
+        # excess = 0.83, cancel_fee = 0.166
+        self.assertEqual(Decimal(result["principal_gets_back"]), Decimal("0.834"))
         self.assertEqual(Decimal(result["agent_gets_bounty_back"]), Decimal("1.00"))
-        self.assertEqual(Decimal(result["agent_gets_reimburse"]), Decimal("0.10"))
-        self.assertEqual(Decimal(result["cancel_fee_to_platform"]), Decimal("0.10"))
+        self.assertEqual(Decimal(result["agent_gets_reimburse"]), Decimal("0.083"))
+        self.assertEqual(Decimal(result["cancel_fee_to_platform"]), Decimal("0.083"))
 
 
 class TestEscrowVoided(unittest.TestCase):

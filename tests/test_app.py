@@ -963,19 +963,21 @@ def test_dispute_status_endpoint():
 
 
 def test_platform_fee_in_resolution():
-    """Platform fee is 10% of bounty."""
+    """Platform fee is 10% of excess bond (bounty - judge_fee)."""
     from server.escrow import Escrow
+    # bounty=1.0, judge_fee=0.17, excess=0.83, fee=0.083
     escrow = Escrow("1.0", {"judge_fee": "0.17"})
     escrow.lock()
     result = escrow.resolve("fulfilled")
     assert "platform_fee" in result
-    assert Decimal(result["platform_fee"]) == Decimal("0.1")
+    assert Decimal(result["platform_fee"]) == Decimal("0.083")
 
 
 def test_platform_fee_minimum():
-    """Platform fee floors at 0.002 XNO for tiny bounties."""
+    """Platform fee floors at 0.002 XNO when excess is tiny."""
     from server.escrow import Escrow
-    escrow = Escrow("0.01", {"judge_fee": "0.17"})
+    # bounty=0.19, judge_fee=0.17, excess=0.02, 10% of 0.02=0.002
+    escrow = Escrow("0.19", {"judge_fee": "0.17"})
     escrow.lock()
     result = escrow.resolve("fulfilled")
     assert Decimal(result["platform_fee"]) == Decimal("0.002")

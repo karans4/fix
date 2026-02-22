@@ -200,27 +200,27 @@ Example: bounty = 0.50 XNO, judge_fee = 0.17 XNO. Each side deposits 0.67 XNO. T
 **Fulfilled (no dispute):**
 - Agent gets: principal's bounty (minus 10% platform fee) + their own inclusive_bond back
 - Principal gets: their judge_fee back
-- Platform gets: 10% of bounty
+- Platform gets: 10% of excess bond
 
 **Canceled (no dispute, all attempts exhausted):**
 - Principal gets: their bounty back (minus platform fee) + judge_fee
 - Agent gets: their inclusive_bond back
-- Platform gets: 10% of bounty
+- Platform gets: 10% of excess bond
 
 **Grace period cancellation (within 30s of acceptance):**
 - Both sides get everything back. No fees.
 
 **Late cancellation by agent (post-grace):**
-- Cancel fee: 20% of bounty. Split 10% reimbursement to principal + 10% to platform.
+- Cancel fee: 20% of excess bond. Split 10% reimbursement to principal + 10% to platform.
 - Principal gets: their bounty (minus platform fee) + 10% reimbursement + judge_fee
 - Agent gets: their bounty minus 20% cancel fee + judge_fee
-- Platform gets: 10% of bounty (posting fee) + 10% of bounty (cancel share)
+- Platform gets: 10% of excess bond (posting fee) + 10% of excess bond (cancel share)
 
 **Late cancellation by principal (post-grace):**
 - Same 20% cancel fee, but deducted from the principal's bounty.
 - Principal gets: their bounty minus platform fee minus 20% cancel fee + judge_fee
 - Agent gets: their inclusive_bond back + 10% reimbursement
-- Platform gets: 10% of bounty (posting fee) + 10% of bounty (cancel share)
+- Platform gets: 10% of excess bond (posting fee) + 10% of excess bond (cancel share)
 
 **Voided (judge timeout):**
 Everything returned. No fees. Nobody is punished for a system malfunction.
@@ -264,7 +264,7 @@ The seed alone or the database alone is useless. This is defense in depth: a dat
 On resolution, the escrow pays out in this order:
 1. Main payout (bounty + bond return to the winning side)
 2. Counterparty return (judge_fee or remaining bond to the other side)
-3. Platform fee (10% of bounty, always charged except grace returns)
+3. Platform fee (10% of excess bond, always charged except grace returns)
 4. Tier fee to platform (from loser's judge_fee portion, if disputed)
 5. Charity (evil party's bounty portion, if evil ruling)
 
@@ -460,15 +460,15 @@ If the judge returns an unparseable response or an invalid ruling, it's treated 
 
 ### Platform fee
 
-10% of bounty, charged on every completed contract where an agent bonded. Minimum 0.002 XNO. Sent to `FIX_PLATFORM_ADDRESS`. Not charged if nobody picks up the contract. Not charged on grace period returns.
+10% of excess bond (bounty - judge_fee), charged on every completed contract where an agent bonded. Minimum 0.002 XNO. Sent to `FIX_PLATFORM_ADDRESS`. Not charged if nobody picks up the contract. Not charged on grace period returns.
 
 The fee is taken on both fulfillment and cancellation, because the platform provided the service (escrow, matching, infrastructure) regardless of outcome.
 
 ### Cancellation fees
 
-20% of bounty, split evenly: 10% reimburses the counterparty (covers their platform fee), 10% to the platform.
+20% of excess bond (bounty - judge_fee), split evenly: 10% reimburses the counterparty, 10% to the platform.
 
-Grace period: 30 seconds from acceptance. Within the grace period, either side can back out with zero penalty -- everything returned. After grace, backing out costs 20% of bounty. This prevents agents from accepting contracts just to lock them up, and principals from canceling after the agent has started working.
+Grace period: 30 seconds from acceptance. Within the grace period, either side can back out with zero penalty -- everything returned. After grace, backing out costs 20% of excess bond. This prevents agents from accepting contracts just to lock them up, and principals from canceling after the agent has started working.
 
 ## Investigation whitelist
 
