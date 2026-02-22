@@ -1,0 +1,982 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FixEscrow State Machine</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0d1117;
+  color: #c9d1d9;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  overflow: hidden;
+  height: 100vh;
+}
+#app { display: flex; height: 100vh; }
+#sidebar {
+  width: 380px;
+  min-width: 380px;
+  border-right: 1px solid #30363d;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+#canvas-wrap { flex: 1; position: relative; }
+canvas { display: block; width: 100%; height: 100%; }
+
+#sidebar h1 {
+  font-size: 16px;
+  padding: 16px;
+  border-bottom: 1px solid #30363d;
+  color: #58a6ff;
+}
+#legend {
+  padding: 10px 16px;
+  border-bottom: 1px solid #30363d;
+  font-size: 11px;
+  line-height: 1.8;
+}
+.legend-item { display: flex; align-items: center; gap: 8px; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+#info-panel {
+  padding: 16px;
+  flex: 1;
+  overflow-y: auto;
+}
+#info-panel h2 { font-size: 14px; color: #58a6ff; margin-bottom: 8px; }
+#info-panel h3 { font-size: 12px; color: #7ee787; margin: 14px 0 6px; }
+#info-panel p, #info-panel li { font-size: 12px; line-height: 1.6; color: #8b949e; }
+#info-panel code {
+  background: #161b22; padding: 1px 5px; border-radius: 3px;
+  font-size: 11px; color: #ffa657;
+}
+
+/* Money location bars */
+.money-loc {
+  background: #161b22;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 6px 0;
+}
+.money-loc-title {
+  font-size: 11px;
+  color: #484f58;
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.money-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0;
+}
+.money-bar-label {
+  font-size: 11px;
+  width: 70px;
+  text-align: right;
+  flex-shrink: 0;
+}
+.money-bar-track {
+  flex: 1;
+  height: 16px;
+  background: #21262d;
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+.money-bar-seg {
+  height: 100%;
+  display: inline-block;
+  float: left;
+  position: relative;
+}
+.money-bar-seg span {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 8px;
+  color: #0d1117;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.money-bar-total {
+  font-size: 10px;
+  color: #484f58;
+  width: 30px;
+  flex-shrink: 0;
+}
+
+/* Transition items */
+.transition-item {
+  padding: 6px 8px; margin: 4px 0;
+  background: #161b22; border-radius: 4px;
+  border-left: 3px solid #30363d;
+  cursor: pointer; font-size: 12px;
+}
+.transition-item:hover { border-left-color: #58a6ff; background: #1c2128; }
+.transition-item .fn { color: #d2a8ff; }
+.transition-item .who { color: #8b949e; font-size: 11px; }
+.transition-item .target { color: #7ee787; }
+
+/* Terminal money table */
+.money-row {
+  display: flex; justify-content: space-between;
+  padding: 3px 0; font-size: 11px;
+  border-bottom: 1px solid #21262d;
+}
+.money-row .label { color: #8b949e; }
+.money-row .val { color: #7ee787; font-family: monospace; }
+
+/* Controls */
+#controls {
+  padding: 8px 16px;
+  border-bottom: 1px solid #30363d;
+  display: flex; gap: 6px; flex-wrap: wrap;
+}
+.ctrl-btn {
+  background: #21262d; border: 1px solid #30363d;
+  color: #c9d1d9; padding: 4px 10px;
+  border-radius: 4px; font-size: 11px; cursor: pointer;
+}
+.ctrl-btn:hover { background: #30363d; }
+.ctrl-btn.active { background: #1f6feb; border-color: #58a6ff; }
+
+#tooltip {
+  display: none; position: absolute;
+  background: #1c2128; border: 1px solid #30363d;
+  border-radius: 6px; padding: 8px 12px; font-size: 12px;
+  pointer-events: none; z-index: 10; max-width: 300px;
+  box-shadow: 0 4px 12px rgba(0,0,0,.4);
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="sidebar">
+    <h1>FixEscrow State Machine</h1>
+    <div id="controls">
+      <button class="ctrl-btn active" onclick="setView('all')">All</button>
+      <button class="ctrl-btn" onclick="setView('happy')">Happy Path</button>
+      <button class="ctrl-btn" onclick="setView('dispute')">Disputes</button>
+      <button class="ctrl-btn" onclick="setView('timeout')">Timeouts</button>
+      <button class="ctrl-btn" onclick="setView('backout')">Backouts</button>
+    </div>
+    <div id="legend"></div>
+    <div id="info-panel">
+      <p style="color:#484f58">Click a state or transition to inspect it.</p>
+    </div>
+  </div>
+  <div id="canvas-wrap">
+    <canvas id="c"></canvas>
+    <div id="tooltip"></div>
+  </div>
+</div>
+<script>
+// ── Colors for money holders ─────────────────────────────────────
+const HOLDER_COLORS = {
+  contract:  '#30363d',
+  bounty:    '#58a6ff',
+  pBond:     '#bc8cff',
+  aBond:     '#ffa657',
+  oracle:    '#f85149',
+  platform:  '#7ee787',
+  principal: '#bc8cff',
+  agent:     '#ffa657',
+  charity:   '#f0883e',
+};
+
+// ── Per-state: where is every unit of money? ─────────────────────
+// Each state tracks money as segments of a stacked bar.
+// "holder" = who has it, "source" = what it came from, "expr" = formula
+const STATE_MONEY = {
+  Open: {
+    desc: 'Principal deposited bounty + court fees. No agent yet.',
+    held: [
+      { holder: 'Contract', color: '#58a6ff', parts: [
+        { label: 'bounty', pct: 55 },
+        { label: 'pBond (court fees)', pct: 45 },
+      ]},
+    ],
+    detail: [
+      { who: 'Contract', has: 'bounty + principalBond', note: 'principalBond = sum(courtFees[3])' },
+    ],
+  },
+  Investigating: {
+    desc: 'Agent bonded. Both deposits locked in contract.',
+    held: [
+      { holder: 'Contract', color: '#58a6ff', parts: [
+        { label: 'bounty', pct: 40 },
+        { label: 'pBond', pct: 30 },
+        { label: 'aBond', pct: 30 },
+      ]},
+    ],
+    detail: [
+      { who: 'Contract', has: 'bounty + principalBond + agentBond', note: 'agent can still decline (gets bond back)' },
+    ],
+  },
+  InProgress: {
+    desc: 'All money locked. Agent working on fix.',
+    held: [
+      { holder: 'Contract', color: '#58a6ff', parts: [
+        { label: 'bounty', pct: 40 },
+        { label: 'pBond', pct: 30 },
+        { label: 'aBond', pct: 30 },
+      ]},
+    ],
+    detail: [
+      { who: 'Contract', has: 'bounty + principalBond + agentBond', note: 'grace period: first 30s, backout is free' },
+    ],
+  },
+  Review: {
+    desc: 'Fix submitted (autonomous mode). All money still locked.',
+    held: [
+      { holder: 'Contract', color: '#58a6ff', parts: [
+        { label: 'bounty', pct: 40 },
+        { label: 'pBond', pct: 30 },
+        { label: 'aBond', pct: 30 },
+      ]},
+    ],
+    detail: [
+      { who: 'Contract', has: 'bounty + principalBond + agentBond', note: 'auto-fulfills when reviewWindow expires' },
+    ],
+  },
+  AwaitResponse: {
+    desc: 'Dispute filed. Money locked. Waiting for counter-argument.',
+    held: [
+      { holder: 'Contract', color: '#58a6ff', parts: [
+        { label: 'bounty', pct: 40 },
+        { label: 'pBond', pct: 30 },
+        { label: 'aBond', pct: 30 },
+      ]},
+    ],
+    detail: [
+      { who: 'Contract', has: 'bounty + principalBond + agentBond', note: '30s response window for other party' },
+    ],
+  },
+  Disputed: {
+    desc: 'Awaiting oracle ruling. Money locked.',
+    tierNote: true,
+    held: [
+      { holder: 'Contract', color: '#58a6ff', parts: [
+        { label: 'bounty', pct: 40 },
+        { label: 'pBond', pct: 30 },
+        { label: 'aBond', pct: 30 },
+      ]},
+    ],
+    detail: [
+      { who: 'Contract', has: 'bounty + pBond + aBond - priorFees', note: 'if appealed, prior tier fees already paid to oracle' },
+      { who: 'Oracle', has: 'cumulative fees from prior tiers (if any)', note: 'tier 0: oracle has 0. tier 1: oracle has courtFees[0]. tier 2: oracle has [0]+[1].' },
+    ],
+  },
+  Ruled: {
+    desc: 'Oracle ruled. This tier\'s fee paid to oracle. Appeal window open (30s).',
+    tierNote: true,
+    held: [
+      { holder: 'Contract', color: '#58a6ff', parts: [
+        { label: 'bounty', pct: 40 },
+        { label: 'bonds - fees', pct: 45 },
+      ]},
+      { holder: 'Oracle', color: '#f85149', parts: [
+        { label: 'tier fees', pct: 15 },
+      ]},
+    ],
+    detail: [
+      { who: 'Contract', has: 'bounty + pBond + aBond - cumulativeOracleFees', note: 'loser determined, appeal window ticking' },
+      { who: 'Oracle', has: 'cumulativeOracleFees', note: 'already paid, non-refundable' },
+    ],
+  },
+  Halted: {
+    desc: 'Emergency halt. All money locked. Oracle rules directly (no response window).',
+    held: [
+      { holder: 'Contract', color: '#58a6ff', parts: [
+        { label: 'bounty', pct: 40 },
+        { label: 'pBond', pct: 30 },
+        { label: 'aBond', pct: 30 },
+      ]},
+    ],
+    detail: [
+      { who: 'Contract', has: 'bounty + principalBond + agentBond', note: 'principal initiated halt' },
+    ],
+  },
+  Fulfilled: {
+    desc: 'Terminal. Agent won.',
+    terminal: true,
+    scenarios: {
+      'No dispute': {
+        bars: [
+          { holder: 'Agent', color: '#ffa657', parts: [{ label: 'NET + aBond', pct: 55 }] },
+          { holder: 'Principal', color: '#bc8cff', parts: [{ label: 'pBond', pct: 25 }] },
+          { holder: 'Platform', color: '#7ee787', parts: [{ label: 'PF', pct: 10 }] },
+        ],
+        detail: [
+          { who: 'Agent', has: 'NET + agentBond' },
+          { who: 'Principal', has: 'principalBond' },
+          { who: 'Platform', has: 'PF' },
+        ],
+      },
+      'Dispute (agent wins)': {
+        bars: [
+          { holder: 'Agent', color: '#ffa657', parts: [{ label: 'NET + aBond', pct: 45 }] },
+          { holder: 'Principal', color: '#bc8cff', parts: [{ label: 'pBond-CTF', pct: 15 }] },
+          { holder: 'Platform', color: '#7ee787', parts: [{ label: 'PF', pct: 10 }] },
+          { holder: 'Oracle', color: '#f85149', parts: [{ label: 'CTF', pct: 20 }] },
+        ],
+        detail: [
+          { who: 'Agent', has: 'NET + agentBond' },
+          { who: 'Principal', has: 'principalBond - CTF', note: 'lost court fees from bond' },
+          { who: 'Platform', has: 'PF' },
+          { who: 'Oracle', has: 'CTF (cumulative through all tiers)' },
+        ],
+      },
+      'Evil principal': {
+        bars: [
+          { holder: 'Charity', color: '#f0883e', parts: [{ label: 'NET+pBond', pct: 55 }] },
+          { holder: 'Agent', color: '#ffa657', parts: [{ label: 'aBond', pct: 20 }] },
+          { holder: 'Platform', color: '#7ee787', parts: [{ label: 'PF', pct: 10 }] },
+          { holder: 'Oracle', color: '#f85149', parts: [{ label: 'CTF', pct: 15 }] },
+        ],
+        detail: [
+          { who: 'Charity', has: 'NET + principalBond remainder' },
+          { who: 'Agent', has: 'agentBond' },
+          { who: 'Platform', has: 'PF' },
+          { who: 'Oracle', has: 'CTF' },
+        ],
+      },
+    },
+  },
+  Canceled: {
+    desc: 'Terminal. Principal refunded.',
+    terminal: true,
+    scenarios: {
+      'No dispute (verify failed)': {
+        bars: [
+          { holder: 'Principal', color: '#bc8cff', parts: [{ label: 'NET + pBond', pct: 60 }] },
+          { holder: 'Agent', color: '#ffa657', parts: [{ label: 'aBond', pct: 20 }] },
+          { holder: 'Platform', color: '#7ee787', parts: [{ label: 'PF', pct: 10 }] },
+        ],
+        detail: [
+          { who: 'Principal', has: 'NET + principalBond' },
+          { who: 'Agent', has: 'agentBond' },
+          { who: 'Platform', has: 'PF' },
+        ],
+      },
+      'Dispute (principal wins)': {
+        bars: [
+          { holder: 'Principal', color: '#bc8cff', parts: [{ label: 'NET+pBond', pct: 50 }] },
+          { holder: 'Agent', color: '#ffa657', parts: [{ label: 'aBond-CTF', pct: 15 }] },
+          { holder: 'Platform', color: '#7ee787', parts: [{ label: 'PF', pct: 10 }] },
+          { holder: 'Oracle', color: '#f85149', parts: [{ label: 'CTF', pct: 15 }] },
+        ],
+        detail: [
+          { who: 'Principal', has: 'NET + principalBond' },
+          { who: 'Agent', has: 'agentBond - CTF', note: 'loser pays court costs' },
+          { who: 'Platform', has: 'PF' },
+          { who: 'Oracle', has: 'CTF' },
+        ],
+      },
+      'Impossible (filer pays)': {
+        bars: [
+          { holder: 'Principal', color: '#bc8cff', parts: [{ label: 'NET+pBond-CTF', pct: 45 }] },
+          { holder: 'Agent', color: '#ffa657', parts: [{ label: 'aBond', pct: 20 }] },
+          { holder: 'Platform', color: '#7ee787', parts: [{ label: 'PF', pct: 10 }] },
+          { holder: 'Oracle', color: '#f85149', parts: [{ label: 'CTF', pct: 15 }] },
+        ],
+        detail: [
+          { who: 'Principal', has: 'NET + principalBond - CTF', note: 'filer pays court' },
+          { who: 'Agent', has: 'agentBond' },
+          { who: 'Oracle', has: 'CTF' },
+        ],
+      },
+      'Stale (no agent)': {
+        bars: [
+          { holder: 'Principal', color: '#bc8cff', parts: [{ label: 'NET + pBond', pct: 80 }] },
+          { holder: 'Platform', color: '#7ee787', parts: [{ label: 'PF', pct: 10 }] },
+        ],
+        detail: [
+          { who: 'Principal', has: 'NET + principalBond' },
+          { who: 'Platform', has: 'PF', note: 'platform listed it, did its job' },
+        ],
+      },
+      'Abandoned (agent silent)': {
+        bars: [
+          { holder: 'Principal', color: '#bc8cff', parts: [{ label: 'NET+pBond+pen', pct: 55 }] },
+          { holder: 'Agent', color: '#ffa657', parts: [{ label: 'aBond-pen', pct: 20 }] },
+          { holder: 'Platform', color: '#7ee787', parts: [{ label: 'PF', pct: 10 }] },
+        ],
+        detail: [
+          { who: 'Principal', has: 'NET + principalBond + penalty' },
+          { who: 'Agent', has: 'agentBond - penalty', note: 'penalty = min(10% bounty, agentBond)' },
+          { who: 'Platform', has: 'PF' },
+        ],
+      },
+      'Backout in grace': {
+        bars: [
+          { holder: 'Principal', color: '#bc8cff', parts: [{ label: 'bounty + pBond', pct: 65 }] },
+          { holder: 'Agent', color: '#ffa657', parts: [{ label: 'aBond', pct: 25 }] },
+        ],
+        detail: [
+          { who: 'Principal', has: 'bounty + principalBond', note: 'FULL refund, no fees' },
+          { who: 'Agent', has: 'agentBond', note: 'full refund' },
+          { who: 'Platform', has: '0', note: 'grace = free trial' },
+        ],
+      },
+      'Agent backout (post-grace)': {
+        bars: [
+          { holder: 'Principal', color: '#bc8cff', parts: [{ label: 'NET+pBond+pen', pct: 55 }] },
+          { holder: 'Agent', color: '#ffa657', parts: [{ label: 'aBond-pen', pct: 20 }] },
+          { holder: 'Platform', color: '#7ee787', parts: [{ label: 'PF', pct: 10 }] },
+        ],
+        detail: [
+          { who: 'Principal', has: 'NET + principalBond + penalty' },
+          { who: 'Agent', has: 'agentBond - penalty' },
+          { who: 'Platform', has: 'PF' },
+        ],
+      },
+      'Principal backout (post-grace)': {
+        bars: [
+          { holder: 'Principal', color: '#bc8cff', parts: [{ label: 'NET-pen+pBond', pct: 45 }] },
+          { holder: 'Agent', color: '#ffa657', parts: [{ label: 'pen+aBond', pct: 30 }] },
+          { holder: 'Platform', color: '#7ee787', parts: [{ label: 'PF', pct: 10 }] },
+        ],
+        detail: [
+          { who: 'Principal', has: 'NET - penalty + principalBond' },
+          { who: 'Agent', has: 'penalty + agentBond', note: 'agent compensated' },
+          { who: 'Platform', has: 'PF' },
+        ],
+      },
+      'Evil agent': {
+        bars: [
+          { holder: 'Principal', color: '#bc8cff', parts: [{ label: 'pBond', pct: 15 }] },
+          { holder: 'Charity', color: '#f0883e', parts: [{ label: 'NET+aBond-CTF', pct: 50 }] },
+          { holder: 'Platform', color: '#7ee787', parts: [{ label: 'PF', pct: 10 }] },
+          { holder: 'Oracle', color: '#f85149', parts: [{ label: 'CTF', pct: 15 }] },
+        ],
+        detail: [
+          { who: 'Principal', has: 'principalBond' },
+          { who: 'Charity', has: 'agentBond - CTF + NET', note: 'evil agent forfeits everything' },
+          { who: 'Oracle', has: 'CTF' },
+        ],
+      },
+    },
+  },
+  Voided: {
+    desc: 'Terminal. Oracle failed. Funds returned.',
+    terminal: true,
+    scenarios: {
+      'Oracle no-show (tier 0)': {
+        bars: [
+          { holder: 'Principal', color: '#bc8cff', parts: [{ label: 'NET + pBond', pct: 55 }] },
+          { holder: 'Agent', color: '#ffa657', parts: [{ label: 'aBond', pct: 25 }] },
+          { holder: 'Platform', color: '#7ee787', parts: [{ label: 'PF', pct: 10 }] },
+        ],
+        detail: [
+          { who: 'Principal', has: 'NET + principalBond' },
+          { who: 'Agent', has: 'agentBond' },
+          { who: 'Platform', has: 'PF', note: 'platform still gets paid' },
+        ],
+      },
+      'Oracle no-show (tier 1+)': {
+        note: 'Lower tier ruling stands. See Fulfilled or Canceled.',
+        bars: [],
+        detail: [],
+      },
+    },
+  },
+};
+
+// ── State machine data ───────────────────────────────────────────
+const STATES = {
+  Open:          { x: 100,  y: 200, kind: 'active',   desc: 'Waiting for agent to bond' },
+  Investigating: { x: 300,  y: 200, kind: 'active',   desc: 'Agent bonded, inspecting' },
+  InProgress:    { x: 520,  y: 200, kind: 'active',   desc: 'Agent working on fix' },
+  Review:        { x: 520,  y: 70,  kind: 'active',   desc: 'Fix submitted, review window' },
+  AwaitResponse: { x: 760,  y: 320, kind: 'dispute',  desc: 'Dispute filed, response window' },
+  Disputed:      { x: 760,  y: 470, kind: 'dispute',  desc: 'Awaiting oracle ruling' },
+  Ruled:         { x: 520,  y: 470, kind: 'dispute',  desc: 'Ruling posted, appeal window' },
+  Halted:        { x: 760,  y: 140, kind: 'dispute',  desc: 'Emergency halt' },
+  Fulfilled:     { x: 200,  y: 470, kind: 'terminal', desc: 'Agent paid' },
+  Canceled:      { x: 100,  y: 370, kind: 'terminal', desc: 'Principal refunded' },
+  Voided:        { x: 200,  y: 570, kind: 'terminal', desc: 'Oracle no-show' },
+};
+
+const COLORS = { active: '#58a6ff', dispute: '#ffa657', terminal: '#7ee787' };
+
+const EDGES = [
+  { from: 'Open', to: 'Investigating', fn: 'bond()', who: 'agent', cat: 'happy', desc: 'Agent bonds with platform approval. Requires >= minBond.', moneyChange: 'Agent deposits agentBond into contract.' },
+  { from: 'Investigating', to: 'InProgress', fn: 'accept()', who: 'agent', cat: 'happy', desc: 'Agent accepts after investigation.', moneyChange: 'No money moves. All stays in contract.' },
+  { from: 'Investigating', to: 'Open', fn: 'decline()', who: 'agent', cat: 'happy', desc: 'Agent declines. Bond returned.', moneyChange: 'agentBond returned to agent. Contract back to just bounty + pBond.' },
+  { from: 'InProgress', to: 'Review', fn: 'submitFix()', who: 'agent', cat: 'happy', desc: 'Agent submits fix (autonomous mode).', moneyChange: 'No money moves. Review window starts ticking.' },
+  { from: 'InProgress', to: 'Fulfilled', fn: 'verify(true)', who: 'principal', cat: 'happy', desc: 'Principal verifies fix.', moneyChange: 'Agent gets NET + aBond. Principal gets pBond. Platform gets PF.' },
+  { from: 'Review', to: 'Fulfilled', fn: 'autoFulfill()', who: 'anyone', cat: 'happy', desc: 'Review window expired.', moneyChange: 'Same as verify(true). Agent gets NET + aBond.' },
+  { from: 'Review', to: 'Fulfilled', fn: 'verify(true)', who: 'principal', cat: 'happy', desc: 'Principal verifies during review.', moneyChange: 'Same as verify(true).' },
+  { from: 'Review', to: 'InProgress', fn: 'verify(false)', who: 'principal', cat: 'happy', desc: 'Principal rejects during review.', moneyChange: 'No money moves. Back to work.' },
+
+  { from: 'InProgress', to: 'AwaitResponse', fn: 'fileDispute()', who: 'either party', cat: 'dispute', desc: 'File dispute. 30s response window.', moneyChange: 'No money moves yet. Dispute clock starts.' },
+  { from: 'Review', to: 'AwaitResponse', fn: 'fileDispute()', who: 'either party', cat: 'dispute', desc: 'File dispute during review.', moneyChange: 'No money moves. Review paused.' },
+  { from: 'AwaitResponse', to: 'Disputed', fn: 'respondDispute()', who: 'other party', cat: 'dispute', desc: 'Other party responds within 30s.', moneyChange: 'No money moves. Both arguments submitted.' },
+  { from: 'AwaitResponse', to: 'Disputed', fn: 'escalateDispute()', who: 'anyone', cat: 'dispute', desc: 'Response window expired.', moneyChange: 'No money moves. Escalated in absentia.' },
+  { from: 'Disputed', to: 'Ruled', fn: 'rule() [tier 0-1]', who: 'oracle', cat: 'dispute', desc: 'Oracle rules. Appeal window opens.', moneyChange: 'courtFees[tier] paid from contract to oracle immediately. Loser determined.' },
+  { from: 'Disputed', to: 'Fulfilled', fn: 'rule(Fulfilled) [supreme]', who: 'oracle', cat: 'dispute', desc: 'Supreme: agent wins. Final.', moneyChange: 'courtFees[2] to oracle. Then full settlement: agent gets NET + aBond.' },
+  { from: 'Disputed', to: 'Canceled', fn: 'rule(Canceled) [supreme]', who: 'oracle', cat: 'dispute', desc: 'Supreme: principal wins. Final.', moneyChange: 'courtFees[2] to oracle. Principal gets NET + pBond. Agent gets aBond - CTF.' },
+  { from: 'Ruled', to: 'AwaitResponse', fn: 'appeal()', who: 'loser', cat: 'dispute', desc: 'Loser appeals to next tier.', moneyChange: 'No money moves. New dispute cycle at tier+1. Oracle keeps what it already got.' },
+  { from: 'Ruled', to: 'Fulfilled', fn: 'finalizeRuling()', who: 'anyone', cat: 'dispute', desc: 'Appeal window expired. Fulfilled.', moneyChange: 'Full settlement based on last ruling. Oracle already has CTF.' },
+  { from: 'Ruled', to: 'Canceled', fn: 'finalizeRuling()', who: 'anyone', cat: 'dispute', desc: 'Appeal window expired. Canceled.', moneyChange: 'Full settlement. Loser\'s bond absorbed CTF.' },
+  { from: 'Disputed', to: 'Voided', fn: 'voidDispute() [tier 0]', who: 'anyone', cat: 'dispute', desc: 'Oracle timed out. No prior ruling.', moneyChange: 'Everyone gets refunded minus platform fee. No oracle payment.' },
+  { from: 'Disputed', to: 'Fulfilled', fn: 'voidDispute() [tier 1+]', who: 'anyone', cat: 'dispute', desc: 'Oracle timed out. Lower ruling stands.', moneyChange: 'Settles per lower tier ruling. Oracle keeps prior tier fees.' },
+  { from: 'Disputed', to: 'Canceled', fn: 'voidDispute() [tier 1+]', who: 'anyone', cat: 'dispute', desc: 'Oracle timed out. Lower ruling stands.', moneyChange: 'Settles per lower tier ruling. Oracle keeps prior tier fees.' },
+  { from: 'Disputed', to: 'Voided', fn: 'refuseDispute() [tier 0]', who: 'oracle', cat: 'dispute', desc: 'Oracle refuses. Void.', moneyChange: 'Same as voidDispute. Immediate, no waiting.' },
+  { from: 'Disputed', to: 'Fulfilled', fn: 'refuseDispute() [tier 1+]', who: 'oracle', cat: 'dispute', desc: 'Oracle refuses. Lower ruling stands.', moneyChange: 'Same as void tier 1+ fallback.' },
+  { from: 'Disputed', to: 'Canceled', fn: 'refuseDispute() [tier 1+]', who: 'oracle', cat: 'dispute', desc: 'Oracle refuses. Lower ruling stands.', moneyChange: 'Same as void tier 1+ fallback.' },
+
+  { from: 'InProgress', to: 'Halted', fn: 'halt()', who: 'principal', cat: 'dispute', desc: 'Emergency halt. Direct to oracle.', moneyChange: 'No money moves. Skips response window.' },
+  { from: 'Review', to: 'Halted', fn: 'halt()', who: 'principal', cat: 'dispute', desc: 'Halt during review.', moneyChange: 'No money moves.' },
+  { from: 'Halted', to: 'Ruled', fn: 'rule() [tier 0-1]', who: 'oracle', cat: 'dispute', desc: 'Oracle rules on halt.', moneyChange: 'Tier fee paid to oracle. Appeal window opens.' },
+  { from: 'Halted', to: 'Fulfilled', fn: 'rule(Fulfilled) [supreme]', who: 'oracle', cat: 'dispute', desc: 'Supreme rules on halt. Final.', moneyChange: 'Full settlement.' },
+  { from: 'Halted', to: 'Canceled', fn: 'rule(Canceled) [supreme]', who: 'oracle', cat: 'dispute', desc: 'Supreme rules on halt. Final.', moneyChange: 'Full settlement.' },
+  { from: 'Halted', to: 'Voided', fn: 'voidDispute()', who: 'anyone', cat: 'dispute', desc: 'Oracle timed out on halt.', moneyChange: 'Void settlement.' },
+  { from: 'Halted', to: 'Voided', fn: 'refuseDispute()', who: 'oracle', cat: 'dispute', desc: 'Oracle refuses halt.', moneyChange: 'Void settlement.' },
+
+  { from: 'InProgress', to: 'Canceled', fn: 'backOut() [grace]', who: 'either party', cat: 'backout', desc: 'Back out in grace period.', moneyChange: 'Everything returned. No fees at all. Grace = free trial.' },
+  { from: 'InProgress', to: 'Canceled', fn: 'backOut() [post-grace]', who: 'either party', cat: 'backout', desc: 'Back out after grace.', moneyChange: 'Backer pays 10% penalty. Platform gets PF. Innocents compensated.' },
+  { from: 'Review', to: 'Canceled', fn: 'backOut() [grace]', who: 'either party', cat: 'backout', desc: 'Back out of review in grace.', moneyChange: 'Everything returned. No fees.' },
+  { from: 'Review', to: 'Canceled', fn: 'backOut() [post-grace]', who: 'either party', cat: 'backout', desc: 'Back out of review post-grace.', moneyChange: 'Penalty applies.' },
+
+  { from: 'Open', to: 'Canceled', fn: 'cancelStale()', who: 'anyone', cat: 'timeout', desc: 'No agent in 30s.', moneyChange: 'Principal gets NET + pBond. Platform gets PF. No agent involved.' },
+  { from: 'InProgress', to: 'Canceled', fn: 'cancelAbandoned()', who: 'anyone', cat: 'timeout', desc: 'Agent silent 120s.', moneyChange: 'Same as agent backout post-grace. Agent penalized from bond.' },
+  { from: 'Investigating', to: 'Canceled', fn: 'cancelAbandoned()', who: 'anyone', cat: 'timeout', desc: 'Agent silent in investigation.', moneyChange: 'Same as agent backout post-grace.' },
+];
+
+const EDGE_COLORS = { happy: '#7ee787', dispute: '#ffa657', timeout: '#f85149', backout: '#bc8cff' };
+
+// ── Canvas ───────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const tooltip = document.getElementById('tooltip');
+let W, H, dpr;
+let currentView = 'all';
+let selectedState = null, selectedEdge = null;
+let hoveredState = null, hoveredEdge = null;
+let panX = 0, panY = 0, zoom = 1;
+let dragging = false, dragStartX, dragStartY, dragPanX, dragPanY;
+
+function resize() {
+  const wrap = document.getElementById('canvas-wrap');
+  dpr = window.devicePixelRatio || 1;
+  W = wrap.clientWidth; H = wrap.clientHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+
+function screenToWorld(sx, sy) { return [(sx - panX) / zoom, (sy - panY) / zoom]; }
+
+function visibleEdges() {
+  if (currentView === 'all') return EDGES;
+  return EDGES.filter(e => e.cat === currentView);
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(panX, panY);
+  ctx.scale(zoom, zoom);
+
+  const edges = visibleEdges();
+  const edgeGroups = {};
+  edges.forEach((e, i) => {
+    const key = e.from < e.to ? e.from + '|' + e.to : e.to + '|' + e.from;
+    if (!edgeGroups[key]) edgeGroups[key] = [];
+    edgeGroups[key].push({ edge: e, idx: i });
+  });
+
+  // Draw edges
+  edges.forEach((e, i) => {
+    const s = STATES[e.from], t = STATES[e.to];
+    const col = EDGE_COLORS[e.cat] || '#484f58';
+    const isSelected = selectedEdge === i;
+    const isHovered = hoveredEdge === i;
+    const key = e.from < e.to ? e.from + '|' + e.to : e.to + '|' + e.from;
+    const group = edgeGroups[key];
+    const groupIdx = group.findIndex(g => g.idx === i);
+    const offset = (groupIdx - (group.length - 1) / 2) * 12;
+
+    ctx.save();
+    ctx.globalAlpha = (selectedEdge !== null && !isSelected && !isHovered) ? 0.12 :
+                      (selectedState !== null && e.from !== selectedState && e.to !== selectedState) ? 0.12 : 1;
+
+    if (e.from === e.to) {
+      ctx.beginPath(); ctx.arc(s.x, s.y - 40, 25, 0.3, Math.PI - 0.3);
+      ctx.strokeStyle = col; ctx.lineWidth = isSelected || isHovered ? 2.5 : 1.5; ctx.stroke();
+    } else {
+      const dx = t.x - s.x, dy = t.y - s.y;
+      const len = Math.sqrt(dx * dx + dy * dy);
+      const nx = -dy / len * offset, ny = dx / len * offset;
+      const r = 28;
+      const angle = Math.atan2(t.y + ny - s.y - ny, t.x + nx - s.x - nx);
+      const x1 = s.x + nx + Math.cos(angle) * r, y1 = s.y + ny + Math.sin(angle) * r;
+      const x2 = t.x + nx - Math.cos(angle) * r, y2 = t.y + ny - Math.sin(angle) * r;
+
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+      ctx.strokeStyle = col; ctx.lineWidth = isSelected || isHovered ? 2.5 : 1.5;
+      if (e.cat === 'timeout') ctx.setLineDash([4, 4]);
+      ctx.stroke(); ctx.setLineDash([]);
+
+      const aLen = 8;
+      ctx.beginPath(); ctx.moveTo(x2, y2);
+      ctx.lineTo(x2 - aLen * Math.cos(angle - 0.4), y2 - aLen * Math.sin(angle - 0.4));
+      ctx.lineTo(x2 - aLen * Math.cos(angle + 0.4), y2 - aLen * Math.sin(angle + 0.4));
+      ctx.closePath(); ctx.fillStyle = col; ctx.fill();
+    }
+    ctx.restore();
+  });
+
+  // Draw states with money indicators
+  for (const [name, st] of Object.entries(STATES)) {
+    const isSelected = selectedState === name;
+    const isHovered = hoveredState === name;
+    const col = COLORS[st.kind];
+    const dimmed = (selectedState !== null && !isSelected && !isAdjacent(name)) ||
+                   (selectedEdge !== null && EDGES[selectedEdge]?.from !== name && EDGES[selectedEdge]?.to !== name);
+
+    ctx.save();
+    ctx.globalAlpha = dimmed ? 0.2 : 1;
+
+    // Node circle
+    ctx.beginPath(); ctx.arc(st.x, st.y, 26, 0, Math.PI * 2);
+    ctx.fillStyle = isSelected ? col : (isHovered ? '#1c2128' : '#0d1117');
+    ctx.fill(); ctx.strokeStyle = col;
+    ctx.lineWidth = isSelected || isHovered ? 3 : 1.5; ctx.stroke();
+
+    if (st.kind === 'terminal') {
+      ctx.beginPath(); ctx.arc(st.x, st.y, 22, 0, Math.PI * 2); ctx.stroke();
+    }
+
+    // Label
+    ctx.fillStyle = dimmed ? '#484f58' : '#c9d1d9';
+    ctx.font = 'bold 9px -apple-system, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const label = name.length > 11 ? name.slice(0, 10) + '..' : name;
+    ctx.fillText(label, st.x, st.y - 4);
+
+    // Mini money bar under label
+    const sm = STATE_MONEY[name];
+    if (sm && !sm.terminal) {
+      const barW = 36, barH = 5, barX = st.x - barW / 2, barY = st.y + 8;
+      const held = sm.held;
+      let x = barX;
+      held.forEach(h => {
+        h.parts.forEach(p => {
+          const w = barW * p.pct / 100;
+          ctx.fillStyle = h.color;
+          ctx.globalAlpha = dimmed ? 0.15 : 0.7;
+          ctx.fillRect(x, barY, w - 0.5, barH);
+          x += w;
+        });
+      });
+      ctx.globalAlpha = dimmed ? 0.2 : 1;
+    } else if (sm && sm.terminal) {
+      // Show small "distributed" indicator
+      ctx.font = '7px -apple-system, sans-serif';
+      ctx.fillStyle = dimmed ? '#484f58' : '#484f58';
+      ctx.fillText('distributed', st.x, st.y + 10);
+    }
+
+    ctx.restore();
+  }
+
+  ctx.restore();
+}
+
+function isAdjacent(name) {
+  return visibleEdges().some(e =>
+    (e.from === selectedState && e.to === name) ||
+    (e.to === selectedState && e.from === name)
+  );
+}
+
+// ── Hit testing ──────────────────────────────────────────────────
+function hitState(mx, my) {
+  const [wx, wy] = screenToWorld(mx, my);
+  for (const [name, st] of Object.entries(STATES)) {
+    const dx = wx - st.x, dy = wy - st.y;
+    if (dx * dx + dy * dy < 30 * 30) return name;
+  }
+  return null;
+}
+
+function hitEdge(mx, my) {
+  const [wx, wy] = screenToWorld(mx, my);
+  const edges = visibleEdges();
+  let best = null, bestDist = 14;
+  const edgeGroups = {};
+  edges.forEach((e, i) => {
+    const key = e.from < e.to ? e.from + '|' + e.to : e.to + '|' + e.from;
+    if (!edgeGroups[key]) edgeGroups[key] = [];
+    edgeGroups[key].push({ edge: e, idx: i });
+  });
+  edges.forEach((e, i) => {
+    if (e.from === e.to) return;
+    const s = STATES[e.from], t = STATES[e.to];
+    const key = e.from < e.to ? e.from + '|' + e.to : e.to + '|' + e.from;
+    const group = edgeGroups[key];
+    const groupIdx = group.findIndex(g => g.idx === i);
+    const offset = (groupIdx - (group.length - 1) / 2) * 12;
+    const dx = t.x - s.x, dy = t.y - s.y, len = Math.sqrt(dx*dx+dy*dy);
+    const nx = -dy/len*offset, ny = dx/len*offset;
+    const sx = s.x+nx, sy = s.y+ny, tx = t.x+nx, ty = t.y+ny;
+    const lx = tx-sx, ly = ty-sy, l2 = lx*lx+ly*ly;
+    let t2 = ((wx-sx)*lx+(wy-sy)*ly)/l2;
+    t2 = Math.max(0, Math.min(1, t2));
+    const px = sx+t2*lx, py = sy+t2*ly;
+    const d = Math.sqrt((wx-px)*(wx-px)+(wy-py)*(wy-py));
+    if (d < bestDist) { bestDist = d; best = EDGES.indexOf(e); }
+  });
+  return best;
+}
+
+// ── Sidebar rendering ────────────────────────────────────────────
+function renderMoneyBars(bars, detail, container) {
+  if (!bars || !bars.length) return '';
+  let html = '<div class="money-loc">';
+  bars.forEach(b => {
+    html += `<div class="money-bar-row">
+      <div class="money-bar-label" style="color:${b.color}">${b.holder}</div>
+      <div class="money-bar-track">`;
+    b.parts.forEach(p => {
+      html += `<div class="money-bar-seg" style="width:${p.pct}%;background:${b.color}">
+        <span>${p.label}</span>
+      </div>`;
+    });
+    html += '</div></div>';
+  });
+  html += '</div>';
+
+  if (detail && detail.length) {
+    detail.forEach(d => {
+      html += `<div class="money-row">
+        <span class="label">${d.who}</span>
+        <span class="val">${d.has}</span>
+      </div>`;
+      if (d.note) html += `<div style="font-size:10px;color:#484f58;padding-left:4px;margin-bottom:2px">${d.note}</div>`;
+    });
+  }
+  return html;
+}
+
+function showStateInfo(name) {
+  const st = STATES[name];
+  const sm = STATE_MONEY[name];
+  const panel = document.getElementById('info-panel');
+  const outEdges = visibleEdges().filter(e => e.from === name);
+  const inEdges = visibleEdges().filter(e => e.to === name);
+
+  let html = `<h2>${name}</h2><p>${st.desc}</p>`;
+
+  // Money location
+  if (sm) {
+    html += '<h3>Money Location</h3>';
+    if (sm.desc) html += `<p style="margin-bottom:6px">${sm.desc}</p>`;
+
+    if (sm.terminal && sm.scenarios) {
+      // Terminal: show each scenario with its own bar
+      let first = true;
+      for (const [scenario, data] of Object.entries(sm.scenarios)) {
+        html += `<div style="margin:${first?4:14}px 0 4px">
+          <strong style="color:#d2a8ff;font-size:11px">${scenario}</strong>
+        </div>`;
+        first = false;
+        if (data.note) {
+          html += `<p style="font-style:italic;color:#484f58">${data.note}</p>`;
+        } else {
+          html += renderMoneyBars(data.bars, data.detail);
+        }
+      }
+      html += `<div style="margin-top:10px;padding:8px;background:#161b22;border-radius:4px;font-size:10px;color:#484f58">
+        <strong style="color:#8b949e">Key:</strong><br>
+        PF = bounty * platformFeeBps / 10000<br>
+        NET = bounty - PF<br>
+        CTF = cumulative oracle fees through tier<br>
+        penalty = min(10% of bounty, source)<br>
+        principalBond = sum(courtFees[3])
+      </div>`;
+    } else if (sm.held) {
+      html += renderMoneyBars(sm.held, sm.detail);
+      if (sm.tierNote) {
+        html += `<div style="margin-top:6px;padding:6px 8px;background:#21262d;border-radius:4px;font-size:10px;color:#ffa657">
+          At tier 1+, oracle already holds fees from prior tiers.<br>
+          Contract balance = original deposits - cumulativeOracleFees.
+        </div>`;
+      }
+    }
+  }
+
+  // Transitions
+  if (outEdges.length) {
+    html += '<h3>Outgoing</h3>';
+    outEdges.forEach(e => {
+      const ei = EDGES.indexOf(e);
+      html += `<div class="transition-item" onmouseenter="highlightEdge(${ei})" onmouseleave="unhighlightEdge()">
+        <span class="fn">${e.fn}</span> <span class="who">(${e.who})</span><br>
+        <span class="target">&rarr; ${e.to}</span>
+      </div>`;
+    });
+  }
+  if (inEdges.length) {
+    html += '<h3>Incoming</h3>';
+    inEdges.forEach(e => {
+      const ei = EDGES.indexOf(e);
+      html += `<div class="transition-item" onmouseenter="highlightEdge(${ei})" onmouseleave="unhighlightEdge()">
+        <span class="target">${e.from} &rarr;</span>
+        <span class="fn">${e.fn}</span> <span class="who">(${e.who})</span>
+      </div>`;
+    });
+  }
+
+  panel.innerHTML = html;
+}
+
+function showEdgeInfo(idx) {
+  const e = EDGES[idx];
+  const panel = document.getElementById('info-panel');
+
+  // Get money state before and after
+  const smBefore = STATE_MONEY[e.from];
+  const smAfter = STATE_MONEY[e.to];
+
+  let html = `<h2>${e.fn}</h2>
+    <p><strong style="color:${COLORS[STATES[e.from].kind]}">${e.from}</strong>
+       &rarr; <strong style="color:${COLORS[STATES[e.to].kind]}">${e.to}</strong></p>
+    <p style="margin-top:4px"><span style="color:${EDGE_COLORS[e.cat]}">${e.cat}</span> &middot; called by: ${e.who}</p>
+    <h3>What happens</h3><p>${e.desc}</p>
+    <h3>Money movement</h3>
+    <div style="padding:8px 10px;background:#161b22;border-radius:4px;border-left:3px solid ${EDGE_COLORS[e.cat]};margin:4px 0">
+      <p style="color:#c9d1d9;font-size:12px">${e.moneyChange}</p>
+    </div>`;
+
+  // Before state money
+  if (smBefore && !smBefore.terminal && smBefore.held) {
+    html += `<h3>Before (${e.from})</h3>`;
+    html += renderMoneyBars(smBefore.held, smBefore.detail);
+  }
+
+  // After state money
+  if (smAfter && !smAfter.terminal && smAfter.held) {
+    html += `<h3>After (${e.to})</h3>`;
+    html += renderMoneyBars(smAfter.held, smAfter.detail);
+  } else if (smAfter && smAfter.terminal) {
+    html += `<h3>After (${e.to})</h3>`;
+    html += `<p style="color:#7ee787">Terminal state. Money distributed to parties. Click ${e.to} node for all scenarios.</p>`;
+  }
+
+  panel.innerHTML = html;
+}
+
+function highlightEdge(idx) { hoveredEdge = idx; draw(); }
+function unhighlightEdge() { hoveredEdge = null; draw(); }
+
+function setView(v) {
+  currentView = v;
+  document.querySelectorAll('.ctrl-btn').forEach(b => b.classList.remove('active'));
+  event.target.classList.add('active');
+  selectedState = null; selectedEdge = null;
+  document.getElementById('info-panel').innerHTML = '<p style="color:#484f58">Click a state or transition to inspect it.</p>';
+  draw();
+}
+
+function buildLegend() {
+  const items = [
+    { color: COLORS.active, label: 'Active' },
+    { color: COLORS.dispute, label: 'Dispute' },
+    { color: COLORS.terminal, label: 'Terminal' },
+    { color: EDGE_COLORS.happy, label: 'Happy path' },
+    { color: EDGE_COLORS.dispute, label: 'Dispute flow' },
+    { color: EDGE_COLORS.timeout, label: 'Timeout' },
+    { color: EDGE_COLORS.backout, label: 'Backout' },
+  ];
+  document.getElementById('legend').innerHTML = items.map(i =>
+    `<div class="legend-item"><div class="legend-dot" style="background:${i.color}"></div>${i.label}</div>`
+  ).join('');
+}
+
+// ── Events ───────────────────────────────────────────────────────
+canvas.addEventListener('mousedown', e => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const state = hitState(mx, my);
+  const edge = state ? null : hitEdge(mx, my);
+  if (state) { selectedState = state; selectedEdge = null; showStateInfo(state); draw(); return; }
+  if (edge !== null) { selectedEdge = edge; selectedState = null; showEdgeInfo(edge); draw(); return; }
+  dragging = true; dragStartX = e.clientX; dragStartY = e.clientY; dragPanX = panX; dragPanY = panY;
+});
+
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  if (dragging) { panX = dragPanX + (e.clientX - dragStartX); panY = dragPanY + (e.clientY - dragStartY); draw(); return; }
+  const state = hitState(mx, my);
+  const edge = state ? null : hitEdge(mx, my);
+  if (state !== hoveredState || edge !== hoveredEdge) {
+    hoveredState = state; hoveredEdge = edge;
+    canvas.style.cursor = (state || edge !== null) ? 'pointer' : 'grab';
+    draw();
+  }
+  if (state) {
+    const sm = STATE_MONEY[state];
+    let moneyLine = '';
+    if (sm && !sm.terminal && sm.detail) {
+      moneyLine = '<br><span style="color:#58a6ff;font-size:10px">' +
+        sm.detail.map(d => d.who + ': ' + d.has).join(' | ') + '</span>';
+    } else if (sm && sm.terminal) {
+      moneyLine = '<br><span style="color:#7ee787;font-size:10px">Click to see money flows</span>';
+    }
+    tooltip.style.display = 'block';
+    tooltip.style.left = (mx + 16) + 'px'; tooltip.style.top = (my - 10) + 'px';
+    tooltip.innerHTML = `<strong>${state}</strong><br><span style="color:#8b949e">${STATES[state].desc}</span>${moneyLine}`;
+  } else if (edge !== null) {
+    const ed = EDGES[edge];
+    tooltip.style.display = 'block';
+    tooltip.style.left = (mx + 16) + 'px'; tooltip.style.top = (my - 10) + 'px';
+    tooltip.innerHTML = `<strong style="color:${EDGE_COLORS[ed.cat]}">${ed.fn}</strong><br>${ed.from} &rarr; ${ed.to}<br><span style="color:#8b949e;font-size:10px">${ed.moneyChange}</span>`;
+  } else {
+    tooltip.style.display = 'none';
+  }
+});
+
+canvas.addEventListener('mouseup', () => { dragging = false; });
+canvas.addEventListener('mouseleave', () => {
+  dragging = false; tooltip.style.display = 'none';
+  hoveredState = null; hoveredEdge = null; draw();
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const [wx, wy] = screenToWorld(mx, my);
+  const factor = e.deltaY < 0 ? 1.1 : 0.9;
+  zoom = Math.max(0.3, Math.min(3, zoom * factor));
+  panX = mx - wx * zoom; panY = my - wy * zoom;
+  draw();
+}, { passive: false });
+
+function centerGraph() {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const st of Object.values(STATES)) {
+    minX = Math.min(minX, st.x); maxX = Math.max(maxX, st.x);
+    minY = Math.min(minY, st.y); maxY = Math.max(maxY, st.y);
+  }
+  const gw = maxX - minX + 120, gh = maxY - minY + 120;
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  zoom = Math.min(W / gw, H / gh, 1.5);
+  panX = W / 2 - cx * zoom; panY = H / 2 - cy * zoom;
+}
+
+buildLegend();
+window.addEventListener('resize', resize);
+resize(); centerGraph(); draw();
+</script>
+</body>
+</html>
