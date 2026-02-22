@@ -10,7 +10,7 @@ import re
 import shutil
 import subprocess
 
-from protocol import DEFAULT_MAX_ATTEMPTS
+from protocol import DEFAULT_MAX_ATTEMPTS, MINIMUM_BOUNTY, DISPUTE_BOND
 
 from scrubber import scrub
 
@@ -255,11 +255,25 @@ def validate_contract(contract):
         else:
             b = escrow.get("bounty", "")
             try:
-                float(b)
-            except (ValueError, TypeError):
+                from decimal import Decimal
+                bounty_val = Decimal(str(b))
+                if bounty_val < Decimal(MINIMUM_BOUNTY):
+                    errors.append(f"escrow.bounty below minimum ({MINIMUM_BOUNTY} XNO)")
+            except (ValueError, TypeError, ArithmeticError):
                 errors.append(f"escrow.bounty must be a numeric string, got '{b}'")
             if not escrow.get("currency"):
                 errors.append("escrow.currency is required when escrow is present")
+
+    # Judge fee (if present) — check both top-level and terms.judge
+    judge_info = contract.get("judge", {}) or contract.get("terms", {}).get("judge", {})
+    if judge_info and judge_info.get("fee") is not None:
+        try:
+            from decimal import Decimal
+            jfee = Decimal(str(judge_info["fee"]))
+            if jfee < Decimal(DISPUTE_BOND):
+                errors.append(f"judge fee {jfee} below minimum required ({DISPUTE_BOND} XNO)")
+        except (ValueError, TypeError):
+            errors.append("invalid judge fee value")
 
     return (len(errors) == 0, errors)
 

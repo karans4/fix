@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import asyncio
 import json as json_mod
+import queue as _queue_mod
+import threading
 from decimal import Decimal
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
@@ -40,6 +42,7 @@ from crypto import (
     build_chain_entry, chain_entry_hash, verify_chain, canonical_json,
     sha256_hash, fix_id_to_pubkey, ReplayGuard,
 )
+from contract import validate_contract
 from protocol import (
     DEFAULT_REVIEW_WINDOW, DEFAULT_INVESTIGATION_RATE, DEFAULT_RULING_TIMEOUT,
     MODE_SUPERVISED, MODE_AUTONOMOUS, COURT_TIERS, MAX_DISPUTE_LEVEL,
@@ -126,6 +129,14 @@ class RulingResponse(BaseModel):
     reasoning: str
     flags: list[str] = []
 
+class DeclineRequest(BaseModel):
+    agent_pubkey: str
+    reason: str = ""
+    chain_entry: Optional[dict] = None
+
+class VoidRequest(BaseModel):
+    pubkey: str  # must be a party to the contract
+
 
 PLATFORM_URL = "https://fix.notruefireman.org"
 
@@ -133,28 +144,14 @@ PLATFORM_URL = "https://fix.notruefireman.org"
 def _validate_contract(contract: dict):
     """Validate contract fields. Raises HTTPException(400) on bad values.
 
-    Inclusive bond model: bounty >= judge_fee + MIN_BOUNTY_EXCESS (0.19 XNO).
+    Delegates structural + protocol validation to contract.validate_contract(),
+    then applies server-policy range checks on top.
     """
-    escrow = contract.get("escrow", {})
-    if escrow.get("bounty") is not None:
-        try:
-            bounty = Decimal(str(escrow["bounty"]))
-        except Exception:
-            raise HTTPException(400, "Invalid bounty value")
-        if bounty < Decimal(MINIMUM_BOUNTY):
-            raise HTTPException(400, f"Bounty below minimum ({MINIMUM_BOUNTY} XNO = judge_fee + {MIN_BOUNTY_EXCESS})")
+    valid, errors = validate_contract(contract)
+    if not valid:
+        raise HTTPException(400, "; ".join(errors))
 
-    # Validate judge fee covers court costs
-    judge_info = contract.get("judge", {})
-    if judge_info and judge_info.get("fee") is not None:
-        try:
-            jfee = Decimal(str(judge_info["fee"]))
-            min_required = Decimal(DISPUTE_BOND)
-            if jfee < min_required:
-                raise HTTPException(400, f"Judge fee {jfee} below minimum required ({DISPUTE_BOND} XNO = sum of all court tier fees)")
-        except (ValueError, TypeError):
-            raise HTTPException(400, "Invalid judge fee value")
-
+    # Server-policy range checks
     execution = contract.get("execution", {})
     if "max_attempts" in execution:
         ma = execution["max_attempts"]
@@ -502,43 +499,59 @@ EXHIBIT A: PLATFORM API
     return briefing
 
 
-# --- App factory ---
+# --- FixServer class ---
 
-def create_app(
-    store: ContractStore | None = None,
-    escrow_mgr: EscrowManager | None = None,
-    judge: AIJudge | None = None,
-    court: TieredCourt | None = None,
-    server_privkey: bytes | None = None,
-) -> FastAPI:
-    """Create FastAPI app with injected dependencies.
+class FixServer:
+    """Fix platform server. Wraps all state and endpoints."""
 
-    If server_privkey is not provided, checks FIX_SERVER_KEY env var
-    (path to key file) or auto-generates one.
-    """
+    MAX_BODY_BYTES = 512 * 1024       # 512 KB max request body
+    MAX_FIELD_LEN = 50_000            # 50 KB max for any single text field
+    MAX_CONTRACT_JSON_LEN = 100_000   # 100 KB max contract JSON
+    MAX_SSE_SUBSCRIBERS = 1000
 
-    app = FastAPI(title="Fix Platform", version="3.0")
+    def __init__(self, store=None, escrow_mgr=None, judge=None, court=None, server_privkey=None):
+        self.store = store or ContractStore()
+        self.escrow = escrow_mgr or EscrowManager()
+        self.judge = judge
+        self.court = court
 
-    # --- Input size limits (DoS prevention) ---
-    MAX_BODY_BYTES = 512 * 1024  # 512 KB max request body
-    MAX_FIELD_LEN = 50_000       # 50 KB max for any single text field
-    MAX_CONTRACT_JSON_LEN = 100_000  # 100 KB max contract JSON
+        # Server identity -- persistent key required for chain verification across restarts
+        if server_privkey:
+            self.server_privkey = server_privkey
+        else:
+            key_path = os.environ.get("FIX_SERVER_KEY", "")
+            if key_path and os.path.exists(key_path):
+                self.server_privkey = load_ed25519_key(key_path)
+            else:
+                self.server_privkey, _ = generate_ed25519_keypair()
+                default_key_path = os.path.expanduser("~/.fix/server.key")
+                try:
+                    os.makedirs(os.path.dirname(default_key_path), exist_ok=True)
+                    save_ed25519_key(default_key_path, self.server_privkey)
+                except OSError:
+                    pass
 
-    @app.middleware("http")
-    async def limit_body_size(request: Request, call_next):
-        """Reject oversized request bodies before parsing."""
-        content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_BODY_BYTES:
-            return __import__('starlette.responses', fromlist=['JSONResponse']).JSONResponse(
-                status_code=413, content={"detail": f"Request body too large (max {MAX_BODY_BYTES} bytes)"})
-        return await call_next(request)
+        self.server_pubkey = ed25519_privkey_to_pubkey(self.server_privkey)
+        self.server_fix_id = pubkey_to_fix_id(self.server_pubkey)
 
-    def _check_field_len(value: str, name: str, max_len: int = MAX_FIELD_LEN):
+        # Replay protection
+        replay_db = os.environ.get("FIX_REPLAY_DB", "")
+        self.replay_guard = ReplayGuard(db_path=replay_db)
+
+        # SSE event bus
+        self.sse_subscribers: list[_queue_mod.Queue] = []
+        self.sse_lock = threading.Lock()
+
+    # --- Internal helpers ---
+
+    def _check_field_len(self, value: str, name: str, max_len: int = None):
         """Raise 400 if a text field is too long."""
+        if max_len is None:
+            max_len = self.MAX_FIELD_LEN
         if len(value) > max_len:
             raise HTTPException(400, f"{name} too long ({len(value)} > {max_len})")
 
-    def _safe_decimal(value: str, name: str) -> Decimal:
+    def _safe_decimal(self, value: str, name: str) -> Decimal:
         """Parse a Decimal from untrusted input, rejecting NaN/Inf/garbage."""
         try:
             d = Decimal(str(value))
@@ -552,79 +565,22 @@ def create_app(
                 raise
             raise HTTPException(400, f"Invalid {name}: {value}")
 
-    # Static file serving
-    static_dir = os.path.join(os.path.dirname(__file__), "static")
-    if os.path.isdir(static_dir):
-        app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
-    @app.get("/")
-    async def index():
-        return FileResponse(os.path.join(static_dir, "index.html"))
-
-    # Server identity -- persistent key required for chain verification across restarts
-    if server_privkey:
-        _server_privkey = server_privkey
-    else:
-        key_path = os.environ.get("FIX_SERVER_KEY", "")
-        if key_path and os.path.exists(key_path):
-            _server_privkey = load_ed25519_key(key_path)
-        else:
-            # Auto-generate and persist so chain entries remain verifiable
-            _server_privkey, _ = generate_ed25519_keypair()
-            default_key_path = os.path.expanduser("~/.fix/server.key")
-            try:
-                os.makedirs(os.path.dirname(default_key_path), exist_ok=True)
-                save_ed25519_key(default_key_path, _server_privkey)
-            except OSError:
-                pass  # best effort -- test environments may not have writable home
-
-    _server_pubkey = ed25519_privkey_to_pubkey(_server_privkey)
-    _server_fix_id = pubkey_to_fix_id(_server_pubkey)
-
-    # Replay protection -- SQLite-backed for persistence across restarts
-    _replay_db = os.environ.get("FIX_REPLAY_DB", "")
-    _replay_guard = ReplayGuard(db_path=_replay_db)
-
-    # Defaults
-    _store = store or ContractStore()
-    _escrow = escrow_mgr or EscrowManager()
-    _judge = judge  # Legacy single-judge (still works for basic disputes)
-    _court = court  # Tiered court system (preferred)
-
-    # --- SSE event bus for agent subscriptions ---
-    # Use threading.Queue for cross-thread safety (TestClient uses threads)
-    import queue as _queue_mod
-    MAX_SSE_SUBSCRIBERS = 1000
-    _sse_subscribers: list[_queue_mod.Queue] = []
-    _sse_lock = __import__('threading').Lock()
-
-    def _sse_publish(event_type: str, data: dict):
+    def _sse_publish(self, event_type: str, data: dict):
         """Push an event to all connected SSE subscribers."""
         payload = {"event": event_type, **data}
-        with _sse_lock:
+        with self.sse_lock:
             dead = []
-            for q in _sse_subscribers:
+            for q in self.sse_subscribers:
                 try:
                     q.put_nowait(payload)
                 except _queue_mod.Full:
                     dead.append(q)
             for q in dead:
-                _sse_subscribers.remove(q)
+                self.sse_subscribers.remove(q)
 
-    # Expose for testing
-    app.state.replay_guard = _replay_guard
-    app.state.store = _store
-    app.state.escrow = _escrow
-    app.state.judge = _judge
-    app.state.court = _court
-    app.state.server_privkey = _server_privkey
-    app.state.server_pubkey = _server_pubkey
-    app.state.server_fix_id = _server_fix_id
-    app.state.sse_publish = _sse_publish
+    # --- Chain operations ---
 
-    # --- Helpers ---
-
-    def _server_sign_and_append(contract_id: str, entry_type: str, data: dict,
+    def _server_sign_and_append(self, contract_id: str, entry_type: str, data: dict,
                                 max_retries: int = 3) -> dict:
         """Build a server-signed chain entry and append it to the transcript.
 
@@ -633,33 +589,31 @@ def create_app(
         Safe because the server signs all entries (no client sigs to invalidate).
         """
         for attempt in range(max_retries):
-            head = _store.get_chain_head(contract_id)
+            head = self.store.get_chain_head(contract_id)
             if head is None:
                 head = hash_chain_init()
 
-            contract_data = _store.get(contract_id)
+            contract_data = self.store.get(contract_id)
             seq = len(contract_data["transcript"]) if contract_data else 0
 
             entry = build_chain_entry(
                 entry_type=entry_type,
                 data=data,
                 seq=seq,
-                author=_server_fix_id,
+                author=self.server_fix_id,
                 prev_hash=head,
-                privkey_bytes=_server_privkey,
+                privkey_bytes=self.server_privkey,
             )
 
-            ok, err = _store.append_chain_entry(contract_id, entry)
+            ok, err = self.store.append_chain_entry(contract_id, entry)
             if ok:
                 return entry
-            # Concurrent modification — another write landed first, retry
             if "Seq conflict" in err or "prev_hash mismatch" in err:
                 continue
-            # Non-retryable error
             raise HTTPException(500, f"Chain append failed: {err}")
         raise HTTPException(503, "Chain busy — too many concurrent writes, try again")
 
-    def _validate_and_append_client_entry(contract_id: str, chain_entry: dict | None,
+    def _validate_and_append_client_entry(self, contract_id: str, chain_entry: dict | None,
                                            caller_pubkey: str, expected_type: str,
                                            entry_data: dict) -> dict:
         """Validate a client-signed chain entry and append it.
@@ -675,23 +629,18 @@ def create_app(
 
         On seq/prev_hash conflict: returns 409 with chain_head and seq.
         """
-        # Legacy fallback: if no chain_entry, server signs
         if chain_entry is None:
-            return _server_sign_and_append(contract_id, expected_type, entry_data)
+            return self._server_sign_and_append(contract_id, expected_type, entry_data)
 
-        # Validate entry type matches expected
         entry_type = chain_entry.get("type", "")
         if entry_type != expected_type:
             raise HTTPException(400, f"Entry type mismatch: expected '{expected_type}', got '{entry_type}'")
 
-        # Reject server-only types from clients
         if entry_type in SERVER_ENTRY_TYPES:
             raise HTTPException(400, f"Entry type '{entry_type}' is server-only")
 
-        # Fetch contract data (needed for role check + timestamp monotonicity)
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
 
-        # Role validation
         allowed_role = ENTRY_TYPE_ROLES.get(entry_type)
         if allowed_role and allowed_role != "either" and data:
             is_agent = data.get("agent_pubkey") == caller_pubkey
@@ -701,17 +650,12 @@ def create_app(
             if allowed_role == "principal" and not is_principal:
                 raise HTTPException(403, f"Entry type '{entry_type}' requires principal role")
 
-        # Server sets the timestamp (server is the sole time authority).
-        # Client-provided timestamp is ignored — store.append_chain_entry overwrites it.
-
-        # Append with caller_pubkey validation
-        ok, err = _store.append_chain_entry(contract_id, chain_entry, caller_pubkey=caller_pubkey)
+        ok, err = self.store.append_chain_entry(contract_id, chain_entry, caller_pubkey=caller_pubkey)
         if ok:
             return chain_entry
         if "Seq conflict" in err or "prev_hash mismatch" in err or "Concurrent modification" in err:
-            # Return 409 with current head so client can retry
-            head = _store.get_chain_head(contract_id)
-            data = _store.get(contract_id)
+            head = self.store.get_chain_head(contract_id)
+            data = self.store.get(contract_id)
             seq = len(data["transcript"]) if data else 0
             raise HTTPException(409, detail={
                 "error": "chain_conflict",
@@ -720,135 +664,185 @@ def create_app(
             })
         raise HTTPException(400, f"Chain append failed: {err}")
 
-    def _check_review_expiry(data: dict) -> dict | None:
+    def _check_review_expiry(self, data: dict) -> dict | None:
         """Check if review window has expired. Auto-fulfill if so. Returns updated data or None."""
         if data["status"] != "review":
             return None
         expires = data.get("review_expires_at")
         if expires and time.time() >= expires:
-            _store.update_status(data["id"], "fulfilled")
-            _server_sign_and_append(data["id"], "auto_fulfill", {})
-            # Resolve escrow
-            escrow = _escrow.get(data["id"])
+            self.store.update_status(data["id"], "fulfilled")
+            self._server_sign_and_append(data["id"], "auto_fulfill", {})
+            escrow = self.escrow.get(data["id"])
             if escrow and not escrow["resolved"]:
-                _escrow.resolve(data["id"], "fulfilled")
-            return _store.get(data["id"])
+                self.escrow.resolve(data["id"], "fulfilled")
+            return self.store.get(data["id"])
         return None
 
-    def _compute_hash_chain(transcript: list[dict]) -> str:
+    def _compute_hash_chain(self, transcript: list[dict]) -> str:
         """Compute hash chain from transcript for evidence integrity."""
-        import json as _json
         chain = hash_chain_init()
         for msg in transcript:
-            chain = hash_chain_append(chain, _json.dumps(msg, sort_keys=True))
+            chain = hash_chain_append(chain, json_mod.dumps(msg, sort_keys=True))
         return chain
 
-    def _verify_transcript_chain(transcript: list[dict]) -> bool:
+    def _verify_transcript_chain(self, transcript: list[dict]) -> bool:
         """Check if transcript entries form a valid signed chain."""
-        # Only verify entries that have signatures (chain entries)
         chain_entries = [e for e in transcript if "signature" in e]
         if not chain_entries:
-            return True  # No chain entries yet (legacy or empty)
+            return True
         ok, _ = verify_chain(chain_entries)
         return ok
 
-    # --- Contract lifecycle ---
+    async def _execute_ruling(self, contract_id: str, data: dict, arguments: dict,
+                              prior_rulings: list, level: int) -> dict:
+        """Run the judge and apply the ruling. Shared by dispute and respond endpoints."""
+        if not self.court and not self.judge:
+            raise HTTPException(501, "No judge configured")
 
-    @app.get("/server_pubkey")
-    async def get_server_pubkey():
+        court_name = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]["name"]
+
+        transcript = data["transcript"]
+        chain_valid = self._verify_transcript_chain(transcript)
+
+        evidence = Evidence(
+            contract=data["contract"],
+            messages=transcript,
+            hash_chain=self._compute_hash_chain(transcript),
+            arguments=arguments,
+            prior_rulings=[r for r in prior_rulings],
+            chain_valid=chain_valid,
+        )
+
+        if self.court:
+            ruling = await self.court.rule(evidence, level=level)
+            can_appeal = level < MAX_DISPUTE_LEVEL
+        else:
+            ruling = await self.judge.rule(evidence)
+            ruling.court = court_name
+            ruling.level = level
+            ruling.final = True
+            can_appeal = False
+
+        if ruling.final or not can_appeal:
+            self.store.update_status(contract_id, "resolved")
+        else:
+            self.store.update_status(contract_id, "in_progress")
+
+        self._server_sign_and_append(contract_id, "ruling", {
+            "outcome": ruling.outcome,
+            "reasoning": ruling.reasoning,
+            "court": ruling.court,
+            "level": ruling.level,
+            "final": ruling.final,
+            "flags": ruling.flags,
+        })
+
+        if ruling.final or not can_appeal:
+            if ruling.outcome in ("fulfilled", "evil_principal"):
+                dispute_loser = "principal"
+                escrow_ruling = "fulfilled"
+            elif ruling.outcome in ("evil_agent", "evil_both"):
+                dispute_loser = "agent"
+                escrow_ruling = "canceled"
+            else:
+                dispute_loser = "agent"
+                escrow_ruling = ruling.outcome if ruling.outcome in ("canceled", "impossible") else "canceled"
+
+            escrow = self.escrow.get(contract_id)
+            if escrow and not escrow["resolved"]:
+                tier_fee = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]["fee"]
+                self.escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
+                              dispute_loser=dispute_loser, tier_fee=tier_fee)
+
+        return {
+            "outcome": ruling.outcome,
+            "reasoning": ruling.reasoning,
+            "court": ruling.court,
+            "level": ruling.level,
+            "final": ruling.final,
+            "can_appeal": can_appeal and not ruling.final,
+            "next_court": COURT_TIERS[level + 1]["name"] if can_appeal and not ruling.final else None,
+            "next_fee": COURT_TIERS[level + 1]["fee"] if can_appeal and not ruling.final else None,
+            "flags": ruling.flags,
+        }
+
+    # --- Endpoints ---
+
+    async def get_server_pubkey(self):
         """Get the server's Ed25519 public key so clients can verify server-signed entries."""
-        return {"pubkey": _server_pubkey.hex(), "fix_id": _server_fix_id}
+        return {"pubkey": self.server_pubkey.hex(), "fix_id": self.server_fix_id}
 
-    @app.post("/contracts")
-    async def post_contract(req: PostContractRequest, request: Request):
+    async def post_contract(self, req: PostContractRequest, request: Request):
         """Post a new contract and lock escrow. Principal's bond locked upfront."""
         authenticated = await _verify_auth(request, req.principal_pubkey)
         _require_auth(authenticated)
 
         contract = req.contract
-        # Size limit on contract JSON
         contract_json = json_mod.dumps(contract)
-        if len(contract_json) > MAX_CONTRACT_JSON_LEN:
-            raise HTTPException(400, f"Contract too large ({len(contract_json)} > {MAX_CONTRACT_JSON_LEN} bytes)")
+        if len(contract_json) > self.MAX_CONTRACT_JSON_LEN:
+            raise HTTPException(400, f"Contract too large ({len(contract_json)} > {self.MAX_CONTRACT_JSON_LEN} bytes)")
         _validate_contract(contract)
         _platform_review(contract)
 
-        # Enforce minimum bounty
-        escrow_data = contract.get("escrow", {})
-        if escrow_data.get("bounty"):
-            bounty = Decimal(escrow_data["bounty"])
-            if bounty < Decimal(MINIMUM_BOUNTY):
-                raise HTTPException(400, f"Bounty {bounty} below minimum {MINIMUM_BOUNTY} XNO")
+        contract_id = self.store.create(contract, req.principal_pubkey, server_pubkey=self.server_pubkey.hex())
 
-        contract_id = _store.create(contract, req.principal_pubkey, server_pubkey=_server_pubkey.hex())
-
-        # Lock escrow if contract has escrow terms
         escrow_data = contract.get("escrow", {})
         if escrow_data.get("bounty"):
             terms = contract.get("terms", {})
             terms["cancellation"] = terms.get("cancellation", {})
-            # Pass judge fee if specified (check both contract.judge and terms.judge)
             judge_info = contract.get("judge", {}) or terms.get("judge", {})
             judge_fee = str(judge_info.get("fee", ""))
             if judge_fee:
                 terms["judge_fee"] = judge_fee
-            _escrow.lock(contract_id, escrow_data["bounty"], terms,
+            self.escrow.lock(contract_id, escrow_data["bounty"], terms,
                         judge_fee=judge_fee)
 
-        # Notify SSE subscribers
         task = contract.get("task", {})
         terms = contract.get("terms", {})
-        _sse_publish("contract_posted", {
+        self._sse_publish("contract_posted", {
             "contract_id": contract_id,
             "status": "open",
             "bounty": escrow_data.get("bounty", "0"),
             "command": task.get("command", ""),
         })
 
-        return {"contract_id": contract_id, "status": "open", "server_pubkey": _server_pubkey.hex()}
+        return {"contract_id": contract_id, "status": "open", "server_pubkey": self.server_pubkey.hex()}
 
-    @app.get("/contracts")
-    async def list_contracts(status: str = "open", limit: int = 50):
-        limit = min(limit, 200)  # cap to prevent DB dump
+    async def list_contracts(self, status: str = "open", limit: int = 50):
+        limit = min(limit, 200)
         """List contracts by status (agents browse open ones).
 
         Lazy timeout: open contracts older than CONTRACT_PICKUP_TIMEOUT with
         no agent activity are auto-canceled on read.
         """
-        contracts = _store.list_by_status(status, limit)
+        contracts = self.store.list_by_status(status, limit)
         result = []
         now = time.time()
         canceled_count = 0
         MAX_AUTO_CANCEL = 10
         for c in contracts:
-            # Auto-cancel stale open contracts (lazy evaluation)
             if c["status"] == "open" and c.get("created_at"):
                 age = now - c["created_at"]
                 if age > CONTRACT_PICKUP_TIMEOUT:
                     if canceled_count >= MAX_AUTO_CANCEL:
-                        continue  # skip, will be caught on next request
+                        continue
                     try:
-                        _store.update_status(c["id"], "canceled")
-                        _server_sign_and_append(c["id"], "auto_fulfill", {
+                        self.store.update_status(c["id"], "canceled")
+                        self._server_sign_and_append(c["id"], "auto_fulfill", {
                             "reason": "No agent accepted within timeout",
                         })
-                        # Resolve escrow if present
-                        escrow = _escrow.get(c["id"])
+                        escrow = self.escrow.get(c["id"])
                         if escrow and not escrow["resolved"]:
-                            _escrow.resolve(c["id"], "canceled")
-                        c = _store.get(c["id"])
+                            self.escrow.resolve(c["id"], "canceled")
+                        c = self.store.get(c["id"])
                         canceled_count += 1
                     except (ValueError, Exception):
-                        pass  # already transitioned or other issue
+                        pass
             c["briefing"] = build_briefing(c["id"], c)
             result.append(c)
         return {"contracts": result}
 
-    @app.get("/contracts/stream")
-    async def stream_contracts(
-        min_bounty: str = "0",
-        status: str = "",
-    ):
+    async def stream_contracts(self, min_bounty: str = "0", status: str = ""):
         """SSE stream for agent subscriptions.
 
         Pushes events when contracts are created, accepted, updated, or resolved.
@@ -864,18 +858,20 @@ def create_app(
         """
         min_b = Decimal(min_bounty)
         q = _queue_mod.Queue(maxsize=256)
-        with _sse_lock:
-            if len(_sse_subscribers) >= MAX_SSE_SUBSCRIBERS:
+        with self.sse_lock:
+            if len(self.sse_subscribers) >= self.MAX_SSE_SUBSCRIBERS:
                 raise HTTPException(503, "Too many SSE subscribers")
-            _sse_subscribers.append(q)
+            self.sse_subscribers.append(q)
+
+        sse_lock = self.sse_lock
+        sse_subscribers = self.sse_subscribers
 
         async def event_generator():
             try:
                 while True:
                     try:
-                        # Non-blocking: check queue, sleep if empty
                         event = None
-                        for _ in range(30):  # 30 x 0.5s = 15s keepalive
+                        for _ in range(30):
                             try:
                                 event = q.get_nowait()
                                 break
@@ -884,7 +880,6 @@ def create_app(
                         if event is None:
                             yield ": keepalive\n\n"
                             continue
-                        # Apply filters
                         if min_b > 0:
                             event_bounty = Decimal(event.get("bounty", "0"))
                             if event_bounty < min_b:
@@ -895,9 +890,9 @@ def create_app(
                     except Exception:
                         break
             finally:
-                with _sse_lock:
-                    if q in _sse_subscribers:
-                        _sse_subscribers.remove(q)
+                with sse_lock:
+                    if q in sse_subscribers:
+                        sse_subscribers.remove(q)
 
         return StreamingResponse(
             event_generator(),
@@ -909,31 +904,26 @@ def create_app(
             },
         )
 
-    @app.get("/contracts/{contract_id}")
-    async def get_contract(contract_id: str):
+    async def get_contract(self, contract_id: str):
         """Get contract details + transcript + briefing."""
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
-        # Check review expiry on access
-        updated = _check_review_expiry(data)
+        updated = self._check_review_expiry(data)
         result = updated or data
         result["briefing"] = build_briefing(contract_id, result)
-
         return result
 
-    @app.get("/contracts/{contract_id}/chain_head")
-    async def get_chain_head(contract_id: str):
+    async def get_chain_head(self, contract_id: str):
         """Get current chain head for building next entry."""
-        head = _store.get_chain_head(contract_id)
+        head = self.store.get_chain_head(contract_id)
         if head is None:
             raise HTTPException(404, "Contract not found")
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         seq = len(data["transcript"]) if data else 0
         return {"chain_head": head, "seq": seq}
 
-    @app.post("/contracts/{contract_id}/bond")
-    async def post_bond(contract_id: str, req: BondRequest, request: Request):
+    async def post_bond(self, contract_id: str, req: BondRequest, request: Request):
         """Agent deposits inclusive bond to start investigating. OPEN -> INVESTIGATING.
 
         Inclusive bond = bounty + judge_fee. Both sides pay the same amount.
@@ -941,7 +931,7 @@ def create_app(
         authed = await _verify_auth(request, req.agent_pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         if data["status"] != "open":
@@ -949,123 +939,104 @@ def create_app(
         if req.agent_pubkey == data.get("principal_pubkey"):
             raise HTTPException(403, "Cannot bond your own contract")
 
-        # Lock agent's inclusive bond
         try:
-            bond_result = _escrow.lock_agent(contract_id)
+            bond_result = self.escrow.lock_agent(contract_id)
         except ValueError:
             bond_result = {"status": "no_escrow"}
 
-        # Assign agent (without transitioning to in_progress yet)
-        with _store._lock:
+        with self.store._lock:
             now = time.time()
-            cursor = _store.db.execute(
+            cursor = self.store.db.execute(
                 "UPDATE contracts SET agent_pubkey = ?, status = 'investigating', updated_at = ? WHERE id = ? AND status = 'open'",
                 (req.agent_pubkey, now, contract_id),
             )
-            _store.db.commit()
+            self.store.db.commit()
             if cursor.rowcount == 0:
-                # Race condition: another agent got it first, undo escrow lock
                 try:
-                    _escrow.release_agent(contract_id)
+                    self.escrow.release_agent(contract_id)
                 except ValueError:
                     pass
                 raise HTTPException(409, "Contract already taken by another agent")
 
-        _validate_and_append_client_entry(contract_id, req.chain_entry,
+        self._validate_and_append_client_entry(contract_id, req.chain_entry,
             req.agent_pubkey, "bond", {"agent_pubkey": req.agent_pubkey})
 
         return {"status": "investigating", "bond": bond_result}
 
-    @app.post("/contracts/{contract_id}/accept")
-    async def accept_contract(contract_id: str, req: AcceptRequest, request: Request):
+    async def accept_contract(self, contract_id: str, req: AcceptRequest, request: Request):
         """Agent accepts a contract. From INVESTIGATING (bonded) or OPEN (legacy)."""
         authed = await _verify_auth(request, req.agent_pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         if req.agent_pubkey == data.get("principal_pubkey"):
             raise HTTPException(403, "Cannot accept your own contract")
 
         if data["status"] == "investigating":
-            # Bonded flow: agent bonded, investigated, now accepts
             _check_party(data, req.agent_pubkey, "agent")
-            _store.update_status(contract_id, "in_progress")
+            self.store.update_status(contract_id, "in_progress")
         elif data["status"] == "open":
-            # Free mode: no escrow, agent accepts directly
-            ok = _store.assign_agent(contract_id, req.agent_pubkey, from_status="open")
+            ok = self.store.assign_agent(contract_id, req.agent_pubkey, from_status="open")
             if not ok:
                 raise HTTPException(409, "Could not assign agent")
         else:
             raise HTTPException(409, "Contract not available for acceptance")
 
-        _validate_and_append_client_entry(contract_id, req.chain_entry,
+        self._validate_and_append_client_entry(contract_id, req.chain_entry,
             req.agent_pubkey, "accept", {"agent_pubkey": req.agent_pubkey})
-        _sse_publish("contract_accepted", {
+        self._sse_publish("contract_accepted", {
             "contract_id": contract_id,
             "status": "in_progress",
             "agent": req.agent_pubkey,
         })
         return {"status": "in_progress"}
 
-    class DeclineRequest(BaseModel):
-        agent_pubkey: str
-        reason: str = ""
-        chain_entry: Optional[dict] = None
-
-    @app.post("/contracts/{contract_id}/decline")
-    async def decline_investigation(contract_id: str, req: DeclineRequest, request: Request):
+    async def decline_investigation(self, contract_id: str, req: DeclineRequest, request: Request):
         """Agent declines after investigating. Bond returned, contract reopens."""
         authed = await _verify_auth(request, req.agent_pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         if data["status"] != "investigating":
             raise HTTPException(409, "Contract not in investigating state")
 
-        # Verify the caller is the investigating agent
         _check_party(data, req.agent_pubkey, "agent")
 
-        # Append chain entry BEFORE clearing agent (role check needs agent_pubkey)
-        _validate_and_append_client_entry(contract_id, req.chain_entry,
+        self._validate_and_append_client_entry(contract_id, req.chain_entry,
             req.agent_pubkey, "decline", {"reason": req.reason})
 
-        # Release agent's inclusive bond
         try:
-            _escrow.release_agent(contract_id)
+            self.escrow.release_agent(contract_id)
         except ValueError:
             pass
 
-        # Reopen: clear agent, set back to open
-        with _store._lock:
+        with self.store._lock:
             now = time.time()
-            _store.db.execute(
+            self.store.db.execute(
                 "UPDATE contracts SET agent_pubkey = NULL, status = 'open', updated_at = ? WHERE id = ?",
                 (now, contract_id),
             )
-            _store.db.commit()
+            self.store.db.commit()
 
         return {"status": "open"}
 
-    @app.post("/contracts/{contract_id}/investigate")
-    async def request_investigation(contract_id: str, req: InvestigateRequest, request: Request):
+    async def request_investigation(self, contract_id: str, req: InvestigateRequest, request: Request):
         """Agent requests an investigation command. Rate-limited."""
-        _check_field_len(req.command, "command", 2000)
+        self._check_field_len(req.command, "command", 2000)
         authed = await _verify_auth(request, req.agent_pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         if data["status"] not in ("in_progress", "investigating"):
             raise HTTPException(409, "Contract not in progress")
-        # Verify caller is the agent
         _check_party(data, req.agent_pubkey, "agent")
 
-        # Rate limiting
         rate_limit = data["contract"].get("execution", {}).get(
             "investigation_rate", DEFAULT_INVESTIGATION_RATE
         )
@@ -1075,35 +1046,33 @@ def create_app(
             wait = rate_limit - (now - last_ts)
             raise HTTPException(429, f"Rate limited. Wait {wait:.1f}s")
 
-        _store.set_last_investigation(contract_id, now)
-        _validate_and_append_client_entry(contract_id, req.chain_entry,
+        self.store.set_last_investigation(contract_id, now)
+        self._validate_and_append_client_entry(contract_id, req.chain_entry,
             req.agent_pubkey, "investigate", {"command": req.command, "from": "agent"})
         return {"status": "pending_result", "command": req.command}
 
-    @app.post("/contracts/{contract_id}/result")
-    async def submit_investigation_result(contract_id: str, req: InvestigationResultRequest, request: Request):
+    async def submit_investigation_result(self, contract_id: str, req: InvestigationResultRequest, request: Request):
         """Principal returns investigation result."""
         authed = await _verify_auth(request, req.principal_pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         _check_party(data, req.principal_pubkey, "principal")
 
-        _validate_and_append_client_entry(contract_id, req.chain_entry,
+        self._validate_and_append_client_entry(contract_id, req.chain_entry,
             req.principal_pubkey, "result", {
                 "command": req.command, "output": req.output, "from": "principal",
             })
         return {"status": "ok"}
 
-    @app.post("/contracts/{contract_id}/chat")
-    async def chat(contract_id: str, req: ChatMessage, request: Request):
+    async def chat(self, contract_id: str, req: ChatMessage, request: Request):
         """Send a chat message. Works in any state except voided/canceled."""
         authed = await _verify_auth(request, req.pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         if data["status"] in ("voided", "canceled"):
@@ -1111,7 +1080,6 @@ def create_app(
         if req.msg_type not in ("ask", "answer", "message"):
             raise HTTPException(400, "Invalid msg_type")
 
-        # Validate msg_type against role
         ALLOWED_MSG_TYPES = {
             "principal": {"message", "answer"},
             "agent": {"message", "ask"},
@@ -1120,114 +1088,108 @@ def create_app(
         if req.msg_type not in allowed:
             raise HTTPException(400, f"msg_type '{req.msg_type}' not allowed for {req.from_side}")
 
-        # Verify caller matches the side they claim
         _check_party(data, req.pubkey, req.from_side)
 
-        _validate_and_append_client_entry(contract_id, req.chain_entry,
+        self._validate_and_append_client_entry(contract_id, req.chain_entry,
             req.pubkey, req.msg_type, {"message": req.message, "from": req.from_side})
         return {"status": "sent"}
 
-    @app.post("/contracts/{contract_id}/fix")
-    async def submit_fix(contract_id: str, req: SubmitFixRequest, request: Request):
+    async def submit_fix(self, contract_id: str, req: SubmitFixRequest, request: Request):
         """Agent submits a fix. In autonomous mode, enters review state."""
         authed = await _verify_auth(request, req.agent_pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         _check_party(data, req.agent_pubkey, "agent")
-        if data["status"] != "in_progress":
-            raise HTTPException(409, "Contract not in progress")
         if not req.fix or not req.fix.strip():
             raise HTTPException(400, "Fix cannot be empty")
 
-        _validate_and_append_client_entry(contract_id, req.chain_entry,
+        self._validate_and_append_client_entry(contract_id, req.chain_entry,
             req.agent_pubkey, "fix", {
                 "fix": req.fix, "explanation": req.explanation, "from": "agent",
             })
 
         mode = data.get("execution_mode", MODE_SUPERVISED)
         if mode == MODE_AUTONOMOUS:
-            # Enter review state with expiry window
             review_window = data["contract"].get("execution", {}).get(
                 "review_window", DEFAULT_REVIEW_WINDOW
             )
             expires_at = time.time() + review_window
-            _store.update_status(contract_id, "review")
-            _store.set_review_expires(contract_id, expires_at)
+            try:
+                self.store.update_status(contract_id, "review")
+            except ValueError as e:
+                raise HTTPException(409, f"Cannot transition to review: {e}")
+            self.store.set_review_expires(contract_id, expires_at)
             return {"status": "review", "review_expires_at": expires_at}
         else:
             return {"status": "pending_verification"}
 
-    @app.post("/contracts/{contract_id}/verify")
-    async def verify_fix(contract_id: str, req: VerifyRequest, request: Request):
+    async def verify_fix(self, contract_id: str, req: VerifyRequest, request: Request):
         """Principal reports verification result (supervised mode)."""
         authed = await _verify_auth(request, req.principal_pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         _check_party(data, req.principal_pubkey, "principal")
-        if data["status"] != "in_progress":
-            raise HTTPException(409, "Contract not in progress")
-        # Must have a fix submitted before verification
         transcript = data.get("transcript", [])
         has_fix = any(m.get("type") == "fix" for m in transcript)
         if not has_fix:
             raise HTTPException(409, "No fix submitted yet")
 
-        _validate_and_append_client_entry(contract_id, req.chain_entry,
+        self._validate_and_append_client_entry(contract_id, req.chain_entry,
             req.principal_pubkey, "verify", {
                 "success": req.success, "explanation": req.explanation, "from": "principal",
             })
 
         if req.success:
-            _store.update_status(contract_id, "fulfilled")
+            try:
+                self.store.update_status(contract_id, "fulfilled")
+            except ValueError as e:
+                raise HTTPException(409, f"Cannot transition to fulfilled: {e}")
             ruling = "fulfilled"
         else:
-            # Check if retries remain
             contract = data.get("contract", {})
             max_attempts = contract.get("execution", {}).get("max_attempts", 3)
             transcript = data.get("transcript", [])
             attempts_so_far = sum(1 for m in transcript if m.get("type") == "verify" and not m.get("data", {}).get("success", m.get("success")))
-            # +1 for this verify we just appended
             attempts_so_far += 1
 
             if attempts_so_far < max_attempts:
-                # Stay in_progress -- agent should retry
                 ruling = "retry"
             else:
-                _store.update_status(contract_id, "canceled")
+                try:
+                    self.store.update_status(contract_id, "canceled")
+                except ValueError as e:
+                    raise HTTPException(409, f"Cannot transition to canceled: {e}")
                 ruling = "canceled"
 
         if ruling != "retry":
-            # Resolve escrow
-            escrow = _escrow.get(contract_id)
+            escrow = self.escrow.get(contract_id)
             if escrow and not escrow["resolved"]:
-                _escrow.resolve(contract_id, ruling)
+                self.escrow.resolve(contract_id, ruling)
 
-        _sse_publish("contract_resolved", {
+        self._sse_publish("contract_resolved", {
             "contract_id": contract_id,
             "status": ruling,
             "bounty": data["contract"].get("escrow", {}).get("bounty", "0"),
         })
         return {"status": ruling}
 
-    @app.post("/contracts/{contract_id}/review")
-    async def review_action(contract_id: str, req: ReviewAction, request: Request):
+    async def review_action(self, contract_id: str, req: ReviewAction, request: Request):
         """Principal acts during review window: accept or dispute."""
         authed = await _verify_auth(request, req.principal_pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         _check_party(data, req.principal_pubkey, "principal")
 
-        # Check auto-fulfill first
-        updated = _check_review_expiry(data)
+        updated = self._check_review_expiry(data)
         if updated:
             return {"status": "fulfilled", "detail": "review window expired, auto-fulfilled"}
 
@@ -1235,49 +1197,46 @@ def create_app(
             raise HTTPException(409, f"Contract is {data['status']}, not in review")
 
         if req.action == "accept":
-            _store.update_status(contract_id, "fulfilled")
-            _validate_and_append_client_entry(contract_id, req.chain_entry,
+            self.store.update_status(contract_id, "fulfilled")
+            self._validate_and_append_client_entry(contract_id, req.chain_entry,
                 req.principal_pubkey, "review_accept", {})
-            # Resolve escrow
-            escrow = _escrow.get(contract_id)
+            escrow = self.escrow.get(contract_id)
             if escrow and not escrow["resolved"]:
-                _escrow.resolve(contract_id, "fulfilled")
+                self.escrow.resolve(contract_id, "fulfilled")
             return {"status": "fulfilled"}
 
         elif req.action == "dispute":
             if not req.argument:
                 raise HTTPException(400, "Dispute requires an argument")
-            # Delegate to dispute endpoint logic
-            _store.update_status(contract_id, "disputed")
-            _validate_and_append_client_entry(contract_id, req.chain_entry,
+            self.store.update_status(contract_id, "disputed")
+            self._validate_and_append_client_entry(contract_id, req.chain_entry,
                 req.principal_pubkey, "dispute_filed", {
                     "argument": req.argument, "side": "principal",
                 })
 
-            if not _judge:
+            if not self.judge:
                 raise HTTPException(501, "No judge configured")
 
-            transcript = _store.get(contract_id)["transcript"]
-            chain_valid = _verify_transcript_chain(transcript)
+            transcript = self.store.get(contract_id)["transcript"]
+            chain_valid = self._verify_transcript_chain(transcript)
 
             evidence = Evidence(
                 contract=data["contract"],
                 messages=transcript,
-                hash_chain=_compute_hash_chain(transcript),
+                hash_chain=self._compute_hash_chain(transcript),
                 arguments={"principal": req.argument},
                 chain_valid=chain_valid,
             )
 
-            ruling = await _judge.rule(evidence)
+            ruling = await self.judge.rule(evidence)
 
-            _store.update_status(contract_id, "resolved")
-            _server_sign_and_append(contract_id, "ruling", {
+            self.store.update_status(contract_id, "resolved")
+            self._server_sign_and_append(contract_id, "ruling", {
                 "outcome": ruling.outcome,
                 "reasoning": ruling.reasoning,
                 "flags": ruling.flags,
             })
 
-            # Determine dispute loser for bond routing
             if ruling.outcome in ("fulfilled", "evil_principal"):
                 dispute_loser = "principal"
                 escrow_ruling = "fulfilled" if ruling.outcome == "fulfilled" else "fulfilled"
@@ -1285,9 +1244,9 @@ def create_app(
                 dispute_loser = "agent"
                 escrow_ruling = "canceled"
 
-            escrow = _escrow.get(contract_id)
+            escrow = self.escrow.get(contract_id)
             if escrow and not escrow["resolved"]:
-                _escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
+                self.escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
                               dispute_loser=dispute_loser, tier_fee=COURT_TIERS[0]["fee"])
 
             return {"outcome": ruling.outcome, "reasoning": ruling.reasoning, "flags": ruling.flags}
@@ -1295,15 +1254,13 @@ def create_app(
         else:
             raise HTTPException(400, f"Invalid review action: {req.action}")
 
-    @app.get("/contracts/{contract_id}/review_status")
-    async def review_status(contract_id: str):
+    async def review_status(self, contract_id: str):
         """Get time remaining in review window."""
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
 
-        # Check auto-fulfill
-        updated = _check_review_expiry(data)
+        updated = self._check_review_expiry(data)
         if updated:
             return {"status": "fulfilled", "remaining": 0}
 
@@ -1317,103 +1274,25 @@ def create_app(
         remaining = max(0, expires - time.time())
         return {"status": "review", "remaining": remaining, "expires_at": expires}
 
-    async def _execute_ruling(contract_id: str, data: dict, arguments: dict,
-                              prior_rulings: list, level: int) -> dict:
-        """Run the judge and apply the ruling. Shared by dispute and respond endpoints."""
-        if not _court and not _judge:
-            raise HTTPException(501, "No judge configured")
-
-        court_name = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]["name"]
-
-        transcript = data["transcript"]
-        chain_valid = _verify_transcript_chain(transcript)
-
-        evidence = Evidence(
-            contract=data["contract"],
-            messages=transcript,
-            hash_chain=_compute_hash_chain(transcript),
-            arguments=arguments,
-            prior_rulings=[r for r in prior_rulings],
-            chain_valid=chain_valid,
-        )
-
-        if _court:
-            ruling = await _court.rule(evidence, level=level)
-            can_appeal = level < MAX_DISPUTE_LEVEL
-        else:
-            ruling = await _judge.rule(evidence)
-            ruling.court = court_name
-            ruling.level = level
-            ruling.final = True
-            can_appeal = False
-
-        if ruling.final or not can_appeal:
-            _store.update_status(contract_id, "resolved")
-        else:
-            _store.update_status(contract_id, "in_progress")
-
-        _server_sign_and_append(contract_id, "ruling", {
-            "outcome": ruling.outcome,
-            "reasoning": ruling.reasoning,
-            "court": ruling.court,
-            "level": ruling.level,
-            "final": ruling.final,
-            "flags": ruling.flags,
-        })
-
-        # Resolve escrow on final ruling
-        if ruling.final or not can_appeal:
-            if ruling.outcome in ("fulfilled", "evil_principal"):
-                dispute_loser = "principal"
-                escrow_ruling = "fulfilled"
-            elif ruling.outcome in ("evil_agent", "evil_both"):
-                dispute_loser = "agent"
-                escrow_ruling = "canceled"
-            else:
-                dispute_loser = "agent"
-                escrow_ruling = ruling.outcome if ruling.outcome in ("canceled", "impossible") else "canceled"
-
-            escrow = _escrow.get(contract_id)
-            if escrow and not escrow["resolved"]:
-                tier_fee = COURT_TIERS[min(level, MAX_DISPUTE_LEVEL)]["fee"]
-                _escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
-                              dispute_loser=dispute_loser, tier_fee=tier_fee)
-
-        return {
-            "outcome": ruling.outcome,
-            "reasoning": ruling.reasoning,
-            "court": ruling.court,
-            "level": ruling.level,
-            "final": ruling.final,
-            "can_appeal": can_appeal and not ruling.final,
-            "next_court": COURT_TIERS[level + 1]["name"] if can_appeal and not ruling.final else None,
-            "next_fee": COURT_TIERS[level + 1]["fee"] if can_appeal and not ruling.final else None,
-            "flags": ruling.flags,
-        }
-
-    @app.post("/contracts/{contract_id}/dispute")
-    async def dispute_contract(contract_id: str, req: DisputeRequest, request: Request):
+    async def dispute_contract(self, contract_id: str, req: DisputeRequest, request: Request):
         """File a dispute. Two-phase: file -> other side has 30s to respond -> judge rules."""
         authed = await _verify_auth(request, req.pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
 
         if data["status"] not in ("in_progress", "review", "awaiting_response", "disputed"):
             raise HTTPException(409, "Cannot dispute in current state")
 
-        # Free-mode check: no judge configured means no disputes
         judge_info = data.get("contract", {}).get("judge", {})
         judge_pubkey = judge_info.get("pubkey", "") if judge_info else ""
         if not judge_pubkey:
             raise HTTPException(400, "Disputes not available: no judge configured for this contract. This is a free-mode contract.")
 
-        # Verify caller matches the side they claim
         _check_party(data, req.pubkey, req.side)
 
-        # Check for pending dispute awaiting response
         transcript = data.get("transcript", [])
         pending_meta = None
         for msg in reversed(transcript):
@@ -1425,15 +1304,13 @@ def create_app(
                 break
 
         if pending_meta:
-            # Get data from either top-level (legacy) or data subdict (chain entry)
             pf_data = pending_meta.get("data", pending_meta)
             deadline = pf_data.get("response_deadline", 0)
             if time.time() >= deadline:
-                # Response window expired -- trigger ruling in absentia
                 prior_rulings = [m for m in transcript if m.get("type") == "ruling"]
                 level = pf_data.get("level", 0)
                 arguments = {pf_data["side"]: pf_data["argument"]}
-                return await _execute_ruling(contract_id, _store.get(contract_id),
+                return await self._execute_ruling(contract_id, self.store.get(contract_id),
                                              arguments, prior_rulings, level)
             else:
                 remaining = round(deadline - time.time(), 1)
@@ -1446,7 +1323,6 @@ def create_app(
         if level > MAX_DISPUTE_LEVEL:
             raise HTTPException(409, "Supreme court has already ruled. No further appeals.")
 
-        # For appeals: only the loser can appeal
         if level > 0:
             last_ruling = prior_rulings[-1]
             last_data = last_ruling.get("data", last_ruling)
@@ -1463,13 +1339,12 @@ def create_app(
         other_side = "agent" if req.side == "principal" else "principal"
         deadline = time.time() + DISPUTE_RESPONSE_WINDOW
 
-        _store.update_status(contract_id, "disputed")
-        _validate_and_append_client_entry(contract_id, req.chain_entry,
+        self.store.update_status(contract_id, "disputed")
+        self._validate_and_append_client_entry(contract_id, req.chain_entry,
             req.pubkey, "dispute_filed", {
                 "argument": req.argument, "side": req.side,
             })
-        # Server-signed metadata entry with court details + deadline
-        _server_sign_and_append(contract_id, "dispute_metadata", {
+        self._server_sign_and_append(contract_id, "dispute_metadata", {
             "argument": req.argument, "side": req.side,
             "level": level, "court": court_name,
             "fee": fee, "response_deadline": deadline,
@@ -1487,20 +1362,17 @@ def create_app(
                        f"POST /contracts/{contract_id}/respond or ruling proceeds in absentia.",
         }
 
-    @app.post("/contracts/{contract_id}/respond")
-    async def respond_to_dispute(contract_id: str, req: RespondRequest, request: Request):
+    async def respond_to_dispute(self, contract_id: str, req: RespondRequest, request: Request):
         """Counter-argue a pending dispute. Must be the other side, within the response window."""
         authed = await _verify_auth(request, req.pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
 
-        # Verify caller matches claimed side
         _check_party(data, req.pubkey, req.side)
 
-        # Find the pending dispute metadata (must not have a ruling after it)
         transcript = data.get("transcript", [])
         last_filed = None
         for msg in reversed(transcript):
@@ -1516,22 +1388,18 @@ def create_app(
         lf_data = last_filed.get("data", last_filed)
         filer_side = lf_data["side"]
 
-        # Must be the other side
         if req.side == filer_side:
             raise HTTPException(400, f"You filed the dispute. Only the {('agent' if filer_side == 'principal' else 'principal')} can respond.")
 
-        # Check deadline
         deadline = lf_data.get("response_deadline", 0)
         if time.time() > deadline:
             raise HTTPException(410, "Response window has expired. Ruling will proceed in absentia.")
 
-        # Record response
-        _validate_and_append_client_entry(contract_id, req.chain_entry,
+        self._validate_and_append_client_entry(contract_id, req.chain_entry,
             req.pubkey, "dispute_response", {
                 "argument": req.argument, "side": req.side,
             })
 
-        # Both sides heard -- trigger ruling immediately
         prior_rulings = [m for m in data.get("transcript", []) if m.get("type") == "ruling"]
         level = lf_data.get("level", 0)
         arguments = {
@@ -1539,17 +1407,15 @@ def create_app(
             req.side: req.argument,
         }
 
-        return await _execute_ruling(contract_id, _store.get(contract_id),
+        return await self._execute_ruling(contract_id, self.store.get(contract_id),
                                      arguments, prior_rulings, level)
 
-    @app.get("/contracts/{contract_id}/dispute_status")
-    async def dispute_status(contract_id: str):
+    async def dispute_status(self, contract_id: str):
         """Check status of a pending dispute (response window, etc.)."""
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
 
-        # Look for dispute_metadata (server-signed with deadline) or legacy dispute_filed
         pending = [m for m in data.get("transcript", [])
                    if m.get("type") in ("dispute_metadata", "dispute_filed")]
         if not pending:
@@ -1560,9 +1426,8 @@ def create_app(
         deadline = lf_data.get("response_deadline", 0)
         remaining = max(0, deadline - time.time())
 
-        # Check if response was already submitted
         responses = [m for m in data.get("transcript", []) if m.get("type") == "dispute_response"]
-        responded = len(responses) > len(pending) - 1  # rough check
+        responded = len(responses) > len(pending) - 1
 
         return {
             "status": "awaiting_response" if remaining > 0 and not responded else "ready_for_ruling",
@@ -1574,35 +1439,26 @@ def create_app(
             "responded": responded,
         }
 
-    class VoidRequest(BaseModel):
-        pubkey: str  # must be a party to the contract
-
-    @app.post("/contracts/{contract_id}/void")
-    async def void_contract(contract_id: str, req: VoidRequest, request: Request):
+    async def void_contract(self, contract_id: str, req: VoidRequest, request: Request):
         """Void a disputed contract (judge timeout). All funds returned."""
         authed = await _verify_auth(request, req.pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
 
-        # Must be a party to the contract
         is_principal = data.get("principal_pubkey") == req.pubkey
         is_agent = data.get("agent_pubkey") == req.pubkey
         if not is_principal and not is_agent:
             raise HTTPException(403, "Not a party to this contract")
 
-        if data["status"] != "disputed":
-            raise HTTPException(409, "Contract not in disputed state")
-
-        # Verify there is a pending dispute that has timed out
         transcript = data.get("transcript", [])
         dispute_filed_at = None
         for msg in reversed(transcript):
             msg_type = msg.get("type", "")
             if msg_type == "ruling":
-                break  # a ruling exists after the last dispute — not pending
+                break
             if msg_type == "dispute_filed":
                 msg_data = msg.get("data", msg)
                 dispute_filed_at = msg_data.get("timestamp", msg.get("timestamp", 0))
@@ -1612,61 +1468,61 @@ def create_app(
         if time.time() - dispute_filed_at < DEFAULT_RULING_TIMEOUT:
             raise HTTPException(409, "Judge ruling timeout has not elapsed")
 
-        _store.update_status(contract_id, "voided")
-        _server_sign_and_append(contract_id, "voided", {"reason": "judge_timeout"})
+        try:
+            self.store.update_status(contract_id, "voided")
+        except ValueError as e:
+            raise HTTPException(409, f"Cannot transition to voided: {e}")
+        self._server_sign_and_append(contract_id, "voided", {"reason": "judge_timeout"})
 
-        # Resolve escrow as voided -- everything returned
-        escrow = _escrow.get(contract_id)
+        escrow = self.escrow.get(contract_id)
         if escrow and not escrow["resolved"]:
-            _escrow.resolve(contract_id, "voided")
+            self.escrow.resolve(contract_id, "voided")
 
         return {"status": "voided"}
 
-    @app.post("/contracts/{contract_id}/halt")
-    async def halt_contract(contract_id: str, req: HaltRequest, request: Request):
+    async def halt_contract(self, contract_id: str, req: HaltRequest, request: Request):
         """Emergency halt by principal -- freeze contract and escalate to district court."""
         authed = await _verify_auth(request, req.principal_pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         _check_party(data, req.principal_pubkey, "principal")
-        if data["status"] not in ("in_progress", "review"):
-            raise HTTPException(409, "Contract not in progress or review")
 
-        _store.update_status(contract_id, "halted")
-        _validate_and_append_client_entry(contract_id, req.chain_entry,
+        try:
+            self.store.update_status(contract_id, "halted")
+        except ValueError as e:
+            raise HTTPException(409, f"Cannot transition to halted: {e}")
+        self._validate_and_append_client_entry(contract_id, req.chain_entry,
             req.principal_pubkey, "halt", {"reason": req.reason, "from": "principal"})
 
         ruling_resp = None
 
-        if _court or _judge:
-            # Immediate district court ruling (no response window for emergencies)
-            transcript = _store.get(contract_id)["transcript"]
-            chain_valid = _verify_transcript_chain(transcript)
+        if self.court or self.judge:
+            transcript = self.store.get(contract_id)["transcript"]
+            chain_valid = self._verify_transcript_chain(transcript)
 
             evidence = Evidence(
                 contract=data["contract"],
                 messages=transcript,
-                hash_chain=_compute_hash_chain(transcript),
+                hash_chain=self._compute_hash_chain(transcript),
                 arguments={"principal": req.reason},
                 chain_valid=chain_valid,
             )
-            if _court:
-                ruling = await _court.rule(evidence, level=0)
-                can_appeal = True  # halt rulings are non-final, can be appealed
+            if self.court:
+                ruling = await self.court.rule(evidence, level=0)
+                can_appeal = True
             else:
-                ruling = await _judge.rule(evidence)
+                ruling = await self.judge.rule(evidence)
                 can_appeal = False
 
-            # Non-final: set to in_progress so loser can appeal via /dispute
             if can_appeal:
-                _store.update_status(contract_id, "in_progress")
+                self.store.update_status(contract_id, "in_progress")
             else:
-                _store.update_status(contract_id, "resolved")
+                self.store.update_status(contract_id, "resolved")
 
-            _server_sign_and_append(contract_id, "ruling", {
+            self._server_sign_and_append(contract_id, "ruling", {
                 "outcome": ruling.outcome,
                 "reasoning": ruling.reasoning,
                 "court": ruling.court if hasattr(ruling, 'court') else "district",
@@ -1675,7 +1531,6 @@ def create_app(
                 "flags": ruling.flags,
             })
 
-            # Only resolve escrow if final (legacy judge)
             if not can_appeal:
                 if ruling.outcome in ("fulfilled", "evil_principal"):
                     dispute_loser = "principal"
@@ -1684,9 +1539,9 @@ def create_app(
                     dispute_loser = "agent"
                     escrow_ruling = "canceled"
 
-                escrow = _escrow.get(contract_id)
+                escrow = self.escrow.get(contract_id)
                 if escrow and not escrow["resolved"]:
-                    _escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
+                    self.escrow.resolve(contract_id, escrow_ruling, flags=ruling.flags,
                                   dispute_loser=dispute_loser, tier_fee=COURT_TIERS[0]["fee"])
 
             ruling_resp = {
@@ -1699,16 +1554,15 @@ def create_app(
                 "flags": ruling.flags,
             }
 
-        updated = _store.get(contract_id)
+        updated = self.store.get(contract_id)
         return {
             "status": updated["status"] if updated else "halted",
             "ruling": ruling_resp,
         }
 
-    @app.get("/contracts/{contract_id}/ruling")
-    async def get_ruling(contract_id: str):
+    async def get_ruling(self, contract_id: str):
         """Get ruling for a contract (from transcript)."""
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
         for msg in reversed(data["transcript"]):
@@ -1717,10 +1571,9 @@ def create_app(
                 return {"outcome": msg_data.get("outcome"), "reasoning": msg_data.get("reasoning"), "flags": msg_data.get("flags", [])}
         return None
 
-    @app.get("/contracts/{contract_id}/verify_chain")
-    async def verify_contract_chain(contract_id: str):
+    async def verify_contract_chain(self, contract_id: str):
         """Verify the signed message chain for a contract."""
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
 
@@ -1739,30 +1592,26 @@ def create_app(
             "chain_head": data.get("chain_head", ""),
         }
 
-    @app.get("/reputation/{pubkey}")
-    async def get_reputation(pubkey: str):
+    async def get_reputation(self, pubkey: str):
         """Bond-as-reputation: reputation is determined by on-chain Nano balance."""
         return {
             "pubkey": pubkey,
             "note": "Reputation is determined by on-chain balance. Check the Nano ledger directly for balance/history.",
         }
 
-    @app.post("/contracts/{contract_id}/accounts")
-    async def set_accounts(contract_id: str, req: SetAccountsRequest, request: Request):
+    async def set_accounts(self, contract_id: str, req: SetAccountsRequest, request: Request):
         """Set payment accounts. Each party can only set their own account."""
         authed = await _verify_auth(request, req.pubkey)
         _require_auth(authed)
 
-        data = _store.get(contract_id)
+        data = self.store.get(contract_id)
         if not data:
             raise HTTPException(404, "Contract not found")
 
-        # Block account changes after escrow resolution
-        escrow = _escrow.get(data["id"])
+        escrow = self.escrow.get(data["id"])
         if escrow and escrow.get("resolved"):
             raise HTTPException(409, "Cannot change accounts after escrow resolution")
 
-        # Validate Nano addresses before anything else
         if req.principal_account:
             valid, err = validate_nano_address(req.principal_account)
             if not valid:
@@ -1772,7 +1621,6 @@ def create_app(
             if not valid:
                 raise HTTPException(400, f"Invalid agent Nano address: {err}")
 
-        # Enforce: you can only set YOUR OWN account
         is_principal = data.get("principal_pubkey") == req.pubkey
         is_agent = data.get("agent_pubkey") == req.pubkey
         if not is_principal and not is_agent:
@@ -1782,20 +1630,18 @@ def create_app(
         if req.agent_account and not is_agent:
             raise HTTPException(403, "Cannot set agent account -- not the agent")
 
-        ok = _escrow.set_accounts(contract_id, req.principal_account, req.agent_account)
+        ok = self.escrow.set_accounts(contract_id, req.principal_account, req.agent_account)
         if not ok:
             raise HTTPException(404, "No escrow for this contract")
         return {"status": "ok"}
 
-    @app.get("/contracts/{contract_id}/escrow")
-    async def get_escrow(contract_id: str, request: Request):
+    async def get_escrow(self, contract_id: str, request: Request):
         """Get escrow state. Requires auth -- only contract parties can see full data."""
-        data = _escrow.get(contract_id)
+        data = self.escrow.get(contract_id)
         if not data:
             raise HTTPException(404, "No escrow for this contract")
 
-        contract_data = _store.get(contract_id)
-        # Try to authenticate
+        contract_data = self.store.get(contract_id)
         pubkey_hex = request.headers.get("X-Fix-Pubkey", "")
         caller_id = "fix_" + pubkey_hex if pubkey_hex else ""
         authenticated = False
@@ -1806,12 +1652,10 @@ def create_app(
                 authenticated = False
 
         if not authenticated:
-            # Unauthenticated: strip sensitive fields
             data = {k: v for k, v in data.items()
                     if k not in ("principal_account", "agent_account", "escrow_account")}
             return data
 
-        # Authenticated: verify party membership
         if contract_data:
             principal = contract_data.get("principal_pubkey", "")
             agent = contract_data.get("agent_pubkey", "")
@@ -1820,21 +1664,19 @@ def create_app(
 
         return data
 
-    @app.get("/stats")
-    async def get_stats():
-        open_count = len(_store.list_by_status("open"))
-        investigating = len(_store.list_by_status("investigating"))
-        in_progress = len(_store.list_by_status("in_progress"))
-        fulfilled = len(_store.list_by_status("fulfilled"))
-        canceled = len(_store.list_by_status("canceled"))
-        resolved = len(_store.list_by_status("resolved"))
-        disputed = len(_store.list_by_status("disputed"))
-        voided = len(_store.list_by_status("voided"))
+    async def get_stats(self):
+        open_count = len(self.store.list_by_status("open"))
+        investigating = len(self.store.list_by_status("investigating"))
+        in_progress = len(self.store.list_by_status("in_progress"))
+        fulfilled = len(self.store.list_by_status("fulfilled"))
+        canceled = len(self.store.list_by_status("canceled"))
+        resolved = len(self.store.list_by_status("resolved"))
+        disputed = len(self.store.list_by_status("disputed"))
+        voided = len(self.store.list_by_status("voided"))
 
-        # Count unique agents (from agent_pubkey on non-open contracts)
         unique_agents = set()
         for status_name in ("investigating", "in_progress", "fulfilled", "resolved", "canceled"):
-            for c in _store.list_by_status(status_name):
+            for c in self.store.list_by_status(status_name):
                 apk = c.get("agent_pubkey", "")
                 if apk and apk != "platform_free_agent":
                     unique_agents.add(apk)
@@ -1852,15 +1694,13 @@ def create_app(
             "unique_agents": len(unique_agents),
         }
 
-    @app.get("/platform_info")
-    async def platform_info():
+    async def platform_info(self):
         """Advertised platform rates, minimums, and live stats."""
-        # Live contract counts
-        fulfilled = len(_store.list_by_status("fulfilled"))
-        resolved = len(_store.list_by_status("resolved"))
-        open_count = len(_store.list_by_status("open"))
-        in_progress = len(_store.list_by_status("in_progress"))
-        investigating = len(_store.list_by_status("investigating"))
+        fulfilled = len(self.store.list_by_status("fulfilled"))
+        resolved = len(self.store.list_by_status("resolved"))
+        open_count = len(self.store.list_by_status("open"))
+        in_progress = len(self.store.list_by_status("in_progress"))
+        investigating = len(self.store.list_by_status("investigating"))
 
         return {
             "model": "inclusive_bond",
@@ -1882,4 +1722,90 @@ def create_app(
             },
         }
 
-    return app
+    # --- App factory ---
+
+    def create_app(self) -> FastAPI:
+        """Build and return the FastAPI application with all routes registered."""
+        app = FastAPI(title="Fix Platform", version="3.0")
+
+        # --- Input size limits (DoS prevention) ---
+        max_body = self.MAX_BODY_BYTES
+
+        @app.middleware("http")
+        async def limit_body_size(request: Request, call_next):
+            """Reject oversized request bodies before parsing."""
+            content_length = request.headers.get("content-length")
+            if content_length and int(content_length) > max_body:
+                return __import__('starlette.responses', fromlist=['JSONResponse']).JSONResponse(
+                    status_code=413, content={"detail": f"Request body too large (max {max_body} bytes)"})
+            return await call_next(request)
+
+        # Static file serving
+        static_dir = os.path.join(os.path.dirname(__file__), "static")
+        if os.path.isdir(static_dir):
+            app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+        @app.get("/")
+        async def index():
+            return FileResponse(os.path.join(static_dir, "index.html"))
+
+        # Expose state for testing and _verify_auth replay guard access
+        app.state.replay_guard = self.replay_guard
+        app.state.store = self.store
+        app.state.escrow = self.escrow
+        app.state.judge = self.judge
+        app.state.court = self.court
+        app.state.server_privkey = self.server_privkey
+        app.state.server_pubkey = self.server_pubkey
+        app.state.server_fix_id = self.server_fix_id
+        app.state.sse_publish = self._sse_publish
+
+        # --- Register routes ---
+        app.add_api_route("/server_pubkey", self.get_server_pubkey, methods=["GET"])
+        app.add_api_route("/contracts", self.post_contract, methods=["POST"])
+        app.add_api_route("/contracts", self.list_contracts, methods=["GET"])
+        app.add_api_route("/contracts/stream", self.stream_contracts, methods=["GET"])
+        app.add_api_route("/contracts/{contract_id}", self.get_contract, methods=["GET"])
+        app.add_api_route("/contracts/{contract_id}/chain_head", self.get_chain_head, methods=["GET"])
+        app.add_api_route("/contracts/{contract_id}/bond", self.post_bond, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/accept", self.accept_contract, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/decline", self.decline_investigation, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/investigate", self.request_investigation, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/result", self.submit_investigation_result, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/chat", self.chat, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/fix", self.submit_fix, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/verify", self.verify_fix, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/review", self.review_action, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/review_status", self.review_status, methods=["GET"])
+        app.add_api_route("/contracts/{contract_id}/dispute", self.dispute_contract, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/respond", self.respond_to_dispute, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/dispute_status", self.dispute_status, methods=["GET"])
+        app.add_api_route("/contracts/{contract_id}/void", self.void_contract, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/halt", self.halt_contract, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/ruling", self.get_ruling, methods=["GET"])
+        app.add_api_route("/contracts/{contract_id}/verify_chain", self.verify_contract_chain, methods=["GET"])
+        app.add_api_route("/reputation/{pubkey}", self.get_reputation, methods=["GET"])
+        app.add_api_route("/contracts/{contract_id}/accounts", self.set_accounts, methods=["POST"])
+        app.add_api_route("/contracts/{contract_id}/escrow", self.get_escrow, methods=["GET"])
+        app.add_api_route("/stats", self.get_stats, methods=["GET"])
+        app.add_api_route("/platform_info", self.platform_info, methods=["GET"])
+
+        return app
+
+
+# --- Backward-compatible factory ---
+
+def create_app(
+    store: ContractStore | None = None,
+    escrow_mgr: EscrowManager | None = None,
+    judge: AIJudge | None = None,
+    court: TieredCourt | None = None,
+    server_privkey: bytes | None = None,
+) -> FastAPI:
+    """Create FastAPI app with injected dependencies.
+
+    If server_privkey is not provided, checks FIX_SERVER_KEY env var
+    (path to key file) or auto-generates one.
+    """
+    server = FixServer(store, escrow_mgr, judge, court, server_privkey)
+    return server.create_app()

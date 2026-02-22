@@ -50,6 +50,10 @@ try:
 except ImportError:
     _HAS_V2 = False
 
+from protocol import (INVESTIGATE_WHITELIST,
+                      DEFAULT_CLAUDE_API_URL as CLAUDE_API_URL, DEFAULT_CLAUDE_MODEL as CLAUDE_MODEL,
+                      DEFAULT_OLLAMA_URL as OLLAMA_URL, DEFAULT_OLLAMA_MODEL as OLLAMA_MODEL)
+
 try:
     from client import FixClient
     from agent import FixAgent
@@ -66,43 +70,9 @@ MAX_INVESTIGATE_ROUNDS = 5
 INVESTIGATE_TIMEOUT = 5
 PRINCIPAL_VERIFY_TIMEOUT = 60
 
-# Claude API defaults
-CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL = "claude-haiku-4-5-20251001"
-
-# Ollama defaults
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5-coder:1.5b"
-
 # --- Investigation ---
 # Regex to detect investigation requests in LLM output
 INVESTIGATE_RE = re.compile(r'^INVESTIGATE:\s*(.+)$', re.MULTILINE)
-
-# Whitelist of allowed command prefixes for investigation
-INVESTIGATE_WHITELIST = {
-    # File inspection
-    "cat", "head", "tail", "less", "file", "wc", "stat", "md5sum", "sha256sum",
-    # Directory listing
-    "ls", "find", "tree", "du",
-    # Search
-    "grep", "rg", "ag",
-    # Versions/info
-    "which", "whereis", "type", "command", "uname", "arch", "lsb_release", "hostnamectl",
-    # Package queries
-    "dpkg", "apt", "apt-cache", "apt-file", "apt-list", "rpm", "pacman",
-    "pip", "pip3", "npm", "gem", "cargo", "rustc",
-    # Runtime versions
-    "gcc", "g++", "make", "cmake",
-    "clang", "clang++", "ld", "as", "nasm",
-    # Environment
-    "echo", "id", "whoami", "pwd", "hostname",
-    # System info
-    "lsmod", "lscpu", "free", "df", "mount", "ip", "ss", "ps",
-    # (logs removed — system info leakage)
-    # Misc
-    "readlink", "realpath", "basename", "dirname", "diff", "cmp",
-    "strings", "nm", "ldd", "objdump", "pkg-config", "test", "timeout",
-}
 
 # Patterns that indicate write operations (but not stderr redirects like 2>&1)
 _RE_WRITE_REDIRECT = re.compile(r'(?<!\d)>(?!&)')  # > not preceded by digit, not followed by &
@@ -660,11 +630,23 @@ def _input_with_countdown(prompt_tpl, timeout, default="y"):
 
 
 class Verifier:
-    """Verification predicate: did the fix work?"""
+    """Verification predicate: did the fix work?
 
-    def __init__(self, spec, original_cmd):
+    Args:
+        run_command: callable(cmd, **kwargs) -> object with .returncode, .stderr.
+            Defaults to subprocess.run with shell=True, capture_output=True.
+            Pass e.g. lambda c, **kw: sandbox.run_in_sandbox(c, network=True)
+            for sandboxed verification.
+    """
+
+    def __init__(self, spec, original_cmd, run_command=None):
         self.spec = spec
         self.original_cmd = original_cmd
+        self._run_command = run_command or self._default_run
+
+    @staticmethod
+    def _default_run(cmd, **kwargs):
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
     def verify(self, fix_result):
         """Returns (success: bool, explanation: str)"""
@@ -681,7 +663,7 @@ class Verifier:
         return self._verify_command(self.spec)
 
     def _verify_rerun(self):
-        proc = subprocess.run(self.original_cmd, shell=True, capture_output=True, text=True)
+        proc = self._run_command(self.original_cmd)
         if proc.returncode == 0:
             return True, "Command succeeded (exit 0)"
         return False, f"Command failed (exit {proc.returncode}): {proc.stderr[:2000]}"
@@ -740,30 +722,10 @@ class Verifier:
         return True, f"Output does not contain '{forbidden}'"
 
     def _verify_command(self, cmd):
-        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        proc = self._run_command(cmd)
         if proc.returncode == 0:
             return True, f"Verification command passed"
         return False, f"Verification command failed (exit {proc.returncode})"
-
-
-class SandboxVerifier(Verifier):
-    """Runs verification inside the sandbox."""
-
-    def __init__(self, spec, original_cmd, sandbox):
-        super().__init__(spec, original_cmd)
-        self.sandbox = sandbox
-
-    def _verify_rerun(self):
-        result = self.sandbox.run_in_sandbox(self.original_cmd, network=True)
-        if result.returncode == 0:
-            return True, "Command succeeded in sandbox (exit 0)"
-        return False, f"Command failed in sandbox (exit {result.returncode})"
-
-    def _verify_command(self, cmd):
-        result = self.sandbox.run_in_sandbox(cmd, network=True)
-        if result.returncode == 0:
-            return True, "Verification passed in sandbox"
-        return False, f"Verification failed in sandbox (exit {result.returncode})"
 
 
 # --- LLM Backends ---
@@ -1909,7 +1871,8 @@ def run_sandboxed_fix(fix_cmd, original_cmd, verify_spec, cfg, status_fn):
             return False, "", "ALLOWLIST_VIOLATION"
 
         # Verification runs inside sandbox
-        verifier = SandboxVerifier(verify_spec, original_cmd, sandbox)
+        verifier = Verifier(verify_spec, original_cmd,
+                            run_command=lambda c, **kw: sandbox.run_in_sandbox(c, network=True))
         success, explanation = verifier.verify(fix_result)
         status_fn(f"{C_GREEN if success else C_RED}{'+'  if success else '!'}{C_RESET}", explanation)
 

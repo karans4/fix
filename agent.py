@@ -336,18 +336,7 @@ class FixAgent:
         await self.client.bond(contract_id, self.pubkey)
 
         # 2. Investigation loop — seed with prior agents' results from transcript
-        investigation_results = []
-        data = await self.client.get_contract(contract_id)
-        if data:
-            transcript = data.get("transcript", [])
-            # Extract prior investigate/result pairs
-            for entry in transcript:
-                etype = entry.get("type", "")
-                if etype == "result":
-                    cmd = entry.get("command", "") or entry.get("data", {}).get("command", "")
-                    output = entry.get("output", "") or entry.get("data", {}).get("output", "")
-                    if cmd:
-                        investigation_results.append({"command": cmd, "output": output})
+        investigation_results = await self.client.get_investigation_results(contract_id)
         prompt_contract = contract_for_prompt(contract)
         max_rounds = contract.get("execution", {}).get(
             "investigation_rounds", MAX_INVESTIGATION_ROUNDS

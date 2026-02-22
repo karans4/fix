@@ -97,6 +97,12 @@ del _validate_charity
 # Investigation rate limiting
 DEFAULT_INVESTIGATION_RATE = 1  # seconds between commands
 
+# LLM backend defaults
+DEFAULT_CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
+DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:1.5b"
+
 
 # --- State Machine ---
 
@@ -169,20 +175,28 @@ EVIL_FLAGS = {"evil_agent", "evil_principal", "evil_both"}
 
 
 # --- Investigation Command Whitelist ---
-# (re-exported from main fix CLI for agent use)
+# Canonical whitelist — used by both fix CLI and server/agent
 
 INVESTIGATE_WHITELIST = {
+    # File inspection
     "cat", "head", "tail", "less", "file", "wc", "stat", "md5sum", "sha256sum",
+    # Directory listing
     "ls", "find", "tree", "du",
-    "grep", "rg", "ag", "awk", "sed",
+    # Search
+    "grep", "rg", "ag",
+    # Versions/info
     "which", "whereis", "type", "command", "uname", "arch", "lsb_release", "hostnamectl",
+    # Package queries
     "dpkg", "apt", "apt-cache", "apt-file", "apt-list", "rpm", "pacman",
     "pip", "pip3", "npm", "gem", "cargo", "rustc",
-    "python3", "python", "node", "gcc", "g++", "make", "cmake", "java", "go", "ruby",
+    # Runtime versions
+    "gcc", "g++", "make", "cmake",
     "clang", "clang++", "ld", "as", "nasm",
-    "env", "printenv", "echo", "id", "whoami", "pwd", "hostname",
+    # Environment
+    "echo", "id", "whoami", "pwd", "hostname",
+    # System info
     "lsmod", "lscpu", "free", "df", "mount", "ip", "ss", "ps",
-    "journalctl", "dmesg",
+    # Misc
     "readlink", "realpath", "basename", "dirname", "diff", "cmp",
     "strings", "nm", "ldd", "objdump", "pkg-config", "test", "timeout",
 }

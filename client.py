@@ -152,6 +152,19 @@ class FixClient:
         """Get contract details."""
         return await self.transport.get(f"/contracts/{contract_id}")
 
+    async def get_investigation_results(self, contract_id: str) -> list[dict]:
+        """Extract investigation results from contract transcript."""
+        data = await self.get_contract(contract_id)
+        results = []
+        if data:
+            for entry in data.get("transcript", []):
+                if entry.get("type") == "result":
+                    cmd = entry.get("command", "") or entry.get("data", {}).get("command", "")
+                    output = entry.get("output", "") or entry.get("data", {}).get("output", "")
+                    if cmd:
+                        results.append({"command": cmd, "output": output})
+        return results
+
     async def get_chain_head(self, contract_id: str) -> dict:
         """Get current chain head and seq for building next entry."""
         return await self.transport.get(f"/contracts/{contract_id}/chain_head")

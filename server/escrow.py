@@ -21,276 +21,17 @@ from protocol import (
     DEFAULT_JUDGE_FEE, GRACE_PERIOD_SECONDS, PLATFORM_FEE_RATE,
     PLATFORM_FEE_MIN, CANCEL_FEE_RATE, Ruling,
 )
-from server.nano import validate_nano_address
-
-
-class Escrow:
-    """Payment routing logic for a single contract (inclusive bond model).
-
-    Both sides pay inclusive_bond = bounty + judge_fee.
-    Bounty is the "excess bond" — the real stake beyond dispute insurance.
-    """
-
-    def __init__(self, bounty: str, terms: dict):
-        self.bounty = Decimal(bounty)
-        self.terms = terms
-        self.judge_fee = Decimal(terms.get("judge_fee", DEFAULT_JUDGE_FEE))
-        self.inclusive_bond = self.bounty + self.judge_fee
-        self.locked = False
-        self.resolved = False
-        self.resolution: dict | None = None
-        self.principal_locked = False
-        self.agent_locked = False
-
-    def lock(self) -> dict:
-        """Lock escrow — principal deposits inclusive_bond."""
-        self.locked = True
-        self.principal_locked = True
-        return {
-            "status": "locked",
-            "bounty": str(self.bounty),
-            "judge_fee": str(self.judge_fee),
-            "inclusive_bond": str(self.inclusive_bond),
-        }
-
-    def lock_agent(self) -> dict:
-        """Lock agent's matching deposit (inclusive_bond)."""
-        self.agent_locked = True
-        return {
-            "status": "agent_locked",
-            "inclusive_bond": str(self.inclusive_bond),
-        }
-
-    def release_agent(self) -> dict:
-        """Return agent's deposit if they decline after investigating."""
-        self.agent_locked = False
-        return {
-            "status": "agent_released",
-            "inclusive_bond": str(self.inclusive_bond),
-        }
-
-    def resolve(self, ruling: str, flags: list[str] | None = None,
-                in_grace: bool = False, backed_out_by: str | None = None,
-                dispute_loser: str | None = None,
-                tier_fee: Decimal | None = None) -> dict:
-        """Route funds based on ruling under the inclusive bond model.
-
-        Returns a dict describing all payment actions.
-        """
-        flags = set(flags or [])
-        bounty = self.bounty
-        judge_fee = self.judge_fee
-
-        if ruling == "voided":
-            return self._void()
-
-        # --- Compute base result ---
-        result = {}
-        has_evil = bool(flags & {"evil_agent", "evil_principal"})
-
-        if ruling == "fulfilled":
-            result = self._base_fulfilled(flags)
-        elif ruling == "canceled":
-            result = self._base_canceled(flags)
-        elif ruling == "impossible":
-            result = self._base_impossible()
-        elif ruling == "backed_out":
-            result = self._base_backed_out(in_grace, backed_out_by)
-        else:
-            raise ValueError(f"unknown ruling: {ruling}")
-
-        self.resolved = True
-        self.resolution = result
-
-        # --- Judge fee routing ---
-        self._route_judge_fees(result, flags, dispute_loser, tier_fee)
-
-        # --- Platform fee: 10% of excess bond (bounty - judge_fee) ---
-        if result.get("action") != "grace_return":
-            excess = max(bounty - judge_fee, Decimal("0"))
-            fee = max(excess * PLATFORM_FEE_RATE, PLATFORM_FEE_MIN) if excess > 0 else Decimal("0")
-            result["platform_fee"] = str(fee)
-        else:
-            result["platform_fee"] = "0"
-
-        return result
-
-    def _base_fulfilled(self, flags: set) -> dict:
-        """Fulfilled: agent gets principal's bounty."""
-        if "evil_principal" in flags:
-            return {
-                "action": "fulfilled_evil_principal",
-                "agent_gets_bounty": str(self.bounty),
-                "principal_bounty_to_charity": str(self.bounty),
-                "details": "fulfilled but principal evil — principal's bounty to charity",
-            }
-        return {
-            "action": "release_to_agent",
-            "agent_gets_bounty": str(self.bounty),
-            "details": "bounty released to agent",
-        }
-
-    def _base_canceled(self, flags: set) -> dict:
-        """Canceled (dispute outcome): bounty back to principal."""
-        if "evil_agent" in flags and "evil_principal" in flags:
-            return {
-                "action": "canceled_both_evil",
-                "agent_bounty_to_charity": str(self.bounty),
-                "principal_bounty_to_charity": str(self.bounty),
-                "details": "both evil — both bounties to charity",
-            }
-        elif "evil_agent" in flags:
-            return {
-                "action": "canceled_evil_agent",
-                "principal_gets_bounty": str(self.bounty),
-                "agent_bounty_to_charity": str(self.bounty),
-                "details": "agent evil — agent's bounty to charity, principal's returned",
-            }
-        elif "evil_principal" in flags:
-            return {
-                "action": "canceled_evil_principal",
-                "principal_bounty_to_charity": str(self.bounty),
-                "details": "principal evil on canceled — bounty to charity",
-            }
-        return {
-            "action": "return_to_principal",
-            "principal_gets_bounty": str(self.bounty),
-            "details": "canceled, bounty returned to principal",
-        }
-
-    def _base_impossible(self) -> dict:
-        """Impossible: bounty back to principal, no penalties."""
-        return {
-            "action": "return_to_principal",
-            "principal_gets_bounty": str(self.bounty),
-            "details": "contract ruled impossible, bounty returned",
-        }
-
-    def _base_backed_out(self, in_grace: bool, backed_out_by: str | None) -> dict:
-        """Backed out: cancel fee logic."""
-        bounty = self.bounty
-
-        if in_grace:
-            return {
-                "action": "grace_return",
-                "details": "backed out during grace period, no fees",
-            }
-
-        excess = max(bounty - self.judge_fee, Decimal("0"))
-        cancel_fee = excess * CANCEL_FEE_RATE   # 20% of excess bond
-        reimburse = cancel_fee / 2              # 10% to counterparty
-        platform_cancel = cancel_fee / 2        # 10% to platform
-
-        if backed_out_by == "agent":
-            return {
-                "action": "agent_canceled",
-                "principal_gets_bounty": str(bounty),
-                "principal_gets_reimburse": str(reimburse),
-                "agent_gets_back": str(bounty - cancel_fee),
-                "cancel_fee_to_platform": str(platform_cancel),
-                "details": "agent backed out post-grace, 20% cancel fee on excess bond",
-            }
-        else:  # principal backed out
-            return {
-                "action": "principal_canceled",
-                "principal_gets_back": str(bounty - cancel_fee),
-                "agent_gets_bounty_back": str(bounty),
-                "agent_gets_reimburse": str(reimburse),
-                "cancel_fee_to_platform": str(platform_cancel),
-                "details": "principal backed out post-grace, 20% cancel fee on excess bond",
-            }
-
-    def _void(self) -> dict:
-        """Judge timeout. Everything returned."""
-        self.resolved = True
-        result = {
-            "action": "voided",
-            "bounty": str(self.bounty),
-            "inclusive_bond": str(self.inclusive_bond),
-            "details": "judge timeout, contract voided, all funds returned",
-            "principal_returned": str(self.inclusive_bond) if self.principal_locked else None,
-            "agent_returned": str(self.inclusive_bond) if self.agent_locked else None,
-            "platform_fee": "0",
-        }
-        self.resolution = result
-        return result
-
-    def _route_judge_fees(self, result: dict, flags: set,
-                          dispute_loser: str | None,
-                          tier_fee: Decimal | None):
-        """Route judge fees from both sides' judge_fee portions.
-
-        Normal dispute: loser pays tier_fee to platform (platform runs the judge),
-        loser gets (judge_fee - tier_fee) back.
-        Evil: same — judge_fee is insurance, not punishment. Only excess bond is punished.
-        No dispute: both get judge_fee back.
-        """
-        judge_fee = self.judge_fee
-
-        if dispute_loser:
-            actual_tier_fee = tier_fee if tier_fee is not None else judge_fee
-            loser_remainder = max(judge_fee - actual_tier_fee, Decimal("0"))
-            winner = "principal" if dispute_loser == "agent" else "agent"
-
-            result["dispute_loser"] = dispute_loser
-            result["tier_fee_to_platform"] = str(actual_tier_fee)
-            result["loser_judge_fee_returned"] = str(loser_remainder)
-            result["winner_judge_fee_returned"] = str(judge_fee)
-            result["winner"] = winner
-
-            # Evil: loser's bounty (excess bond) to charity
-            # But judge_fee portion is always returned minus tier_fee
-            has_evil = bool(flags & {"evil_agent", "evil_principal"})
-            if has_evil:
-                result["loser_bounty_to_charity"] = str(self.bounty)
-            else:
-                result["loser_bounty_to_charity"] = None
-
-            # evil_both: winner's bounty also to charity
-            if "evil_agent" in flags and "evil_principal" in flags:
-                result["winner_bounty_to_charity"] = str(self.bounty)
-                result["winner"] = None  # nobody "wins"
-            else:
-                result["winner_bounty_to_charity"] = None
-
-        else:
-            # No dispute — both judge fees returned
-            result["dispute_loser"] = None
-            result["tier_fee_to_platform"] = None
-            result["loser_judge_fee_returned"] = None
-            result["winner_judge_fee_returned"] = None
-            result["winner"] = None
-            result["loser_bounty_to_charity"] = None
-            result["winner_bounty_to_charity"] = None
-
-    # --- Convenience methods (backwards compat) ---
-
-    def release_to_agent(self) -> dict:
-        return self.resolve("fulfilled")
-
-    def return_to_principal(self, reason: str = "canceled") -> dict:
-        return self.resolve("canceled")
-
-    def send_to_charity(self, reason: str = "") -> dict:
-        result = {
-            "action": "send_to_charity",
-            "bounty": str(self.bounty),
-            "charity_amount": str(self.bounty),
-            "details": reason or "forced to charity",
-            "platform_fee": "0",
-        }
-        self.resolved = True
-        self.resolution = result
-        return result
+from server.nano import validate_nano_address, PaymentBackend
 
 
 class EscrowManager:
     """SQLite-backed escrow manager with pluggable payment backend.
 
     Inclusive bond model: both sides deposit bounty + judge_fee.
+    All payment routing logic is inline — no separate Escrow object.
     """
 
-    def __init__(self, db_path: str = ":memory:", payment_backend=None, platform_account: str = ""):
+    def __init__(self, db_path: str = ":memory:", payment_backend: PaymentBackend | None = None, platform_account: str = ""):
         from protocol import PLATFORM_ADDRESS
         self.payment = payment_backend
         self.platform_account = platform_account or PLATFORM_ADDRESS
@@ -327,18 +68,26 @@ class EscrowManager:
     def lock(self, contract_id: str, bounty: str, terms: dict,
              judge_fee: str = "") -> dict:
         """Lock escrow for a contract. Principal deposits inclusive_bond."""
-        escrow = Escrow(bounty, terms)
-        result = escrow.lock()
+        bounty_dec = Decimal(bounty)
+        jf = Decimal(judge_fee) if judge_fee else Decimal(terms.get("judge_fee", DEFAULT_JUDGE_FEE))
+        inclusive_bond = bounty_dec + jf
+
+        result = {
+            "status": "locked",
+            "bounty": str(bounty_dec),
+            "judge_fee": str(jf),
+            "inclusive_bond": str(inclusive_bond),
+        }
 
         account_info = self.payment.create_escrow_account(contract_id)
         escrow_account = account_info.get("account", "")
 
-        actual_judge_fee = judge_fee or str(escrow.judge_fee)
-        inclusive_bond = str(Decimal(bounty) + Decimal(actual_judge_fee))
+        actual_judge_fee = str(jf)
+        inclusive_bond_str = str(inclusive_bond)
 
         self.db.execute(
             "INSERT INTO escrows (contract_id, bounty, terms, locked, escrow_account, judge_fee, inclusive_bond, principal_locked) VALUES (?, ?, ?, 1, ?, ?, ?, 1)",
-            (contract_id, bounty, json.dumps(terms), escrow_account, actual_judge_fee, inclusive_bond),
+            (contract_id, bounty, json.dumps(terms), escrow_account, actual_judge_fee, inclusive_bond_str),
         )
         self.db.commit()
 
@@ -420,6 +169,194 @@ class EscrowManager:
             return False
         return self.payment.check_deposit(contract_id, row["inclusive_bond"])
 
+    # --- Private routing methods (take explicit parameters, no instance state) ---
+
+    def _base_fulfilled(self, bounty: Decimal, judge_fee: Decimal, flags: set) -> dict:
+        """Fulfilled: agent gets principal's bounty."""
+        if "evil_principal" in flags:
+            return {
+                "action": "fulfilled_evil_principal",
+                "agent_gets_bounty": str(bounty),
+                "principal_bounty_to_charity": str(bounty),
+                "details": "fulfilled but principal evil — principal's bounty to charity",
+            }
+        return {
+            "action": "release_to_agent",
+            "agent_gets_bounty": str(bounty),
+            "details": "bounty released to agent",
+        }
+
+    def _base_canceled(self, bounty: Decimal, judge_fee: Decimal, flags: set) -> dict:
+        """Canceled (dispute outcome): bounty back to principal."""
+        if "evil_agent" in flags and "evil_principal" in flags:
+            return {
+                "action": "canceled_both_evil",
+                "agent_bounty_to_charity": str(bounty),
+                "principal_bounty_to_charity": str(bounty),
+                "details": "both evil — both bounties to charity",
+            }
+        elif "evil_agent" in flags:
+            return {
+                "action": "canceled_evil_agent",
+                "principal_gets_bounty": str(bounty),
+                "agent_bounty_to_charity": str(bounty),
+                "details": "agent evil — agent's bounty to charity, principal's returned",
+            }
+        elif "evil_principal" in flags:
+            return {
+                "action": "canceled_evil_principal",
+                "principal_bounty_to_charity": str(bounty),
+                "details": "principal evil on canceled — bounty to charity",
+            }
+        return {
+            "action": "return_to_principal",
+            "principal_gets_bounty": str(bounty),
+            "details": "canceled, bounty returned to principal",
+        }
+
+    def _base_impossible(self, bounty: Decimal, judge_fee: Decimal, flags: set) -> dict:
+        """Impossible: bounty back to principal, no penalties."""
+        return {
+            "action": "return_to_principal",
+            "principal_gets_bounty": str(bounty),
+            "details": "contract ruled impossible, bounty returned",
+        }
+
+    def _base_backed_out(self, bounty: Decimal, judge_fee: Decimal, flags: set,
+                         in_grace: bool, backed_out_by: str | None) -> dict:
+        """Backed out: cancel fee logic."""
+        if in_grace:
+            return {
+                "action": "grace_return",
+                "details": "backed out during grace period, no fees",
+            }
+
+        excess = max(bounty - judge_fee, Decimal("0"))
+        cancel_fee = excess * CANCEL_FEE_RATE   # 20% of excess bond
+        reimburse = cancel_fee / 2              # 10% to counterparty
+        platform_cancel = cancel_fee / 2        # 10% to platform
+
+        if backed_out_by == "agent":
+            return {
+                "action": "agent_canceled",
+                "principal_gets_bounty": str(bounty),
+                "principal_gets_reimburse": str(reimburse),
+                "agent_gets_back": str(bounty - cancel_fee),
+                "cancel_fee_to_platform": str(platform_cancel),
+                "details": "agent backed out post-grace, 20% cancel fee on excess bond",
+            }
+        else:  # principal backed out
+            return {
+                "action": "principal_canceled",
+                "principal_gets_back": str(bounty - cancel_fee),
+                "agent_gets_bounty_back": str(bounty),
+                "agent_gets_reimburse": str(reimburse),
+                "cancel_fee_to_platform": str(platform_cancel),
+                "details": "principal backed out post-grace, 20% cancel fee on excess bond",
+            }
+
+    def _void(self, bounty: Decimal, judge_fee: Decimal,
+              principal_locked: bool, agent_locked: bool) -> dict:
+        """Judge timeout. Everything returned."""
+        inclusive_bond = bounty + judge_fee
+        return {
+            "action": "voided",
+            "bounty": str(bounty),
+            "inclusive_bond": str(inclusive_bond),
+            "details": "judge timeout, contract voided, all funds returned",
+            "principal_returned": str(inclusive_bond) if principal_locked else None,
+            "agent_returned": str(inclusive_bond) if agent_locked else None,
+            "platform_fee": "0",
+        }
+
+    def _route_judge_fees(self, result: dict, bounty: Decimal, judge_fee: Decimal,
+                          flags: set, dispute_loser: str | None,
+                          tier_fee: Decimal | None):
+        """Route judge fees from both sides' judge_fee portions.
+
+        Normal dispute: loser pays tier_fee to platform (platform runs the judge),
+        loser gets (judge_fee - tier_fee) back.
+        Evil: same — judge_fee is insurance, not punishment. Only excess bond is punished.
+        No dispute: both get judge_fee back.
+        """
+        if dispute_loser:
+            actual_tier_fee = tier_fee if tier_fee is not None else judge_fee
+            loser_remainder = max(judge_fee - actual_tier_fee, Decimal("0"))
+            winner = "principal" if dispute_loser == "agent" else "agent"
+
+            result["dispute_loser"] = dispute_loser
+            result["tier_fee_to_platform"] = str(actual_tier_fee)
+            result["loser_judge_fee_returned"] = str(loser_remainder)
+            result["winner_judge_fee_returned"] = str(judge_fee)
+            result["winner"] = winner
+
+            # Evil: loser's bounty (excess bond) to charity
+            # But judge_fee portion is always returned minus tier_fee
+            has_evil = bool(flags & {"evil_agent", "evil_principal"})
+            if has_evil:
+                result["loser_bounty_to_charity"] = str(bounty)
+            else:
+                result["loser_bounty_to_charity"] = None
+
+            # evil_both: winner's bounty also to charity
+            if "evil_agent" in flags and "evil_principal" in flags:
+                result["winner_bounty_to_charity"] = str(bounty)
+                result["winner"] = None  # nobody "wins"
+            else:
+                result["winner_bounty_to_charity"] = None
+
+        else:
+            # No dispute — both judge fees returned
+            result["dispute_loser"] = None
+            result["tier_fee_to_platform"] = None
+            result["loser_judge_fee_returned"] = None
+            result["winner_judge_fee_returned"] = None
+            result["winner"] = None
+            result["loser_bounty_to_charity"] = None
+            result["winner_bounty_to_charity"] = None
+
+    def _compute_resolution(self, bounty: Decimal, judge_fee: Decimal,
+                            ruling: str, flags: list[str] | None = None,
+                            in_grace: bool = False, backed_out_by: str | None = None,
+                            dispute_loser: str | None = None,
+                            tier_fee: Decimal | None = None,
+                            principal_locked: bool = False,
+                            agent_locked: bool = False) -> dict:
+        """Compute payment routing result for a resolution.
+
+        Contains the logic formerly in Escrow.resolve() — switches on ruling type,
+        calls base routing methods, computes platform fees, routes judge fees.
+        """
+        flags_set = set(flags or [])
+
+        if ruling == "voided":
+            return self._void(bounty, judge_fee, principal_locked, agent_locked)
+
+        # --- Compute base result ---
+        if ruling == "fulfilled":
+            result = self._base_fulfilled(bounty, judge_fee, flags_set)
+        elif ruling == "canceled":
+            result = self._base_canceled(bounty, judge_fee, flags_set)
+        elif ruling == "impossible":
+            result = self._base_impossible(bounty, judge_fee, flags_set)
+        elif ruling == "backed_out":
+            result = self._base_backed_out(bounty, judge_fee, flags_set, in_grace, backed_out_by)
+        else:
+            raise ValueError(f"unknown ruling: {ruling}")
+
+        # --- Judge fee routing ---
+        self._route_judge_fees(result, bounty, judge_fee, flags_set, dispute_loser, tier_fee)
+
+        # --- Platform fee: 10% of excess bond (bounty - judge_fee) ---
+        if result.get("action") != "grace_return":
+            excess = max(bounty - judge_fee, Decimal("0"))
+            fee = max(excess * PLATFORM_FEE_RATE, PLATFORM_FEE_MIN) if excess > 0 else Decimal("0")
+            result["platform_fee"] = str(fee)
+        else:
+            result["platform_fee"] = "0"
+
+        return result
+
     def resolve(self, contract_id: str, ruling: str, flags: list[str] | None = None,
                 dispute_loser: str | None = None, tier_fee: str | None = None,
                 **kwargs) -> dict:
@@ -439,24 +376,20 @@ class EscrowManager:
             if not row["locked"]:
                 raise ValueError(f"Escrow for {contract_id} was never locked")
 
-            terms = json.loads(row["terms"])
-            escrow = Escrow(row["bounty"], terms)
-            escrow.locked = bool(row["locked"])
-            escrow.principal_locked = bool(row["principal_locked"])
-            escrow.agent_locked = bool(row["agent_locked"])
-
-            tier_fee_dec = Decimal(tier_fee) if tier_fee else None
-
-            result = escrow.resolve(
-                ruling, flags=flags,
-                dispute_loser=dispute_loser,
-                tier_fee=tier_fee_dec,
-                **kwargs,
-            )
-
             bounty = Decimal(row["bounty"])
             judge_fee = Decimal(row["judge_fee"] or DEFAULT_JUDGE_FEE)
             inclusive_bond = bounty + judge_fee
+            tier_fee_dec = Decimal(tier_fee) if tier_fee else None
+
+            result = self._compute_resolution(
+                bounty, judge_fee, ruling, flags=flags,
+                dispute_loser=dispute_loser,
+                tier_fee=tier_fee_dec,
+                principal_locked=bool(row["principal_locked"]),
+                agent_locked=bool(row["agent_locked"]),
+                **kwargs,
+            )
+
             platform_fee = Decimal(result.get("platform_fee", "0"))
             action = result.get("action")
 
@@ -698,3 +631,86 @@ class EscrowManager:
 
     def close(self):
         self.db.close()
+
+
+class Escrow:
+    """Backwards-compatible in-memory escrow for tests.
+
+    Delegates all routing logic to EscrowManager's private methods.
+    """
+
+    def __init__(self, bounty: str, terms: dict):
+        self.bounty = Decimal(bounty)
+        self.terms = terms
+        self.judge_fee = Decimal(terms.get("judge_fee", DEFAULT_JUDGE_FEE))
+        self.inclusive_bond = self.bounty + self.judge_fee
+        self.locked = False
+        self.resolved = False
+        self.resolution: dict | None = None
+        self.principal_locked = False
+        self.agent_locked = False
+        # Lightweight manager instance for routing logic (no DB, no payment backend)
+        self._mgr = EscrowManager.__new__(EscrowManager)
+
+    def lock(self) -> dict:
+        """Lock escrow — principal deposits inclusive_bond."""
+        self.locked = True
+        self.principal_locked = True
+        return {
+            "status": "locked",
+            "bounty": str(self.bounty),
+            "judge_fee": str(self.judge_fee),
+            "inclusive_bond": str(self.inclusive_bond),
+        }
+
+    def lock_agent(self) -> dict:
+        """Lock agent's matching deposit (inclusive_bond)."""
+        self.agent_locked = True
+        return {
+            "status": "agent_locked",
+            "inclusive_bond": str(self.inclusive_bond),
+        }
+
+    def release_agent(self) -> dict:
+        """Return agent's deposit if they decline after investigating."""
+        self.agent_locked = False
+        return {
+            "status": "agent_released",
+            "inclusive_bond": str(self.inclusive_bond),
+        }
+
+    def resolve(self, ruling: str, flags: list[str] | None = None,
+                in_grace: bool = False, backed_out_by: str | None = None,
+                dispute_loser: str | None = None,
+                tier_fee: Decimal | None = None) -> dict:
+        """Route funds based on ruling. Delegates to EscrowManager._compute_resolution."""
+        result = self._mgr._compute_resolution(
+            self.bounty, self.judge_fee, ruling, flags=flags,
+            in_grace=in_grace, backed_out_by=backed_out_by,
+            dispute_loser=dispute_loser, tier_fee=tier_fee,
+            principal_locked=self.principal_locked,
+            agent_locked=self.agent_locked,
+        )
+        self.resolved = True
+        self.resolution = result
+        return result
+
+    # --- Convenience methods (backwards compat) ---
+
+    def release_to_agent(self) -> dict:
+        return self.resolve("fulfilled")
+
+    def return_to_principal(self, reason: str = "canceled") -> dict:
+        return self.resolve("canceled")
+
+    def send_to_charity(self, reason: str = "") -> dict:
+        result = {
+            "action": "send_to_charity",
+            "bounty": str(self.bounty),
+            "charity_amount": str(self.bounty),
+            "details": reason or "forced to charity",
+            "platform_fee": "0",
+        }
+        self.resolved = True
+        self.resolution = result
+        return result
